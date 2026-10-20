@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
+"""Build the minimal Apple Device Tree that the SUNSTONE xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sunstone (Redmi Note 12 5G, SM4375 blair) live FDT
+read on 2026-10-20 (topaz values in git history). Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -12,11 +13,14 @@ import adt  # noqa: E402
 # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# --highmem (phone only): the whole upper DDR bank. The topaz live FDT memory
+# --highmem (phone only): the whole upper DDR bank. (topaz notes:) The topaz live FDT memory
 # node is <0x40000000 0x3bb00000>, <0x80000000 3G>, <0x1_40000000 4G>; every
 # fixed reserved-memory carve-out is below 0x63900000 and the dynamic pools are
 # limited below 4G.
-HIGH_PHYS_BASE = 0x140000000
+# sunstone (8GB): the live FDT memory node is <0x80000000 0x3bb00000>,
+# <0xc0000000 3G>, <0x1_80000000 4G>, and /proc/iomem shows 0xf6400000 to
+# 0x2_7fffffff as one System RAM range: the upper bank holds no carve-out.
+HIGH_PHYS_BASE = 0x180000000
 HIGH_MEM_SIZE = 0x100000000
 # --midmem (phone only): the middle and upper banks as one range, 0x80000000 +
 # 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
@@ -28,10 +32,10 @@ SOC_BASE = 0x01000000
 
 # interrupt-controller@f200000 (redistributor-stride 0x20000, 8 cores)
 GICD, GICD_SIZE = 0x0f200000, 0x10000
-GICR, GICR_SIZE = 0x0f300000, 0x100000
+GICR, GICR_SIZE = 0x0f240000, 0x100000
 # cont_splash_region left lit by ABL
-FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
+FB, FB_SIZE = 0x85200000, 0xc00000  # sunstone splash_region@0x85200000
+SWEET_ECID = 0x53554e5354000001  # 'SUNST' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x04804000, 0x3000
@@ -41,7 +45,7 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'sunstone boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -91,8 +95,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('topaz-shim')),
-        ('system-firmware-version', cstr('topaz-shim')),
+        ('firmware-version', cstr('sunstone-shim')),
+        ('system-firmware-version', cstr('sunstone-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -128,28 +132,28 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # TOPAZ SMP: only the four Cortex-A73 (gold) cores, MPIDR 0x100-0x103:
-    # the Kryo 260 Silver cores have no 16K granule, so the shim boots xnu
-    # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # SUNSTONE SMP: all eight cores have the 16K granule (shim milestone 1):
+    # six Cortex-A55 at MPIDR 0x000-0x500 and two Cortex-A78 at 0x600/0x700,
+    # Aff1 = core as on sweet. One homogeneous cluster. The kernel defaults to
+    # one and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
+    for core in range(1 if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('reg', u32(core if qemu else core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(0)),  # gold L2
+            ('l2-cache-id', u32(0)),
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(2000000000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -181,13 +185,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
-        # launchd starts wifid only when the device tree has a "wlan" node
-        # (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi)
-        node('wlan', [
-            ph(),
-            ('device_type', cstr('wlan')),
-            ('compatible', cstr('topaz,wcn3988')),
-        ]),
+        # No "wlan" node yet: launchd starts wifid only when it exists, and
+        # sunstone has no Wi-Fi driver (topaz patches 0113-0130 not ported).
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -243,7 +242,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sunstone') + cstr('xiaomi,sweet') + cstr('qcom,blair') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
