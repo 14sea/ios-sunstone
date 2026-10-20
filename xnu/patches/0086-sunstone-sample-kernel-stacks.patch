@@ -23,18 +23,19 @@ index b40eccd..6df21ba 100644
  		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
  	}
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a20a764..613320f 100644
+index a20a764..bb43bbb 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -823,6 +823,7 @@ exception_triage(
+@@ -822,7 +822,7 @@ exception_triage(
+ 
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <vm/vm_shared_region.h>
- #include <arm/thread.h>
-+#include <kern/thread_kernel_state.h>
+-#include <arm/thread.h>
++#include <arm/thread.h>        /* also brings thread_get_kernel_state() (its header has no guard) */
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1036,6 +1037,32 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1036,6 +1036,32 @@ sweet_sample_task(const char *name, int pid, task_t task)
  			fp = frame[0];
  		}
  		printf("%s\n", line);
