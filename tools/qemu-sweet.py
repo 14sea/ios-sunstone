@@ -7,7 +7,7 @@ Does what shim/loader.c does on the phone, but on the host: places the
 kernel segments, ADT and boot_args at their physical addresses and starts
 the CPU at a 6-instruction stub that jumps to the entry with x0 = boot_args.
 virt RAM starts at 0x40000000; with 4G it covers the phone's framebuffer
-(0x9c000000) and the kernel's phys_base (0xb0000000) as plain memory.
+(sunstone 0x85200000) and the kernel's phys_base (0xb0000000) as plain memory.
 
 After N seconds (or when the guest stops) it writes into OUTDIR:
   fb.png     the 1080x2400 framebuffer (what the phone screen would show)
@@ -22,7 +22,7 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+FB_BASE, FB_W, FB_H = 0x85200000, 1080, 2400	# sunstone splash (sweet: 0x9c000000)
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base

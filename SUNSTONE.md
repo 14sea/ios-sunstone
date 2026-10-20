@@ -7,6 +7,8 @@ starting from ios-topaz. Status: kernel-only bring-up, no iOS root yet.
   hardware drivers off by default), plus sunstone patches:
   - 0083 early framebuffer at the sunstone splash 0x85200000 (32MB block 0x84000000)
   - 0084 CPU topology: MPIDR Aff1 = core (0x000-0x700), boot on CPU 0
+  - 0085 GPT watchdog (topaz 0088 rebased): UFS refuses writes to both GPT copies,
+    a thread panics if they change
 - topaz's hardware drivers (touch, battery, MDP scanout, cpufreq, modem/Wi-Fi,
   0083-0139) are kept in `xnu/patches-topaz/` for reference and are NOT built:
   they poke SM6225 MMIO.
