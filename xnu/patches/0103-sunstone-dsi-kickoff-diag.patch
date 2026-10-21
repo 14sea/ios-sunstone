@@ -1,0 +1,130 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 78b15d8..21475af 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -197,6 +197,8 @@ public:
+ 	bool          fBlSet;         /* iOS set a level: restore it at display on */
+ 	uint32_t      fBlLevel;       /* panel DBV, kept while the display is off */
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
++	bool          dsiKick(uint32_t size, bool lpm);
++	void          dsiDump(const char *when);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+ 	void          setPanelLevel(uint32_t level);
+@@ -328,8 +330,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	if (fDsi != NULL) {
+ 		fDsiOk = true;
+-		IOLog("SWEET FB: DSI0 ctrl %#x trig %#x, DCS brightness/on-off\n",
+-		    *(volatile uint32_t *)(fDsi + 0x004), *(volatile uint32_t *)(fDsi + 0x084));
++		dsiDump("start");
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		uint32_t blOn = 0;
+ 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+@@ -745,31 +746,47 @@ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-bool
+-AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
++/* DSI0 registers (techpack dsi_ctrl_reg.h) that decide whether a command DMA runs */
++void
++AppleCLCD::dsiDump(const char *when)
+ {
+-	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
+-		return false;
+-	}
+-	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
+-	uint32_t size = (4 + len + 3) & ~3u;
+-	memset(p, 0xff, 64);
+-	memcpy(p, hdr, 4);
+-	if (len) {
+-		memcpy(p + 4, payload, len);
++	if (fDsi == NULL) {
++		return;
+ 	}
+-	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	IOLog("SWEET FB: DSI0 %s: ctrl %#x status %#x fifo %#x vid %#x dma %#x dmafifo %#x trig %#x\n", when,
++	    dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x00c), dsi_rd(fDsi, 0x010),
++	    dsi_rd(fDsi, 0x03c), dsi_rd(fDsi, 0x050), dsi_rd(fDsi, 0x084));
++	IOLog("SWEET FB: DSI0 %s: lanes %#x/%#x errmask %#x int %#x clk %#x clkst %#x eot %#x tpg %#x timeout %#x\n", when,
++	    dsi_rd(fDsi, 0x0a8), dsi_rd(fDsi, 0x0ac), dsi_rd(fDsi, 0x10c), dsi_rd(fDsi, 0x110),
++	    dsi_rd(fDsi, 0x11c), dsi_rd(fDsi, 0x120), dsi_rd(fDsi, 0x0cc), dsi_rd(fDsi, 0x15c),
++	    dsi_rd(fDsi, 0x0c0));
++}
++
++/*
++ * One command DMA, as techpack dsi_ctrl_hw_cmn_kickoff_command(): embedded
++ * mode (bit 28), packet type 0 (bit 24), WC_SEL 0 (bit 29), LP11 or HS (bit
++ * 26), DMA FIFO watermarks off, every DSI clock forced on for the transfer.
++ */
++bool
++AppleCLCD::dsiKick(uint32_t size, bool lpm)
++{
+ 	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
++	uint32_t clk = dsi_rd(fDsi, 0x11c), dma = dsi_rd(fDsi, 0x03c), fifo = dsi_rd(fDsi, 0x050);
++	dsi_wr(fDsi, 0x11c, clk | 0x200b3fu);     /* DSI_CTRL_DYNAMIC_FORCE_ON */
+ 	if ((trig & 7) != 4) {
+ 		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
+ 	}
+ 	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
+-	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
++	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & ~(1u << 24)) | 1);   /* clear CMD_DMA_DONE */
+ 	dsi_wr(fDsi, 0x15c, 0);                          /* no test pattern */
++	uint32_t d = dma;
++	d = lpm ? (d | (1u << 26)) : (d & ~(1u << 26));
++	d |= 1u << 28;
++	d &= ~((1u << 24) | (1u << 29) | (1u << 30) | (1u << 31));
++	dsi_wr(fDsi, 0x03c, d);
++	dsi_wr(fDsi, 0x050, fifo | (1u << 20) | (1u << 16));
+ 	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
+-	dsi_wr(fDsi, 0x04c, size);
+-	uint32_t dma = dsi_rd(fDsi, 0x03c);
+-	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
++	dsi_wr(fDsi, 0x04c, size & 0xffffffu);
+ 	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+ 	for (int i = 0; i < 50 && !done; i++) {
+@@ -778,12 +795,41 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 			IODelay(1000);
+ 		}
+ 	}
+-	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
++	if (!done) {
++		dsiDump(lpm ? "timeout lp" : "timeout hs");
++	}
++	dsi_wr(fDsi, 0x110, (dsi_rd(fDsi, 0x110) & ~(1u << 24)) | 1);
++	dsi_wr(fDsi, 0x050, fifo);
+ 	dsi_wr(fDsi, 0x03c, dma);
+ 	dsi_wr(fDsi, 0x004, ctrl);
+ 	if (trig != dsi_rd(fDsi, 0x084)) {
+ 		dsi_wr(fDsi, 0x084, trig);
+ 	}
++	dsi_wr(fDsi, 0x11c, clk);
++	return done;
++}
++
++bool
++AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
++{
++	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
++		return false;
++	}
++	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
++	uint32_t size = (4 + len + 3) & ~3u;
++	memset(p, 0xff, 64);
++	memcpy(p, hdr, 4);
++	if (len) {
++		memcpy(p + 4, payload, len);
++	}
++	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	static bool first = true;
++	if (first) {
++		first = false;
++		dsiDump("first cmd");
++	}
++	/* HS in the blanking first (topaz); this panel's own command tables are LP, try that too */
++	bool done = dsiKick(size, false) || dsiKick(size, true);
+ 	if (!done) {
+ 		fDsiOk = false;         /* back to the CPU fade for display off */
+ 	}
