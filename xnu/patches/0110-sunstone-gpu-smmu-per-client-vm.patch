@@ -1,0 +1,1800 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 8d3bed9..8a45f29 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -1,20 +1,28 @@
+ /*
+- * Adreno 619 2D copies for SWEET on sunstone.
++ * Adreno 619 2D copies and SMMU-isolated user submissions for SWEET on sunstone.
+  *
+  * The shim brings the GPU up before xnu (ios-sunstone shim/gpu.c: GDSCs
+- * and clocks, identity GPU SMMU bank, zap shader through TZ, SQE, ring,
++ * and clocks, GPU SMMU bank 0, zap shader through TZ, SQE, ring,
+  * CP_ME_INIT, 2D context state, core at 300 MHz) and leaves a handoff block
+  * at 0xe0040000. All of that lives below 4 GB, outside xnu's RAM. Here we
+- * only append packets to the ring and move CP_RB_WPTR.
++ * append packets to the ring and move CP_RB_WPTR.
+  *
+- * GPU addresses are physical (the SMMU bank passes them through), so
+- * sources must be physically contiguous. The panel stride (4320 bytes) is
+- * not a multiple of 64 as the 2D engine wants, but two rows are: even and
+- * odd panel rows are two blits with doubled pitches, the odd one based 32
+- * bytes before its first row and shifted right by 8 pixels.
++ * Kernel framebuffer copies run with CB0 in bypass (M=0). User submissions
++ * (SweetGPUDevice.cpp) switch CB0 to the calling client's own ARMv8 stage-1
++ * page table (4 KB granule, 39-bit VA):
++ *   - Client BOs live in [0x10000000, 0x40000000).
++ *   - The CP ring (0xe0000000, 32 KB) and SQE microcode (0xe0010000, 64 KB)
++ *     are mapped Read-Only (SMMU_PTE_AP_RO).
++ *   - Each client VM has its own private 4 KB fence page mapped at IOVA
++ *     0xe0030000 (disjoint from the kernel's gpu_ctl page at PA 0xe0020000,
++ *     which is never mapped into any client VM).
++ *   - Each client VM has a kernel-only shadow IB buffer mapped Read-Only at
++ *     IOVA 0xe0080000; user IBs are copied there before validation and
++ *     submission to eliminate TOCTOU races.
+  *
+- * Packets and registers follow Mesa freedreno (fd6_blitter.cc) and were
+- * tested in the shim first (G2a-G2d). boot-arg sweetgpu=0 turns this off.
++ * All GPU SMMU MMIO accesses use plain 32-bit LDR/STR instructions: Gunyah
++ * traps and emulates the GPU SMMU on sunstone, and writeback/post-index
++ * accesses have ISV=0 in ESR_EL2 and hang the CPU.
+  */
+ #include "SweetGPU.h"
+ 
+@@ -22,24 +30,61 @@
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ 
+ #define GPU_HANDOFF_PHYS        0xe0040000ULL
+-#define GPU_LOW_PHYS            0xe0000000ULL   /* ring, fence word, handoff */
++#define GPU_LOW_PHYS            0xe0000000ULL   /* ring (0x0), sqe (0x10000), ctl (0x20000), handoff (0x40000) */
+ #define GPU_LOW_SIZE            0x50000ULL
++#define GPU_RING_PHYS           0xe0000000ULL
++#define GPU_RING_BYTES          0x8000u
++#define GPU_SQE_PHYS            0xe0010000ULL
++#define GPU_SQE_BYTES           0x10000u
++#define GPU_USER_FENCE_IOVA     0xe0030000ULL   /* mapped in each VM to vm->fence_pa (disjoint from kernel PA 0xe0020000) */
++#define GPU_USER_FENCE_OFFSET   0x100u
++#define GPU_USER_IB_IOVA        0xe0080000ULL   /* mapped Read-Only in each VM to vm->ib_mem */
++#define GPU_USER_IB_BYTES       (SWEET_GPU_MAX_IB_DWORDS * 4u)
+ #define GPU_REGS_SIZE           0x4000ULL
++#define GPU_SMMU_PHYS           0x05940000ULL
++#define GPU_SMMU_SIZE           0x10000ULL
+ 
+ #define REG_CP_RB_RPTR          0x806
+ #define REG_CP_RB_WPTR          0x807
+ #define REG_RBBM_STATUS         0x210
+ #define REG_CP_HW_FAULT         0x821
++#define REG_CP_PROTECT_STATUS   0x824
++#define REG_CP_PROTECT_CNTL     0x84f
++#define REG_CP_PROTECT_BASE     0x850
+ 
++#define CP_NOP                  0x10
++#define CP_WAIT_FOR_ME          0x13
++#define CP_SKIP_IB2_ENABLE_GLOBAL 0x1d
++#define CP_REG_RMW              0x21
++#define CP_SKIP_IB2_ENABLE_LOCAL  0x23
+ #define CP_WAIT_FOR_IDLE        0x26
+-#define CP_EVENT_WRITE          0x46
+ #define CP_BLIT                 0x2c
++#define CP_SET_BIN_DATA5        0x2f
++#define CP_LOAD_STATE6          0x30
++#define CP_LOAD_STATE6_GEOM     0x32
++#define CP_EXEC_CS              0x33
++#define CP_LOAD_STATE6_FRAG     0x34
++#define CP_SET_SUBDRAW_SIZE     0x35
++#define CP_DRAW_INDX_OFFSET     0x38
++#define CP_WAIT_REG_MEM         0x3c
++#define CP_MEM_WRITE            0x3d
++#define CP_REG_TO_MEM           0x3e
+ #define CP_INDIRECT_BUFFER      0x3f
++#define CP_EXEC_CS_INDIRECT     0x41
++#define CP_SET_DRAW_STATE       0x43
++#define CP_EVENT_WRITE          0x46
++#define CP_CONTEXT_REG_BUNCH    0x5c
++#define CP_SET_VISIBILITY_OVERRIDE 0x64
++#define CP_SET_MARKER           0x65
++#define CP_MEM_TO_MEM           0x73
++
+ #define BLIT_OP_SCALE           3
+ #define CACHE_FLUSH_TS          0x04
+ #define CACHE_INVALIDATE        0x31
+@@ -47,6 +92,51 @@
+ #define DEBUG_LABEL             0x3f
+ #define FMT6_8_8_8_8_UNORM      0x30
+ 
++/* ARM SMMU-v2 Context Bank registers and SCTLR bits (ARM IHI 0062D / Linux arm-smmu.h) */
++#define SMMU_CB0_FSR            0x58
++#define SMMU_CB_SCTLR_M         (1u << 0)       /* MMU enable */
++#define SMMU_CB_SCTLR_TRE       (1u << 1)       /* TEX Remap Enable */
++#define SMMU_CB_SCTLR_AFE       (1u << 2)       /* Access Flag Enable */
++#define SMMU_CB_SCTLR_AFFD      (1u << 3)       /* Access Flag Fault Disable */
++#define SMMU_CB_SCTLR_CFRE      (1u << 5)       /* Context Fault Report Enable (abort) */
++#define SMMU_CB_SCTLR_CFIE      (1u << 6)       /* Context Fault Interrupt Enable */
++#define SMMU_CB_SCTLR_CFCFG     (1u << 7)       /* 1 = stall until RESUME, 0 = terminate/abort */
++#define SMMU_CB_SCTLR_HUPCF     (1u << 8)       /* 1 = Hit Under Previous Context Fault */
++
++/* CFCFG (bit 7) is 0 in both modes so faults abort immediately without stalling the CP. */
++#define SMMU_SCTLR_BYPASS       (SMMU_CB_SCTLR_CFRE)
++#define SMMU_SCTLR_STAGE1       (SMMU_CB_SCTLR_HUPCF | SMMU_CB_SCTLR_CFRE | \
++                                 SMMU_CB_SCTLR_AFFD | SMMU_CB_SCTLR_AFE | \
++                                 SMMU_CB_SCTLR_TRE | SMMU_CB_SCTLR_M)
++
++/* ARMv8 VMSAv8-64 stage-1 4 KB granule descriptor bits */
++#define SMMU_PTE_PAGE           3ULL            /* valid table / L3 page */
++#define SMMU_PTE_ATTR_NC        (0ULL << 2)     /* MAIR0 attr0 = 0x44 Normal Non-Cacheable */
++#define SMMU_PTE_AP_RW          (1ULL << 6)     /* AP[2:1]=0b01: RW at EL1/EL0 */
++#define SMMU_PTE_AP_RO          (3ULL << 6)     /* AP[2:1]=0b11: RO at EL1/EL0 */
++#define SMMU_PTE_SH_OS          (2ULL << 8)     /* Outer Shareable */
++#define SMMU_PTE_AF             (1ULL << 10)    /* Access Flag */
++#define SMMU_PTE_NG             (1ULL << 11)    /* non-Global (per-ASID) */
++#define SMMU_PA_MASK            0x0000fffffffff000ULL
++
++#define SMMU_MAX_PT_PAGES       96              /* 96 x 16 KB = 384 x 4 KB tables */
++
++struct sweet_gpu_vm {
++	IOBufferMemoryDescriptor *pt_pages[SMMU_MAX_PT_PAGES];
++	uint32_t                  n_pages;
++	uint32_t                  n_sub;        /* next 4 KB subpage index */
++	uint16_t                  asid;
++	uint32_t                  seqno;        /* per-client fence sequence */
++	uint64_t                  l1_pa;
++	uint64_t                 *l1_va;
++	uint64_t                 *l2_user_va;   /* L1[0]: covers [0x00000000, 0x40000000) */
++	uint64_t                 *l3_va[512];   /* L3 tables under L1[0], indexed by VA[29:21] */
++	uint64_t                  fence_pa;     /* private 4 KB fence page PA */
++	volatile uint32_t        *fence_va;     /* private 4 KB fence page VA */
++	IOBufferMemoryDescriptor *ib_mem;       /* kernel-only shadow IB buffer (mapped RO at GPU_USER_IB_IOVA) */
++	uint32_t                 *ib_va;
++};
++
+ struct sweet_gpu_handoff {
+ 	char     magic[8];              /* "SUNGPUHO" */
+ 	uint32_t version, ok;
+@@ -58,13 +148,51 @@ struct sweet_gpu_handoff {
+ };
+ 
+ static int                 gpu_state;   /* 0 not tried, 1 ready, -1 off */
+-static IOMemoryMap        *gpu_low_map, *gpu_regs_map;
++static IOMemoryMap        *gpu_low_map, *gpu_regs_map, *gpu_smmu_map;
+ static volatile uint32_t  *gpu_regs, *gpu_ring, *gpu_ctl;
++static uintptr_t           gpu_smmu, gpu_gr1, gpu_cb0;
+ static uint32_t            gpu_ring_dwords, gpu_wptr, gpu_seqno, gpu_queued;
+ static uint64_t            gpu_ctl_phys;
+-static uint64_t            gpu_frames, gpu_ns_total;
++static uint64_t            gpu_frames, gpu_ns_total, gpu_smmu_faults;
+ static IOLock             *gpu_lock;    /* the ring: framebuffer copies and user submissions */
+ 
++/*
++ * Plain 32-bit LDR/STR for the GPU SMMU (Gunyah hypervisor emulation trap).
++ */
++static inline uint32_t
++smmu_rd(uintptr_t b, uint32_t o)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(b + o) : "memory");
++	return v;
++}
++
++static inline void
++smmu_wr(uintptr_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "rZ"(v), "r"(b + o) : "memory");
++}
++
++void
++sweet_gpu_clean_va(uintptr_t va, uint64_t len, bool invalidate)
++{
++	if (len == 0) {
++		return;
++	}
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = 4UL << ((ctr >> 16) & 0xf), end = va + len;
++	__builtin_arm_dsb(0xf);
++	for (uintptr_t p = va & ~(line - 1); p < end; p += line) {
++		if (invalidate) {
++			__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++		} else {
++			__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
++		}
++	}
++	__builtin_arm_dsb(0xf);
++}
++
+ static IOLock *
+ gpu_lock_get(void)
+ {
+@@ -77,13 +205,23 @@ gpu_lock_get(void)
+ 	return gpu_lock;
+ }
+ 
+-/* fence values are a wrapping sequence: done when the written value is at or past seq */
++/* Kernel fence values are a wrapping sequence: done when *gpu_ctl is at or past seq. */
+ static bool
+ seq_done(uint32_t seq)
+ {
+ 	return (int32_t)(*gpu_ctl - seq) >= 0;
+ }
+ 
++/* Per-client fence values live in vm->fence_va[GPU_USER_FENCE_OFFSET / 4]. */
++static bool
++vm_seq_done(struct sweet_gpu_vm *vm, uint32_t seq)
++{
++	uintptr_t addr = (uintptr_t)vm->fence_va + GPU_USER_FENCE_OFFSET;
++	__asm__ volatile ("dc civac, %0" :: "r"(addr & ~63UL) : "memory");
++	__builtin_arm_dsb(0xf);
++	return (int32_t)(vm->fence_va[GPU_USER_FENCE_OFFSET / 4] - seq) >= 0;
++}
++
+ static void
+ gpu_off(const char *why)
+ {
+@@ -105,6 +243,58 @@ gpu_map(uint64_t phys, uint64_t size)
+ 	return map;
+ }
+ 
++/*
++ * Linux a630_protect_regs (used for Adreno 619 on qcom,sm6375 in a6xx_catalog.c):
++ * blocks IB1/IB2/SDS from writing privileged RBBM/CP/SMMU/SECVID registers in HW.
++ */
++#define A6XX_PROT_RO(reg, len)  ((((uint32_t)(len) & 0x1fffu) << 18) | ((uint32_t)(reg) & 0x3ffffu))
++#define A6XX_PROT_RW(reg, len)  ((1u << 31) | A6XX_PROT_RO(reg, len))
++
++static void
++gpu_init_cp_protect(void)
++{
++	static const uint32_t a630_protect[32] = {
++		A6XX_PROT_RO(0x00000, 0x04ff),
++		A6XX_PROT_RO(0x00501, 0x0005),
++		A6XX_PROT_RO(0x0050b, 0x02f4),
++		A6XX_PROT_RW(0x0050e, 0x0000),
++		A6XX_PROT_RW(0x00510, 0x0000),
++		A6XX_PROT_RW(0x00534, 0x0000),
++		A6XX_PROT_RW(0x00800, 0x0082),
++		A6XX_PROT_RW(0x008a0, 0x0008),
++		A6XX_PROT_RW(0x008ab, 0x0024),
++		A6XX_PROT_RO(0x008de, 0x00ae),
++		A6XX_PROT_RW(0x00900, 0x004d),
++		A6XX_PROT_RW(0x0098d, 0x0272),
++		A6XX_PROT_RW(0x00e00, 0x0001),
++		A6XX_PROT_RW(0x00e03, 0x000c),
++		A6XX_PROT_RW(0x03c00, 0x00c3),
++		A6XX_PROT_RO(0x03cc4, 0x1fff),
++		A6XX_PROT_RW(0x08630, 0x01cf),
++		A6XX_PROT_RW(0x08e00, 0x0000),
++		A6XX_PROT_RW(0x08e08, 0x0000),
++		A6XX_PROT_RW(0x08e50, 0x001f),
++		A6XX_PROT_RW(0x09624, 0x01db),
++		A6XX_PROT_RW(0x09e70, 0x0001),
++		A6XX_PROT_RW(0x09e78, 0x0187),
++		A6XX_PROT_RW(0x0a630, 0x01cf),
++		A6XX_PROT_RW(0x0ae02, 0x0000),
++		A6XX_PROT_RW(0x0ae50, 0x032f),
++		A6XX_PROT_RW(0x0b604, 0x0000),
++		A6XX_PROT_RW(0x0be02, 0x0001),
++		A6XX_PROT_RW(0x0be20, 0x17df),
++		A6XX_PROT_RW(0x0f000, 0x0bff),
++		A6XX_PROT_RO(0x0fc00, 0x1fff),
++		A6XX_PROT_RW(0x11c00, 0x0000),  /* infinite range */
++	};
++	/* ACCESS_PROT_EN (bit 0) | ACCESS_FAULT_ON_VIOL_EN (bit 1) | LAST_SPAN_INF_RANGE (bit 3) */
++	gpu_regs[REG_CP_PROTECT_CNTL] = (1u << 3) | (1u << 1) | (1u << 0);
++	for (uint32_t i = 0; i < 32; i++) {
++		gpu_regs[REG_CP_PROTECT_BASE + i] = a630_protect[i];
++	}
++	__builtin_arm_dsb(0xf);
++}
++
+ static bool
+ gpu_init(void)
+ {
+@@ -142,6 +332,22 @@ gpu_init(void)
+ 		IOLog("SWEET GPU: cannot map regs 0x%llx\n", ho.regs_phys);
+ 		return false;
+ 	}
++	gpu_smmu_map = gpu_map(GPU_SMMU_PHYS, GPU_SMMU_SIZE);
++	if (gpu_smmu_map == NULL) {
++		IOLog("SWEET GPU: cannot map SMMU 0x%llx\n", GPU_SMMU_PHYS);
++		return false;
++	}
++	gpu_smmu = (uintptr_t)gpu_smmu_map->getVirtualAddress();
++	uint32_t id1 = smmu_rd(gpu_smmu, 0x24);
++	uint32_t pgsize = (id1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	uint32_t npage = 1u << (((id1 >> 28) & 7u) + 1u);
++	if (((uint64_t)npage + 1) * pgsize > GPU_SMMU_SIZE) {
++		IOLog("SWEET GPU: bad SMMU geometry id1=0x%x\n", id1);
++		return false;
++	}
++	gpu_gr1 = gpu_smmu + pgsize;
++	gpu_cb0 = gpu_smmu + (uintptr_t)npage * pgsize;
++
+ 	gpu_regs = (volatile uint32_t *)gpu_regs_map->getVirtualAddress();
+ 	gpu_ring = (volatile uint32_t *)(low + (ho.ring_phys - GPU_LOW_PHYS));
+ 	gpu_ctl = (volatile uint32_t *)(low + (ho.ctl_phys - GPU_LOW_PHYS));
+@@ -153,12 +359,397 @@ gpu_init(void)
+ 		gpu_off("ring not idle at handoff");
+ 		return false;
+ 	}
++	gpu_init_cp_protect();
++	/* Ensure CB0 starts with CFCFG=0 (no stall on fault) and M=0 (bypass). */
++	smmu_wr(gpu_cb0, 0x00, SMMU_SCTLR_BYPASS);
+ 	gpu_state = 1;
+-	IOLog("SWEET GPU: Adreno 619 from the shim: core %u MHz, ring 0x%llx (%u dwords) wptr %u seq %u, rbbm 0x%x\n",
+-	    ho.core_mhz, ho.ring_phys, ho.ring_dwords, gpu_wptr, gpu_seqno, gpu_regs[REG_RBBM_STATUS]);
++	IOLog("SWEET GPU: Adreno 619 from the shim: core %u MHz, ring 0x%llx (%u dwords) wptr %u seq %u, rbbm 0x%x, smmu cb0 +0x%lx, cp_protect 0x%x\n",
++	    ho.core_mhz, ho.ring_phys, ho.ring_dwords, gpu_wptr, gpu_seqno,
++	    gpu_regs[REG_RBBM_STATUS], (unsigned long)(gpu_cb0 - gpu_smmu),
++	    gpu_regs[REG_CP_PROTECT_CNTL]);
++	return true;
++}
++
++/* ---- Per-process SMMU stage-1 page tables (4 KB granule, 39-bit VA) ---- */
++
++static void
++smmu_tlb_sync(void)
++{
++	if (gpu_cb0 == 0) {
++		return;
++	}
++	__builtin_arm_dsb(0xf);
++	smmu_wr(gpu_cb0, 0x618, 0);             /* SMMU_CB0_TLBIALL (0x618, not 0x600 TLBIVA) */
++	smmu_wr(gpu_cb0, 0x7f0, 0);             /* SMMU_CB0_TLBSYNC */
++	__builtin_arm_dsb(0xf);
++	for (int i = 0; i < 1000; i++) {
++		if ((smmu_rd(gpu_cb0, 0x7f4) & 1u) == 0) {
++			break;
++		}
++		IODelay(1);
++	}
++}
++
++static void
++smmu_attach(struct sweet_gpu_vm *vm)
++{
++	smmu_wr(gpu_smmu, 0x48, 0xffffffffu);   /* clear global GFSR */
++	smmu_wr(gpu_cb0, SMMU_CB0_FSR, 0xffffffffu);    /* clear CB0_FSR */
++	smmu_wr(gpu_cb0, 0x00, SMMU_SCTLR_BYPASS); /* M=0, CFCFG=0 while programming CB0 */
++	__builtin_arm_dsb(0xf);
++	smmu_wr(gpu_gr1, 0x800, 1u);            /* CBA2R0: VA64 */
++	smmu_wr(gpu_gr1, 0x000, 0x0001f000u);   /* CBAR0: stage 1, stage 2 bypass */
++	smmu_wr(gpu_cb0, 0x38, 0x0004ff44u);    /* MAIR0: attr0=NC(0x44), attr1=WB(0xff), attr2=Dev(0x04) */
++	smmu_wr(gpu_cb0, 0x3c, 0u);             /* MAIR1 */
++	smmu_wr(gpu_cb0, 0x30, (1u << 23) | 25u); /* TCR: EPD1=1, TG0=4KB, T0SZ=25 (39-bit VA) */
++	smmu_wr(gpu_cb0, 0x10, (7u << 15) | 2u);  /* TCR2: SEP=7, PASize=2 (40-bit PA) */
++	smmu_wr(gpu_cb0, 0x20, (uint32_t)vm->l1_pa);
++	smmu_wr(gpu_cb0, 0x24, (uint32_t)(vm->l1_pa >> 32) | ((uint32_t)vm->asid << 16));
++	__builtin_arm_dsb(0xf);
++	smmu_tlb_sync();
++	/* SCTLR = 0x12f: HUPCF(8) | CFRE(5) | AFFD(3) | AFE(2) | TRE(1) | M(0); CFCFG(7)=0 */
++	smmu_wr(gpu_cb0, 0x00, SMMU_SCTLR_STAGE1);
++	__builtin_arm_dsb(0xf);
++}
++
++static void
++smmu_detach(uint32_t *fsr_out, uint64_t *far_out, uint32_t *syn_out)
++{
++	uint32_t fsr = smmu_rd(gpu_cb0, SMMU_CB0_FSR);
++	if (fsr_out != NULL) {
++		*fsr_out = fsr;
++	}
++	if ((fsr & 0x3feu) != 0) {
++		uint32_t far_lo = smmu_rd(gpu_cb0, 0x60);
++		uint32_t far_hi = smmu_rd(gpu_cb0, 0x64);
++		uint32_t syn = smmu_rd(gpu_cb0, 0x68);
++		if (far_out != NULL) {
++			*far_out = ((uint64_t)far_hi << 32) | far_lo;
++		}
++		if (syn_out != NULL) {
++			*syn_out = syn;
++		}
++		/* If SS (bit 30) somehow set, terminate stalled transaction via CB0_RESUME. */
++		if ((fsr & (1u << 30)) != 0) {
++			smmu_wr(gpu_cb0, 0x08, 1u);     /* SMMU_CB0_RESUME: TnR=1 (terminate) */
++		}
++		smmu_wr(gpu_cb0, SMMU_CB0_FSR, 0xffffffffu);
++	}
++	smmu_wr(gpu_smmu, 0x48, 0xffffffffu);   /* clear global GFSR */
++	smmu_wr(gpu_cb0, 0x00, SMMU_SCTLR_BYPASS); /* M=0, CFCFG=0: bypass for kernel display copies */
++	smmu_wr(gpu_cb0, 0x20, 0u);
++	smmu_wr(gpu_cb0, 0x24, 0u);
++	__builtin_arm_dsb(0xf);
++	smmu_tlb_sync();
++}
++
++/* Allocate one 4 KB zeroed table/subpage out of 16 KB XNU buffer pages. */
++static uint64_t *
++vm_alloc_table(struct sweet_gpu_vm *vm, uint64_t *pa_out)
++{
++	uint32_t page_idx = vm->n_sub / 4;
++	uint32_t sub_idx = vm->n_sub % 4;
++
++	if (page_idx >= SMMU_MAX_PT_PAGES) {
++		return NULL;
++	}
++	if (sub_idx == 0) {
++		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(
++		    kernel_task, kIODirectionInOut, page_size, page_size);
++		if (md == NULL) {
++			return NULL;
++		}
++		bzero(md->getBytesNoCopy(), page_size);
++		sweet_gpu_clean_va((uintptr_t)md->getBytesNoCopy(), page_size, false);
++		vm->pt_pages[page_idx] = md;
++		vm->n_pages = page_idx + 1;
++	}
++	IOBufferMemoryDescriptor *md = vm->pt_pages[page_idx];
++	IOByteCount seg = 0;
++	addr64_t base_pa = md->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
++	if (base_pa == 0 || seg < page_size) {
++		return NULL;
++	}
++	vm->n_sub++;
++	*pa_out = base_pa + (uint64_t)sub_idx * 0x1000ULL;
++	return (uint64_t *)((uintptr_t)md->getBytesNoCopy() + (uintptr_t)sub_idx * 0x1000u);
++}
++
++struct sweet_gpu_vm *
++sweet_gpu_vm_create(uint16_t asid)
++{
++	struct sweet_gpu_vm *vm = (struct sweet_gpu_vm *)IOMallocZeroData(sizeof(*vm));
++	if (vm == NULL) {
++		return NULL;
++	}
++	vm->asid = asid != 0 ? asid : 1;
++
++	uint64_t l2_user_pa = 0, l2_kern_pa = 0, l3_kern_pa = 0;
++	uint64_t *l2_kern_va = NULL, *l3_kern_va = NULL;
++	vm->l1_va = vm_alloc_table(vm, &vm->l1_pa);
++	vm->l2_user_va = vm_alloc_table(vm, &l2_user_pa);
++	l2_kern_va = vm_alloc_table(vm, &l2_kern_pa);
++	l3_kern_va = vm_alloc_table(vm, &l3_kern_pa);
++	vm->fence_va = (volatile uint32_t *)vm_alloc_table(vm, &vm->fence_pa);
++	vm->ib_mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut, GPU_USER_IB_BYTES, page_size);
++	if (vm->l1_va == NULL || vm->l2_user_va == NULL || l2_kern_va == NULL ||
++	    l3_kern_va == NULL || vm->fence_va == NULL || vm->ib_mem == NULL) {
++		sweet_gpu_vm_destroy(vm);
++		return NULL;
++	}
++	vm->ib_va = (uint32_t *)vm->ib_mem->getBytesNoCopy();
++	bzero(vm->ib_va, GPU_USER_IB_BYTES);
++	sweet_gpu_clean_va((uintptr_t)vm->ib_va, GPU_USER_IB_BYTES, false);
++
++	/* L1[0] covers user IOVAs [0x00000000, 0x40000000); L1[3] covers 0xe0000000..0xe01fffff */
++	vm->l1_va[0] = (l2_user_pa & SMMU_PA_MASK) | SMMU_PTE_PAGE;
++	vm->l1_va[(GPU_LOW_PHYS >> 30) & 0x1ff] = (l2_kern_pa & SMMU_PA_MASK) | SMMU_PTE_PAGE;
++	l2_kern_va[(GPU_LOW_PHYS >> 21) & 0x1ff] = (l3_kern_pa & SMMU_PA_MASK) | SMMU_PTE_PAGE;
++
++	/*
++	 * 1. Map CP ring (0xe0000000, 32 KB) and SQE microcode (0xe0010000, 64 KB) Read-Only.
++	 * 2. Map this client's private 4 KB fence page at GPU_USER_FENCE_IOVA (0xe0030000) Read-Write;
++	 *    the kernel's own gpu_ctl page (PA 0xe0020000) is NEVER mapped into any client VM.
++	 * 3. Map this client's kernel-only shadow IB buffer at GPU_USER_IB_IOVA (0xe0080000) Read-Only.
++	 */
++	for (uint32_t off = 0; off < GPU_RING_BYTES; off += 0x1000) {
++		uint64_t pa = GPU_RING_PHYS + off;
++		l3_kern_va[(pa >> 12) & 0x1ff] = (pa & SMMU_PA_MASK) |
++		    SMMU_PTE_AF | SMMU_PTE_SH_OS | SMMU_PTE_AP_RO | SMMU_PTE_ATTR_NC | SMMU_PTE_PAGE;
++	}
++	for (uint32_t off = 0; off < GPU_SQE_BYTES; off += 0x1000) {
++		uint64_t pa = GPU_SQE_PHYS + off;
++		l3_kern_va[(pa >> 12) & 0x1ff] = (pa & SMMU_PA_MASK) |
++		    SMMU_PTE_AF | SMMU_PTE_SH_OS | SMMU_PTE_AP_RO | SMMU_PTE_ATTR_NC | SMMU_PTE_PAGE;
++	}
++	l3_kern_va[(GPU_USER_FENCE_IOVA >> 12) & 0x1ff] = (vm->fence_pa & SMMU_PA_MASK) |
++	    SMMU_PTE_NG | SMMU_PTE_AF | SMMU_PTE_SH_OS | SMMU_PTE_AP_RW | SMMU_PTE_ATTR_NC | SMMU_PTE_PAGE;
++
++	for (uint32_t off = 0; off < GPU_USER_IB_BYTES; off += 0x1000) {
++		IOByteCount seg = 0;
++		addr64_t pa = vm->ib_mem->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		if (pa == 0) {
++			sweet_gpu_vm_destroy(vm);
++			return NULL;
++		}
++		uint64_t va = GPU_USER_IB_IOVA + off;
++		l3_kern_va[(va >> 12) & 0x1ff] = (pa & SMMU_PA_MASK) |
++		    SMMU_PTE_NG | SMMU_PTE_AF | SMMU_PTE_SH_OS | SMMU_PTE_AP_RO | SMMU_PTE_ATTR_NC | SMMU_PTE_PAGE;
++	}
++
++	sweet_gpu_clean_va((uintptr_t)vm->pt_pages[0]->getBytesNoCopy(), page_size, false);
++	if (vm->n_pages > 1) {
++		sweet_gpu_clean_va((uintptr_t)vm->pt_pages[1]->getBytesNoCopy(), page_size, false);
++	}
++	return vm;
++}
++
++void
++sweet_gpu_vm_destroy(struct sweet_gpu_vm *vm)
++{
++	if (vm == NULL) {
++		return;
++	}
++	OSSafeReleaseNULL(vm->ib_mem);
++	for (uint32_t i = 0; i < vm->n_pages; i++) {
++		OSSafeReleaseNULL(vm->pt_pages[i]);
++	}
++	IOFreeData(vm, sizeof(*vm));
++}
++
++bool
++sweet_gpu_vm_map(struct sweet_gpu_vm *vm, uint64_t iova,
++    IOMemoryDescriptor *mem, uint64_t offset, uint32_t size, bool writable)
++{
++	if (vm == NULL || mem == NULL || size == 0 || (iova & 0xfff) != 0 || (size & 0xfff) != 0 ||
++	    iova < SWEET_GPU_IOVA_BASE || iova + size > SWEET_GPU_IOVA_END || iova + size < iova) {
++		return false;
++	}
++	IOByteCount mem_len = mem->getLength();
++	uint64_t prot = writable ? SMMU_PTE_AP_RW : SMMU_PTE_AP_RO;
++	for (uint32_t off = 0; off < size; off += 0x1000) {
++		if (offset + off >= mem_len) {
++			sweet_gpu_vm_unmap(vm, iova, off);
++			return false;
++		}
++		uint64_t va = iova + off;
++		uint32_t l2_idx = (uint32_t)((va >> 21) & 0x1ff);
++		uint32_t l3_idx = (uint32_t)((va >> 12) & 0x1ff);
++		if (vm->l3_va[l2_idx] == NULL) {
++			uint64_t l3_pa = 0;
++			uint64_t *l3_va = vm_alloc_table(vm, &l3_pa);
++			if (l3_va == NULL) {
++				sweet_gpu_vm_unmap(vm, iova, off);
++				return false;
++			}
++			vm->l3_va[l2_idx] = l3_va;
++			vm->l2_user_va[l2_idx] = (l3_pa & SMMU_PA_MASK) | SMMU_PTE_PAGE;
++			sweet_gpu_clean_va((uintptr_t)&vm->l2_user_va[l2_idx], sizeof(uint64_t), false);
++		}
++		IOByteCount seg = 0;
++		addr64_t pa = mem->getPhysicalSegment(offset + off, &seg, kIOMemoryMapperNone);
++		/* Allow the tail of a wrapped client descriptor to be < 4 KB as long as the page PA is valid. */
++		if (pa == 0 || (pa & 0xfff) != 0 || seg == 0) {
++			sweet_gpu_vm_unmap(vm, iova, off);
++			return false;
++		}
++		vm->l3_va[l2_idx][l3_idx] = (pa & SMMU_PA_MASK) |
++		    SMMU_PTE_NG | SMMU_PTE_AF | SMMU_PTE_SH_OS | prot | SMMU_PTE_ATTR_NC | SMMU_PTE_PAGE;
++	}
++	uint32_t l2_first = (uint32_t)((iova >> 21) & 0x1ff);
++	uint32_t l2_last = (uint32_t)(((iova + size - 1) >> 21) & 0x1ff);
++	for (uint32_t l2 = l2_first; l2 <= l2_last; l2++) {
++		if (vm->l3_va[l2] != NULL) {
++			sweet_gpu_clean_va((uintptr_t)vm->l3_va[l2], 0x1000, false);
++		}
++	}
+ 	return true;
+ }
+ 
++void
++sweet_gpu_vm_unmap(struct sweet_gpu_vm *vm, uint64_t iova, uint32_t size)
++{
++	if (vm == NULL || size == 0 || (iova & 0xfff) != 0 || (size & 0xfff) != 0 ||
++	    iova < SWEET_GPU_IOVA_BASE || iova + size > SWEET_GPU_IOVA_END) {
++		return;
++	}
++	for (uint32_t off = 0; off < size; off += 0x1000) {
++		uint64_t va = iova + off;
++		uint32_t l2_idx = (uint32_t)((va >> 21) & 0x1ff);
++		uint32_t l3_idx = (uint32_t)((va >> 12) & 0x1ff);
++		if (vm->l3_va[l2_idx] != NULL) {
++			vm->l3_va[l2_idx][l3_idx] = 0;
++		}
++	}
++	uint32_t l2_first = (uint32_t)((iova >> 21) & 0x1ff);
++	uint32_t l2_last = (uint32_t)(((iova + size - 1) >> 21) & 0x1ff);
++	for (uint32_t l2 = l2_first; l2 <= l2_last; l2++) {
++		if (vm->l3_va[l2] != NULL) {
++			sweet_gpu_clean_va((uintptr_t)vm->l3_va[l2], 0x1000, false);
++		}
++	}
++}
++
++/*
++ * Check that a staged IB only contains safe PM4 packets and context/2D/3D
++ * register writes (no privileged CP/SMMU/SECVID/RBBM control writes, no
++ * unvalidated indirect draw state streams, and no nested IBs).
++ */
++static bool
++reg_allowed(uint32_t reg)
++{
++	return (reg >= 0x8000 && reg <= 0xbfff) ||
++	       (reg >= 0x0c00 && reg <= 0x0dff) ||
++	       (reg >= 0x0883 && reg <= 0x088a);
++}
++
++bool
++sweet_gpu_check_ib(const uint32_t *ib, uint32_t dwords)
++{
++	if (ib == NULL || dwords == 0 || dwords > SWEET_GPU_MAX_IB_DWORDS) {
++		return false;
++	}
++	uint32_t i = 0;
++	while (i < dwords) {
++		uint32_t hdr = ib[i++];
++		uint32_t type = hdr >> 28;
++		if (type == 4) {
++			uint32_t cnt = hdr & 0x7fu;
++			uint32_t reg = (hdr >> 8) & 0x3ffffu;
++			if (cnt == 0 || i + cnt > dwords) {
++				return false;
++			}
++			for (uint32_t k = 0; k < cnt; k++) {
++				if (!reg_allowed(reg + k)) {
++					return false;
++				}
++			}
++			i += cnt;
++		} else if (type == 7) {
++			uint32_t cnt = hdr & 0x7fffu;
++			uint32_t op = (hdr >> 16) & 0x7fu;
++			if (i + cnt > dwords) {
++				return false;
++			}
++			switch (op) {
++			case CP_NOP:
++			case CP_WAIT_FOR_ME:
++			case CP_SKIP_IB2_ENABLE_GLOBAL:
++			case CP_REG_RMW:
++			case CP_SKIP_IB2_ENABLE_LOCAL:
++			case CP_WAIT_FOR_IDLE:
++			case CP_BLIT:
++			case CP_SET_BIN_DATA5:
++			case CP_LOAD_STATE6:
++			case CP_LOAD_STATE6_GEOM:
++			case CP_EXEC_CS:
++			case CP_LOAD_STATE6_FRAG:
++			case CP_SET_SUBDRAW_SIZE:
++			case CP_DRAW_INDX_OFFSET:
++			case CP_WAIT_REG_MEM:
++			case CP_MEM_WRITE:
++			case CP_REG_TO_MEM:
++			case CP_EXEC_CS_INDIRECT:
++			case CP_EVENT_WRITE:
++			case CP_SET_VISIBILITY_OVERRIDE:
++			case CP_SET_MARKER:
++			case CP_MEM_TO_MEM:
++				if (op == CP_REG_RMW && (cnt < 3 || !reg_allowed(ib[i] & 0x3ffffu))) {
++					return false;
++				}
++				break;
++			case CP_SET_DRAW_STATE:
++				/*
++				 * Each draw state group entry is 3 dwords (cmd, iova_lo, iova_hi).
++				 * Register writes inside SDS groups are enforced in hardware by
++				 * CP_PROTECT (programmed in gpu_init_cp_protect).
++				 */
++				if (cnt == 0 || (cnt % 3u) != 0) {
++					return false;
++				}
++				break;
++			case CP_CONTEXT_REG_BUNCH:
++				if ((cnt & 1u) != 0) {
++					return false;
++				}
++				for (uint32_t k = 0; k < cnt; k += 2) {
++					if (!reg_allowed(ib[i + k])) {
++						return false;
++					}
++				}
++				break;
++			default:
++				/* Reject CP_SMMU_TABLE_UPDATE, CP_SET_SECURE_MODE, CP_ME_INIT, nested IBs, etc. */
++				return false;
++			}
++			i += cnt;
++		} else {
++			return false;
++		}
++	}
++	return true;
++}
++
++bool
++sweet_gpu_vm_stage_ib(struct sweet_gpu_vm *vm, const uint32_t *src_kva, uint32_t dwords)
++{
++	if (vm == NULL || vm->ib_va == NULL || src_kva == NULL ||
++	    dwords == 0 || dwords > SWEET_GPU_MAX_IB_DWORDS) {
++		return false;
++	}
++	uint32_t bytes = dwords * 4u;
++	memcpy(vm->ib_va, src_kva, bytes);
++	if (!sweet_gpu_check_ib(vm->ib_va, dwords)) {
++		bzero(vm->ib_va, bytes);
++		return false;
++	}
++	sweet_gpu_clean_va((uintptr_t)vm->ib_va, bytes, false);
++	return true;
++}
++
++/* ---- Ring packet helpers ---- */
++
+ static uint32_t
+ par(uint32_t v)
+ {
+@@ -204,6 +795,16 @@ event(uint32_t ev, bool ts)
+ 	}
+ }
+ 
++static void
++event_vm(uint32_t ev, uint64_t fence_iova, uint32_t seq)
++{
++	emit(pkt7(CP_EVENT_WRITE, 4));
++	emit(ev);
++	emit((uint32_t)fence_iova);
++	emit((uint32_t)(fence_iova >> 32));
++	emit(seq);
++}
++
+ /* One BLIT_OP_SCALE copy, 1:1, RGBA8-sized pixels moved as they are. */
+ static void
+ blit(uint64_t sbase, uint32_t spitch, uint32_t sw, uint32_t sh, uint32_t sx, uint32_t sy,
+@@ -250,17 +851,79 @@ blit(uint64_t sbase, uint32_t spitch, uint32_t sw, uint32_t sh, uint32_t sx, uin
+ static bool
+ ring_space(uint32_t n)
+ {
+-	for (int i = 0; i < 20000; i++) {       /* ~200 ms */
++	for (int i = 0; i < 40; i++) {          /* fast path: up to 200 us */
++		uint32_t rptr = gpu_regs[REG_CP_RB_RPTR];
++		uint32_t used = (gpu_wptr + gpu_ring_dwords - rptr) % gpu_ring_dwords;
++		if (used + n + 16 < gpu_ring_dwords) {
++			return true;
++		}
++		IODelay(5);
++	}
++	for (int ms = 0; ms < 200; ms++) {      /* slow path: sleep instead of spinning */
++		IOSleep(1);
+ 		uint32_t rptr = gpu_regs[REG_CP_RB_RPTR];
+ 		uint32_t used = (gpu_wptr + gpu_ring_dwords - rptr) % gpu_ring_dwords;
+ 		if (used + n + 16 < gpu_ring_dwords) {
+ 			return true;
+ 		}
+-		IODelay(10);
+ 	}
+ 	return false;
+ }
+ 
++/*
++ * Wait for the CP ring to drain (RPTR == WPTR) AND for the kernel's last
++ * CACHE_FLUSH_TS fence write (*gpu_ctl >= gpu_seqno) to land in memory before
++ * switching CB0 from bypass to a client VM.
++ */
++static bool
++ring_idle(uint32_t timeout_ms)
++{
++	for (int i = 0; i < 20; i++) {
++		if (gpu_regs[REG_CP_RB_RPTR] == gpu_wptr && seq_done(gpu_seqno)) {
++			return true;
++		}
++		IODelay(5);
++	}
++	for (uint32_t ms = 0; ms < timeout_ms; ms++) {
++		IOSleep(1);
++		if (gpu_regs[REG_CP_RB_RPTR] == gpu_wptr && seq_done(gpu_seqno)) {
++			return true;
++		}
++	}
++	return gpu_regs[REG_CP_RB_RPTR] == gpu_wptr && seq_done(gpu_seqno);
++}
++
++/*
++ * Wait for a client submission on vm to finish (RPTR == WPTR and vm's private
++ * fence page updated to seq) before detaching CB0 back to bypass.
++ * Stops early if CB0_FSR reports an SMMU fault once RPTR catches up.
++ */
++static bool
++ring_idle_vm(struct sweet_gpu_vm *vm, uint32_t seq, uint32_t timeout_ms)
++{
++	for (int i = 0; i < 40; i++) {
++		bool rptr_ok = (gpu_regs[REG_CP_RB_RPTR] == gpu_wptr);
++		if (rptr_ok && vm_seq_done(vm, seq)) {
++			return true;
++		}
++		if (rptr_ok && (smmu_rd(gpu_cb0, SMMU_CB0_FSR) & 0x3feu) != 0) {
++			return false;
++		}
++		IODelay(5);
++	}
++	for (uint32_t ms = 0; ms < timeout_ms; ms++) {
++		IOSleep(1);
++		bool rptr_ok = (gpu_regs[REG_CP_RB_RPTR] == gpu_wptr);
++		if (rptr_ok && vm_seq_done(vm, seq)) {
++			return true;
++		}
++		if (rptr_ok && (smmu_rd(gpu_cb0, SMMU_CB0_FSR) & 0x3feu) != 0) {
++			return false;
++		}
++	}
++	return gpu_regs[REG_CP_RB_RPTR] == gpu_wptr && vm_seq_done(vm, seq);
++}
++
+ static void
+ kick(void)
+ {
+@@ -269,6 +932,31 @@ kick(void)
+ 	gpu_queued = 0;
+ }
+ 
++static void
++emit_copy_blits(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
++    uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy)
++{
++	if (fb_stride % 64 == 0 && src_pitch % 64 == 0) {
++		uint64_t drow = fb + (uint64_t)dy * fb_stride + (uint64_t)dx * 4;
++		uint64_t srow = src + (uint64_t)sy * src_pitch + (uint64_t)sx * 4;
++		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
++		blit(srow & ~63ULL, src_pitch, sxo + w, h, sxo, 0, drow & ~63ULL, fb_stride, dxo, 0, w, h);
++		return;
++	}
++	for (uint32_t par_ = 0; par_ < 2; par_++) {
++		uint32_t r0 = dy + ((par_ + 2 - (dy & 1)) & 1);
++		if (r0 >= dy + h) {
++			continue;
++		}
++		uint32_t n = (dy + h - r0 + 1) / 2;
++		uint64_t drow = fb + (uint64_t)r0 * fb_stride + (uint64_t)dx * 4;
++		uint64_t srow = src + (uint64_t)(sy + r0 - dy) * src_pitch + (uint64_t)sx * 4;
++		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
++		blit(srow & ~63ULL, 2 * src_pitch, sxo + w, n, sxo, 0,
++		    drow & ~63ULL, 2 * fb_stride, dxo, 0, w, n);
++	}
++}
++
+ bool
+ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+     uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy)
+@@ -292,26 +980,7 @@ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+ 		event(CACHE_INVALIDATE, false);
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	}
+-	if (fb_stride % 64 == 0 && src_pitch % 64 == 0) {
+-		/* aligned destination (the flip buffers): one blit */
+-		uint64_t drow = fb + (uint64_t)dy * fb_stride + (uint64_t)dx * 4;
+-		uint64_t srow = src + (uint64_t)sy * src_pitch + (uint64_t)sx * 4;
+-		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
+-		blit(srow & ~63ULL, src_pitch, sxo + w, h, sxo, 0, drow & ~63ULL, fb_stride, dxo, 0, w, h);
+-		return true;
+-	}
+-	for (uint32_t par_ = 0; par_ < 2; par_++) {
+-		uint32_t r0 = dy + ((par_ + 2 - (dy & 1)) & 1);         /* first panel row of this parity */
+-		if (r0 >= dy + h) {
+-			continue;
+-		}
+-		uint32_t n = (dy + h - r0 + 1) / 2;
+-		uint64_t drow = fb + (uint64_t)r0 * fb_stride + (uint64_t)dx * 4;
+-		uint64_t srow = src + (uint64_t)(sy + r0 - dy) * src_pitch + (uint64_t)sx * 4;
+-		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
+-		blit(srow & ~63ULL, 2 * src_pitch, sxo + w, n, sxo, 0,
+-		    drow & ~63ULL, 2 * fb_stride, dxo, 0, w, n);
+-	}
++	emit_copy_blits(src, src_pitch, sx, sy, w, h, fb, fb_stride, dx, dy);
+ 	return true;
+ }
+ 
+@@ -335,8 +1004,11 @@ sweet_gpu_flush(void)
+ 	uint32_t seq = gpu_seqno;
+ 	kick();
+ 	IOLockUnlock(gpu_lock);
+-	for (int i = 0; i < 20000 && !seq_done(seq); i++) {   /* ~200 ms */
+-		IODelay(10);
++	for (int i = 0; i < 400 && !seq_done(seq); i++) {       /* fast spin up to 2 ms */
++		IODelay(5);
++	}
++	for (int ms = 0; ms < 200 && !seq_done(seq); ms++) {
++		IOSleep(1);
+ 	}
+ 	if (!seq_done(seq)) {
+ 		gpu_off("fence timeout");
+@@ -353,46 +1025,140 @@ sweet_gpu_flush(void)
+ }
+ 
+ /*
+- * User submissions (SweetGPUDevice.cpp): run dwords of commands at GPU
+- * address iova as an indirect buffer, then flush CCU and UCHE and write a
+- * fence. Returns the fence value to wait for.
++ * User submissions (SweetGPUDevice.cpp): switch CB0 to the client's SMMU page
++ * table, run dwords of commands from the client's read-only staged IB buffer
++ * (GPU_USER_IB_IOVA), flush CCU and UCHE, write the fence into the client's
++ * private fence page (GPU_USER_FENCE_IOVA), wait for completion, and detach CB0.
++ *
++ * Faults or timeouts fail only this client's submission and restore CB0 to
++ * bypass (M=0) without calling gpu_off(), so kernel display copies continue.
+  */
+ bool
+-sweet_gpu_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seq_out)
++sweet_gpu_submit_ib(struct sweet_gpu_vm *vm, uint32_t dwords,
++    uint32_t *seq_out, bool *faulted_out)
+ {
+-	if (!gpu_init() || dwords == 0 || dwords >= (1u << 20)) {
++	if (faulted_out != NULL) {
++		*faulted_out = false;
++	}
++	if (!gpu_init() || vm == NULL || gpu_cb0 == 0 ||
++	    dwords == 0 || dwords > SWEET_GPU_MAX_IB_DWORDS) {
+ 		return false;
+ 	}
+ 	IOLockLock(gpu_lock_get());
+-	if (gpu_state <= 0 || !ring_space(64)) {
++	if (gpu_state <= 0 || !ring_idle(100) || !ring_space(64)) {
+ 		IOLockUnlock(gpu_lock);
+ 		return false;
+ 	}
+-	event(CACHE_INVALIDATE, false);         /* the CPU wrote sources through WC mappings */
++	smmu_attach(vm);
++	uint32_t seq = ++vm->seqno;
++	uint64_t fence_iova = GPU_USER_FENCE_IOVA + GPU_USER_FENCE_OFFSET;
++	event(CACHE_INVALIDATE, false);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	emit(pkt7(CP_INDIRECT_BUFFER, 3));
+-	emit((uint32_t)iova);
+-	emit((uint32_t)(iova >> 32));
++	emit((uint32_t)GPU_USER_IB_IOVA);
++	emit((uint32_t)(GPU_USER_IB_IOVA >> 32));
+ 	emit(dwords);
+-	event(PC_CCU_FLUSH_COLOR_TS, true);
++	event_vm(PC_CCU_FLUSH_COLOR_TS, fence_iova, seq);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+-	event(CACHE_FLUSH_TS, true);
+-	*seq_out = gpu_seqno;
++	event_vm(CACHE_FLUSH_TS, fence_iova, seq);
++	*seq_out = seq;
+ 	kick();
++
++	bool done = ring_idle_vm(vm, seq, 150);
++	uint32_t fsr = 0, syn = 0;
++	uint64_t far = 0;
++	smmu_detach(&fsr, &far, &syn);
++	if (!done && gpu_regs[REG_CP_RB_RPTR] != gpu_wptr) {
++		/* Recover ring write pointer after detaching CB0 back to bypass. */
++		for (int i = 0; i < 10 && gpu_regs[REG_CP_RB_RPTR] != gpu_wptr; i++) {
++			IOSleep(1);
++		}
++		gpu_wptr = gpu_regs[REG_CP_RB_RPTR];
++		gpu_queued = 0;
++		IOLog("SWEET GPU: user IB timeout (asid %u rbbm 0x%x hwf 0x%x prot 0x%x)\n",
++		    vm->asid, gpu_regs[REG_RBBM_STATUS], gpu_regs[REG_CP_HW_FAULT],
++		    gpu_regs[REG_CP_PROTECT_STATUS]);
++	}
+ 	IOLockUnlock(gpu_lock);
+-	return true;
++
++	if ((fsr & 0x3feu) != 0) {
++		gpu_smmu_faults++;
++		if (faulted_out != NULL) {
++			*faulted_out = true;
++		}
++		IOLog("SWEET GPU: SMMU fault (asid %u): fsr 0x%x far 0x%llx syn 0x%x\n",
++		    vm->asid, fsr, far, syn);
++		return false;
++	}
++	return done;
++}
++
++bool
++sweet_gpu_copy_vm(struct sweet_gpu_vm *vm, uint64_t src_iova, uint32_t src_pitch,
++    uint32_t sx, uint32_t sy, uint32_t w, uint32_t h,
++    uint64_t dst_iova, uint32_t dst_pitch, uint32_t dx, uint32_t dy)
++{
++	if (!gpu_init() || vm == NULL || gpu_cb0 == 0 || w == 0 || h == 0) {
++		return false;
++	}
++	if ((2 * src_pitch) % 64 || (2 * dst_pitch) % 64 || sx + w + 16 > 16384 || dx + w + 16 > 16384 ||
++	    h >= 16384) {
++		return false;
++	}
++	IOLockLock(gpu_lock_get());
++	if (gpu_state <= 0 || !ring_idle(100) || !ring_space(2 * BLIT_DWORDS + 32)) {
++		IOLockUnlock(gpu_lock);
++		return false;
++	}
++	smmu_attach(vm);
++	uint32_t seq = ++vm->seqno;
++	uint64_t fence_iova = GPU_USER_FENCE_IOVA + GPU_USER_FENCE_OFFSET;
++	event(CACHE_INVALIDATE, false);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit_copy_blits(src_iova, src_pitch, sx, sy, w, h, dst_iova, dst_pitch, dx, dy);
++	event_vm(PC_CCU_FLUSH_COLOR_TS, fence_iova, seq);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event_vm(CACHE_FLUSH_TS, fence_iova, seq);
++	kick();
++
++	bool done = ring_idle_vm(vm, seq, 150);
++	uint32_t fsr = 0, syn = 0;
++	uint64_t far = 0;
++	smmu_detach(&fsr, &far, &syn);
++	if (!done && gpu_regs[REG_CP_RB_RPTR] != gpu_wptr) {
++		for (int i = 0; i < 10 && gpu_regs[REG_CP_RB_RPTR] != gpu_wptr; i++) {
++			IOSleep(1);
++		}
++		gpu_wptr = gpu_regs[REG_CP_RB_RPTR];
++		gpu_queued = 0;
++		IOLog("SWEET GPU: copy_vm timeout (asid %u rbbm 0x%x)\n",
++		    vm->asid, gpu_regs[REG_RBBM_STATUS]);
++	}
++	IOLockUnlock(gpu_lock);
++
++	if ((fsr & 0x3feu) != 0) {
++		gpu_smmu_faults++;
++		IOLog("SWEET GPU: SMMU fault in copy_vm (asid %u): fsr 0x%x far 0x%llx syn 0x%x\n",
++		    vm->asid, fsr, far, syn);
++		return false;
++	}
++	return done;
+ }
+ 
+ bool
+-sweet_gpu_wait(uint32_t seq, uint32_t timeout_us)
++sweet_gpu_wait(struct sweet_gpu_vm *vm, uint32_t seq, uint32_t timeout_us)
+ {
+-	if (gpu_state <= 0) {
++	if (gpu_state <= 0 || vm == NULL || vm->fence_va == NULL) {
+ 		return false;
+ 	}
+-	for (uint32_t i = 0; i < timeout_us / 10 && !seq_done(seq); i++) {
+-		IODelay(10);
++	for (uint32_t i = 0; i < 10 && !vm_seq_done(vm, seq); i++) {
++		IODelay(5);
+ 	}
+-	return seq_done(seq);
++	uint32_t timeout_ms = timeout_us / 1000;
++	for (uint32_t ms = 0; ms < timeout_ms && !vm_seq_done(vm, seq); ms++) {
++		IOSleep(1);
++	}
++	return vm_seq_done(vm, seq);
+ }
+ 
+ uint64_t
+@@ -412,6 +1178,8 @@ sweet_gpu_param(uint32_t which)
+ 		return *gpu_ctl;
+ 	case SWEET_GPU_PARAM_STATUS:
+ 		return gpu_regs[REG_RBBM_STATUS] | ((uint64_t)gpu_regs[REG_CP_HW_FAULT] << 32);
++	case SWEET_GPU_PARAM_SMMU_FAULTS:
++		return gpu_smmu_faults;
+ 	default:
+ 		return 0;
+ 	}
+@@ -419,14 +1187,60 @@ sweet_gpu_param(uint32_t which)
+ 
+ #else /* !SWEET */
+ 
++struct sweet_gpu_vm *
++sweet_gpu_vm_create(uint16_t)
++{
++	return 0;
++}
++
++void
++sweet_gpu_vm_destroy(struct sweet_gpu_vm *)
++{
++}
++
++bool
++sweet_gpu_vm_map(struct sweet_gpu_vm *, uint64_t, IOMemoryDescriptor *, uint64_t, uint32_t, bool)
++{
++	return false;
++}
++
++void
++sweet_gpu_vm_unmap(struct sweet_gpu_vm *, uint64_t, uint32_t)
++{
++}
++
++void
++sweet_gpu_clean_va(uintptr_t, uint64_t, bool)
++{
++}
++
++bool
++sweet_gpu_check_ib(const uint32_t *, uint32_t)
++{
++	return false;
++}
++
++bool
++sweet_gpu_vm_stage_ib(struct sweet_gpu_vm *, const uint32_t *, uint32_t)
++{
++	return false;
++}
++
++bool
++sweet_gpu_submit_ib(struct sweet_gpu_vm *, uint32_t, uint32_t *, bool *)
++{
++	return false;
++}
++
+ bool
+-sweet_gpu_submit_ib(uint64_t, uint32_t, uint32_t *)
++sweet_gpu_copy_vm(struct sweet_gpu_vm *, uint64_t, uint32_t, uint32_t, uint32_t,
++    uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t)
+ {
+ 	return false;
+ }
+ 
+ bool
+-sweet_gpu_wait(uint32_t, uint32_t)
++sweet_gpu_wait(struct sweet_gpu_vm *, uint32_t, uint32_t)
+ {
+ 	return false;
+ }
+diff --git a/iokit/Kernel/arm/SweetGPU.h b/iokit/Kernel/arm/SweetGPU.h
+index 3130896..fd28cd7 100644
+--- a/iokit/Kernel/arm/SweetGPU.h
++++ b/iokit/Kernel/arm/SweetGPU.h
+@@ -1,5 +1,6 @@
+ /*
+- * Adreno 619 2D copies for SWEET on sunstone (see SweetGPU.cpp).
++ * Adreno 619 2D copies and SMMU-isolated user submissions for SWEET on sunstone
++ * (see SweetGPU.cpp and SweetGPUDevice.cpp).
+  */
+ #ifndef _SWEET_GPU_H
+ #define _SWEET_GPU_H
+@@ -8,9 +9,12 @@
+ #include <stdbool.h>
+ 
+ #ifdef __cplusplus
++class IOMemoryDescriptor;
+ extern "C" {
+ #endif
+ 
++struct sweet_gpu_vm;
++
+ /*
+  * Queue a copy of a w x h rectangle of 32-bit pixels from physically
+  * contiguous memory (pixel sx,sy of a surface at physical src with
+@@ -27,16 +31,61 @@ bool sweet_gpu_ready(void);
+ /* Run what sweet_gpu_copy() queued and wait for it. false: the GPU is off for good. */
+ bool sweet_gpu_flush(void);
+ 
+-/* User submissions (SweetGPUDevice.cpp): see SweetGPU.cpp. */
+-bool sweet_gpu_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seq_out);
+-bool sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
++/*
++ * Per-process GPU SMMU stage-1 page tables (4 KB granule, 39-bit VA).
++ * Each SweetGPUUserClient gets its own sweet_gpu_vm so the GPU can only
++ * access BOs mapped into that client's address space.
++ */
++#define SWEET_GPU_IOVA_BASE     0x10000000ULL
++#define SWEET_GPU_IOVA_END      0x40000000ULL
++#define SWEET_GPU_IOVA_ALIGN    0x00010000ULL   /* 64 KB aligned BO base */
++#define SWEET_GPU_IOVA_GUARD    0x00004000ULL   /* 16 KB unmapped guard between BOs */
++#define SWEET_GPU_MAX_IB_DWORDS (1u << 16)      /* 64K dwords (256 KB) max per IB */
++
++struct sweet_gpu_vm *sweet_gpu_vm_create(uint16_t asid);
++void sweet_gpu_vm_destroy(struct sweet_gpu_vm *vm);
++bool sweet_gpu_vm_map(struct sweet_gpu_vm *vm, uint64_t iova,
++    IOMemoryDescriptor *mem, uint64_t offset, uint32_t size, bool writable);
++void sweet_gpu_vm_unmap(struct sweet_gpu_vm *vm, uint64_t iova, uint32_t size);
++
++/* Clean/invalidate CPU data cache lines to PoC by virtual address. */
++void sweet_gpu_clean_va(uintptr_t va, uint64_t len, bool invalidate);
++
++/* Validate PM4 packets in a command buffer. */
++bool sweet_gpu_check_ib(const uint32_t *ib, uint32_t dwords);
++
++/*
++ * Copy dwords from a user BO (src_kva) into vm's kernel-only read-only IB
++ * shadow buffer, validate the copied packets (eliminating TOCTOU), and
++ * clean the shadow buffer to PoC. Must be called with the client lock held.
++ */
++bool sweet_gpu_vm_stage_ib(struct sweet_gpu_vm *vm, const uint32_t *src_kva,
++    uint32_t dwords);
++
++/*
++ * User submissions (SweetGPUDevice.cpp): switch GPU SMMU CB0 to vm, run
++ * dwords of commands from vm's read-only staged IB buffer, flush CCU and
++ * UCHE, write a fence into vm's private fence page, wait for completion,
++ * and detach vm back to bypass.
++ * Sets *faulted_out = true if the GPU SMMU reported a fault in CB0_FSR.
++ */
++bool sweet_gpu_submit_ib(struct sweet_gpu_vm *vm, uint32_t dwords,
++    uint32_t *seq_out, bool *faulted_out);
++
++/* 2D blit within a client's SMMU address space (src_iova -> dst_iova). */
++bool sweet_gpu_copy_vm(struct sweet_gpu_vm *vm, uint64_t src_iova, uint32_t src_pitch,
++    uint32_t sx, uint32_t sy, uint32_t w, uint32_t h,
++    uint64_t dst_iova, uint32_t dst_pitch, uint32_t dx, uint32_t dy);
++
++bool sweet_gpu_wait(struct sweet_gpu_vm *vm, uint32_t seq, uint32_t timeout_us);
+ 
+ enum {
+-	SWEET_GPU_PARAM_CHIP_ID   = 0,
+-	SWEET_GPU_PARAM_GPU_ID    = 1,
+-	SWEET_GPU_PARAM_GMEM_SIZE = 2,
+-	SWEET_GPU_PARAM_FENCE     = 3,  /* last fence value written */
+-	SWEET_GPU_PARAM_STATUS    = 4,  /* RBBM_STATUS | CP_HW_FAULT << 32 */
++	SWEET_GPU_PARAM_CHIP_ID     = 0,
++	SWEET_GPU_PARAM_GPU_ID      = 1,
++	SWEET_GPU_PARAM_GMEM_SIZE   = 2,
++	SWEET_GPU_PARAM_FENCE       = 3,        /* last kernel fence value written */
++	SWEET_GPU_PARAM_STATUS      = 4,        /* RBBM_STATUS | CP_HW_FAULT << 32 */
++	SWEET_GPU_PARAM_SMMU_FAULTS = 5,        /* total SMMU faults caught */
+ };
+ uint64_t sweet_gpu_param(uint32_t which);
+ 
+diff --git a/iokit/Kernel/arm/SweetGPUDevice.cpp b/iokit/Kernel/arm/SweetGPUDevice.cpp
+index 5c71e7a..2f10bfb 100644
+--- a/iokit/Kernel/arm/SweetGPUDevice.cpp
++++ b/iokit/Kernel/arm/SweetGPUDevice.cpp
+@@ -1,22 +1,41 @@
+ /*
+  * User-space access to the Adreno 619 for SWEET on sunstone: the kernel side
+- * a Mesa freedreno winsys will talk to (a small subset of Linux's msm DRM
+- * driver: buffer objects, indirect-buffer submission, fences).
++ * a Mesa freedreno winsys (and CoreAnimation's GLES/EGL stack) talks to.
+  *
+- * SweetGPUDevice (IOResources, published when SweetGPU took the GPU over from
+- * the shim) opens SweetGPUUserClient, whose external methods are:
+- *   0 GetParam   [param]           -> [value]          (SWEET_GPU_PARAM_*)
+- *   1 BONew      [size]            -> [handle, iova, user address, size]
+- *   2 BOFree     [handle]
+- *   3 Submit     [handle, offset, dwords] -> [fence]   commands at iova+offset as an IB
+- *   4 Wait       [fence, timeout ms]       -> status   kIOReturnTimeout if not reached
++ * Security & Isolation Architecture:
++ *   1. Permission checks: opening SweetGPUUserClient verifies that the calling
++ *      task has foreground GPU privilege (kIOClientPrivilegeForeground, i.e.
++ *      not marked task_gpu_denied by XNU). On iOS all GUI apps and daemons run
++ *      as mobile (UID 501) or root (UID 0), so all non-denied foreground tasks
++ *      in those UIDs (plus any task holding "com.sunstone.gpu-access" or
++ *      "com.apple.private.gpu-access") are permitted.
++ *   2. Per-process SMMU page tables: each SweetGPUUserClient owns an isolated
++ *      ARMv8 Stage-1 page table (struct sweet_gpu_vm) on the GPU SMMU
++ *      (0x05940000), including its own private fence page at 0xe0030000 and
++ *      a kernel-only read-only staged IB buffer at 0xe0080000. The GPU can
++ *      only access BOs explicitly mapped into that client's page table.
++ *   3. GPU Virtual Addresses (IOVA) only: user space only ever receives GPU
++ *      virtual addresses in [SWEET_GPU_IOVA_BASE, SWEET_GPU_IOVA_END)
++ *      (0x10000000..0x40000000), never physical addresses.
++ *   4. TOCTOU-free IB staging + CP_PROTECT: Submit (selector 3) copies the
++ *      client's IB into the client VM's kernel-only read-only staging buffer,
++ *      validates the staged copy against the PM4/register whitelist, and
++ *      executes from the read-only staging IOVA while hardware CP_PROTECT
++ *      blocks privileged register writes across IB1/IB2/SDS.
+  *
+- * Buffer objects are physically contiguous, write-combined in the kernel and
+- * in the client, so the CPU and the GPU see the same bytes without cache
+- * maintenance. GPU addresses are physical (identity GPU SMMU bank), and the
+- * GPU itself is not fenced off from other memory yet: bring-up only.
++ * External methods:
++ *   0 GetParam      [param]                    -> [value]
++ *   1 BONew         [size]                     -> [handle, iova, user_va, size]
++ *   2 BOFree        [handle]
++ *   3 Submit        [handle, offset, dwords]   -> [fence]
++ *   4 Wait          [fence, timeout_ms]        -> status
++ *   5 BOClean       [handle, offset, length]   -> status (PoC cache clean)
++ *   6 CopyToSurface [bo_h, src_pitch, sx, sy, w, h, surf_id, dx, dy] -> status
++ *   7 BOFromSurface [surf_id]                  -> [handle, iova, user_va, size,
++ *                                                  width, height, bpr, format]
+  */
+ #include "SweetGPU.h"
++#include "SweetSurface.h"
+ 
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -27,9 +46,16 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOKitKeys.h>
++#include <libkern/OSAtomic.h>
++#include <kern/task.h>
++#include <mach/task_info.h>
++#include <sys/proc.h>
+ 
+ #define SWEET_GPU_MAX_BOS       256
+ #define SWEET_GPU_MAX_BO_SIZE   (256u << 20)
++#define SWEET_GPU_UID_MOBILE    501u
++
++static volatile SInt32 sweet_gpu_next_asid = 1;
+ 
+ class SweetGPUDevice : public IOService {
+ 	OSDeclareDefaultStructors(SweetGPUDevice);
+@@ -51,27 +77,35 @@ SweetGPUDevice::start(IOService *provider)
+ 	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+ 	registerService();
+-	IOLog("SWEET GPU: SweetGPUDevice ready (chip %#llx)\n", sweet_gpu_param(SWEET_GPU_PARAM_CHIP_ID));
++	IOLog("SWEET GPU: SweetGPUDevice ready (chip %#llx, SMMU per-process VM)\n",
++	    sweet_gpu_param(SWEET_GPU_PARAM_CHIP_ID));
+ 	return true;
+ }
+ 
+ struct sweet_gpu_bo {
+-	IOBufferMemoryDescriptor *mem;
+-	IOMemoryMap              *map;      /* in the client task */
+-	uint64_t                  iova;
+-	uint32_t                  size;
++	IOMemoryDescriptor *mem;
++	IOMemoryMap        *map;        /* mapping in fTask */
++	SweetSurface       *surf;       /* non-NULL if imported via BOFromSurface */
++	uint64_t            iova;       /* page-aligned base GPU VA in fVM */
++	uint32_t            size;       /* 4 KB-rounded mapped byte size in fVM */
++	uint32_t            delta;      /* byte offset from iova/map base (wrapDelta + offset) */
++	uint32_t            usable_size;/* accessible byte size starting at delta */
+ };
+ 
+ class SweetGPUUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(SweetGPUUserClient);
+ 
+-	task_t              fTask;
+-	IOLock             *fLock;
+-	struct sweet_gpu_bo fBOs[SWEET_GPU_MAX_BOS];
+-	uint32_t            fLastFence;
+-	bool                fFenced;
++	task_t               fTask;
++	IOLock              *fLock;
++	struct sweet_gpu_vm *fVM;
++	uint16_t             fASID;
++	struct sweet_gpu_bo  fBOs[SWEET_GPU_MAX_BOS];
++	uint32_t             fLastFence;
++	bool                 fFenced;
+ 
+-	void freeBO(uint32_t handle);
++	static bool checkPermission(task_t task, void *securityID);
++	uint64_t    allocIOVA(uint32_t size);
++	void        freeBO(uint32_t handle);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -83,41 +117,142 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ 
++bool
++SweetGPUUserClient::checkPermission(task_t task, void *securityID)
++{
++	if (task == NULL || securityID == NULL) {
++		return false;
++	}
++	/* Reject background tasks explicitly denied GPU access by XNU policy. */
++	if (clientHasPrivilege(securityID, kIOClientPrivilegeForeground) != kIOReturnSuccess) {
++		return false;
++	}
++	/* Allow root (UID 0). */
++	if (clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess) {
++		return true;
++	}
++	/* Allow explicit GPU entitlements. */
++	OSPtr<OSObject> ent = copyClientEntitlement(task, "com.sunstone.gpu-access");
++	if (ent.get() == kOSBooleanTrue) {
++		return true;
++	}
++	OSPtr<OSObject> privEnt = copyClientEntitlement(task, "com.apple.private.gpu-access");
++	if (privEnt.get() == kOSBooleanTrue) {
++		return true;
++	}
++	/*
++	 * Allow UID 0 (root) and UID 501 (mobile). On iOS all third-party and
++	 * system apps run as UID 501, so any non-GPU-denied app is permitted.
++	 */
++	security_token_t token;
++	mach_msg_type_number_t count = TASK_SECURITY_TOKEN_COUNT;
++	if (task_info(task, TASK_SECURITY_TOKEN, (task_info_t)&token, &count) == KERN_SUCCESS) {
++		if (token.val[0] == 0 || token.val[0] == SWEET_GPU_UID_MOBILE) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+ 		return false;
+ 	}
++	char name[32] = { 0 };
++	proc_selfname(name, sizeof(name));
++	if (!checkPermission(owningTask, securityID)) {
++		IOLog("SWEET GPU: permission denied for %s\n", name);
++		return false;
++	}
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
++	if (fLock == NULL) {
++		return false;
++	}
++	uint32_t raw_asid = (uint32_t)OSIncrementAtomic(&sweet_gpu_next_asid);
++	fASID = (uint16_t)((raw_asid % 254u) + 1u);
++	fVM = sweet_gpu_vm_create(fASID);
++	if (fVM == NULL) {
++		IOLog("SWEET GPU: failed to allocate SMMU page table for %s\n", name);
++		IOLockFree(fLock);
++		fLock = NULL;
++		return false;
++	}
+ 	bzero(fBOs, sizeof(fBOs));
+-	return fLock != NULL;
++	fLastFence = 0;
++	fFenced = false;
++	IOLog("SWEET GPU: opened client for %s (asid %u)\n", name, fASID);
++	return true;
++}
++
++/*
++ * Find the first unmapped [iova, iova + size + guard) window in this client's
++ * GPU virtual address space [SWEET_GPU_IOVA_BASE, SWEET_GPU_IOVA_END).
++ * Lock held.
++ */
++uint64_t
++SweetGPUUserClient::allocIOVA(uint32_t size)
++{
++	uint64_t cand = SWEET_GPU_IOVA_BASE;
++	uint64_t span = ((uint64_t)size + SWEET_GPU_IOVA_GUARD + SWEET_GPU_IOVA_ALIGN - 1) &
++	    ~(SWEET_GPU_IOVA_ALIGN - 1);
++
++	for (;;) {
++		if (cand + span > SWEET_GPU_IOVA_END) {
++			return 0;
++		}
++		bool hit = false;
++		for (uint32_t i = 1; i < SWEET_GPU_MAX_BOS; i++) {
++			if (fBOs[i].mem == NULL) {
++				continue;
++			}
++			uint64_t bo_start = fBOs[i].iova;
++			uint64_t bo_end = ((bo_start + fBOs[i].size + SWEET_GPU_IOVA_GUARD +
++			    SWEET_GPU_IOVA_ALIGN - 1) & ~(SWEET_GPU_IOVA_ALIGN - 1));
++			if (cand < bo_end && cand + span > bo_start) {
++				cand = bo_end;
++				hit = true;
++				break;
++			}
++		}
++		if (!hit) {
++			return cand;
++		}
++	}
+ }
+ 
+ void
+ SweetGPUUserClient::freeBO(uint32_t handle)
+ {
+ 	struct sweet_gpu_bo *bo = &fBOs[handle];
+-	/* the GPU may still use it: wait for this client's last submission */
+-	if (fFenced) {
+-		(void)sweet_gpu_wait(fLastFence, 500000);
++	/* Wait for this client's last submission before unmapping pages from its SMMU VM. */
++	if (fFenced && fVM != NULL) {
++		(void)sweet_gpu_wait(fVM, fLastFence, 500000);
++		fFenced = false;
++	}
++	if (fVM != NULL && bo->iova != 0 && bo->size != 0) {
++		sweet_gpu_vm_unmap(fVM, bo->iova, bo->size);
+ 	}
+ 	OSSafeReleaseNULL(bo->map);
+ 	OSSafeReleaseNULL(bo->mem);
++	OSSafeReleaseNULL(bo->surf);
+ 	bzero(bo, sizeof(*bo));
+ }
+ 
+ IOReturn
+ SweetGPUUserClient::clientClose(void)
+ {
+-	IOLockLock(fLock);
+-	for (uint32_t i = 1; i < SWEET_GPU_MAX_BOS; i++) {
+-		if (fBOs[i].mem != NULL) {
+-			freeBO(i);
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++		for (uint32_t i = 1; i < SWEET_GPU_MAX_BOS; i++) {
++			if (fBOs[i].mem != NULL) {
++				freeBO(i);
++			}
+ 		}
++		IOLockUnlock(fLock);
+ 	}
+-	IOLockUnlock(fLock);
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -125,8 +260,18 @@ SweetGPUUserClient::clientClose(void)
+ void
+ SweetGPUUserClient::free(void)
+ {
++	if (fVM != NULL) {
++		for (uint32_t i = 1; i < SWEET_GPU_MAX_BOS; i++) {
++			if (fBOs[i].mem != NULL) {
++				freeBO(i);
++			}
++		}
++		sweet_gpu_vm_destroy(fVM);
++		fVM = NULL;
++	}
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
++		fLock = NULL;
+ 	}
+ 	IOUserClient::free();
+ }
+@@ -142,7 +287,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 
+ 	IOLockLock(fLock);
+ 	switch (selector) {
+-	case 0:         /* GetParam */
++	case 0:         /* GetParam: [param] -> [value] */
+ 		if (nin < 1 || args->scalarOutputCount < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+@@ -150,7 +295,8 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		out[0] = sweet_gpu_param((uint32_t)in[0]);
+ 		args->scalarOutputCount = 1;
+ 		break;
+-	case 1: {       /* BONew */
++
++	case 1: {       /* BONew: [size] -> [handle, iova, user_va, size] */
+ 		if (nin < 1 || args->scalarOutputCount < 4 || in[0] == 0 || in[0] > SWEET_GPU_MAX_BO_SIZE) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+@@ -164,12 +310,24 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			break;
+ 		}
+ 		uint32_t size = (uint32_t)round_page((vm_size_t)in[0]);
+-		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
+-		    size, ~((mach_vm_address_t)page_size - 1));
++		uint64_t iova = allocIOVA(size);
++		if (iova == 0) {
++			ret = kIOReturnNoSpace;
++			break;
++		}
++		/*
++		 * Allocate non-contiguous wired pages: our per-process SMMU page table
++		 * maps arbitrary 4 KB physical pages contiguously into GPU IOVA space,
++		 * avoiding contiguous-DMA carveout exhaustion and the pmap_find_phys
++		 * 32-bit shift truncation bug.
++		 */
++		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
++		    size, page_size);
+ 		IOMemoryMap *map = NULL;
+ 		if (mem != NULL) {
+ 			bzero(mem->getBytesNoCopy(), size);
++			sweet_gpu_clean_va((uintptr_t)mem->getBytesNoCopy(), size, false);
+ 			map = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+ 		}
+ 		if (map == NULL) {
+@@ -177,34 +335,65 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			ret = kIOReturnNoMemory;
+ 			break;
+ 		}
++		if (!sweet_gpu_vm_map(fVM, iova, mem, 0, size, true)) {
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(mem);
++			ret = kIOReturnVMError;
++			break;
++		}
+ 		fBOs[h].mem = mem;
+ 		fBOs[h].map = map;
+-		fBOs[h].iova = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		fBOs[h].surf = NULL;
++		fBOs[h].iova = iova;
+ 		fBOs[h].size = size;
++		fBOs[h].delta = 0;
++		fBOs[h].usable_size = size;
++		/* User space only ever receives the GPU virtual address (iova). */
+ 		out[0] = h;
+-		out[1] = fBOs[h].iova;
++		out[1] = iova;
+ 		out[2] = map->getAddress();
+ 		out[3] = size;
+ 		args->scalarOutputCount = 4;
+ 		break;
+ 	}
+-	case 2:         /* BOFree */
++
++	case 2:         /* BOFree: [handle] */
+ 		if (nin < 1 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS || fBOs[in[0]].mem == NULL) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+ 		freeBO((uint32_t)in[0]);
+ 		break;
+-	case 3: {       /* Submit */
++
++	case 3: {       /* Submit: [handle, offset, dwords] -> [fence] */
+ 		if (nin < 3 || args->scalarOutputCount < 1 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS ||
+-		    fBOs[in[0]].mem == NULL || (in[1] & 3) || in[2] == 0 ||
+-		    in[1] + in[2] * 4 > fBOs[in[0]].size) {
++		    fBOs[in[0]].mem == NULL || (in[1] & 3) || in[2] == 0 || in[2] > SWEET_GPU_MAX_IB_DWORDS ||
++		    in[1] + in[2] * 4 > fBOs[in[0]].usable_size) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
++		struct sweet_gpu_bo *bo = &fBOs[in[0]];
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, bo->mem);
++		uintptr_t kva = 0;
++		if (bmd != NULL) {
++			kva = (uintptr_t)bmd->getBytesNoCopy();
++		} else if (bo->surf != NULL) {
++			kva = bo->surf->kernelAddress();
++		}
++		if (kva == 0) {
++			ret = kIOReturnInternalError;
++			break;
++		}
++		const uint32_t *ib_words = (const uint32_t *)(kva + (uintptr_t)bo->delta + (uintptr_t)in[1]);
++		sweet_gpu_clean_va((uintptr_t)ib_words, (uint64_t)in[2] * 4, true);
++		if (!sweet_gpu_vm_stage_ib(fVM, ib_words, (uint32_t)in[2])) {
++			ret = kIOReturnNotPermitted;
++			break;
++		}
+ 		uint32_t fence = 0;
+-		if (!sweet_gpu_submit_ib(fBOs[in[0]].iova + in[1], (uint32_t)in[2], &fence)) {
+-			ret = kIOReturnNotReady;
++		bool faulted = false;
++		if (!sweet_gpu_submit_ib(fVM, (uint32_t)in[2], &fence, &faulted)) {
++			ret = faulted ? kIOReturnVMError : kIOReturnNotReady;
+ 			break;
+ 		}
+ 		fLastFence = fence;
+@@ -213,14 +402,161 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	}
+-	case 4:         /* Wait */
++
++	case 4: {       /* Wait: [fence, timeout_ms] -> status */
+ 		if (nin < 2) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		IOLockUnlock(fLock);    /* do not hold the client while sleeping */
+-		return sweet_gpu_wait((uint32_t)in[0], (uint32_t)(in[1] > 10000 ? 10000000 : in[1] * 1000)) ?
+-		       kIOReturnSuccess : kIOReturnTimeout;
++		struct sweet_gpu_vm *vm = fVM;
++		uint32_t fence = (uint32_t)in[0];
++		uint32_t timeout_us = (uint32_t)(in[1] > 10000 ? 10000000 : in[1] * 1000);
++		IOLockUnlock(fLock);    /* do not hold the client lock while sleeping */
++		return sweet_gpu_wait(vm, fence, timeout_us) ? kIOReturnSuccess : kIOReturnTimeout;
++	}
++
++	case 5: {       /* BOClean: [handle, offset, length] -> status */
++		if (nin < 3 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS || fBOs[in[0]].mem == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		struct sweet_gpu_bo *bo = &fBOs[in[0]];
++		uint64_t off = in[1], len = in[2];
++		if (len == 0) {
++			len = bo->usable_size > off ? bo->usable_size - off : 0;
++		}
++		if (off > bo->usable_size || len > bo->usable_size - off) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, bo->mem);
++		uintptr_t kva = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() :
++		    (bo->surf != NULL ? bo->surf->kernelAddress() : 0);
++		if (kva != 0 && len != 0) {
++			sweet_gpu_clean_va(kva + (uintptr_t)bo->delta + (uintptr_t)off, len, false);
++		}
++		break;
++	}
++
++	case 6: {       /* CopyToSurface: [bo_h, src_pitch, sx, sy, w, h, surf_id, dx, dy] */
++		if (nin < 9 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS || fBOs[in[0]].mem == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		struct sweet_gpu_bo *bo = &fBOs[in[0]];
++		uint32_t src_pitch = (uint32_t)in[1];
++		uint32_t sx = (uint32_t)in[2], sy = (uint32_t)in[3];
++		uint32_t w = (uint32_t)in[4], h = (uint32_t)in[5];
++		uint32_t surf_id = (uint32_t)in[6];
++		uint32_t dx = (uint32_t)in[7], dy = (uint32_t)in[8];
++		if (w == 0 || h == 0 || src_pitch < w * 4 ||
++		    (uint64_t)(sy + h - 1) * src_pitch + (uint64_t)(sx + w) * 4 > bo->usable_size) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		SweetSurface *s = sweet_surface_copy(surf_id);
++		if (s == NULL || s->memory == NULL) {
++			OSSafeReleaseNULL(s);
++			ret = kIOReturnNotFound;
++			break;
++		}
++		if (dx + w > s->width || dy + h > s->height || s->bytesPerElement != 4) {
++			s->release();
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint32_t surf_size = (uint32_t)((s->memory->getLength() + 0xfffULL) & ~0xfffULL);
++		uint64_t dst_iova = allocIOVA(surf_size);
++		if (dst_iova == 0 || !sweet_gpu_vm_map(fVM, dst_iova, s->memory, 0, surf_size, true)) {
++			s->release();
++			ret = kIOReturnVMError;
++			break;
++		}
++		uint64_t src_base = bo->iova + bo->delta;
++		uint64_t dst_base = dst_iova + s->wrapDelta + s->offset;
++		bool ok = sweet_gpu_copy_vm(fVM, src_base, src_pitch, sx, sy, w, h,
++		    dst_base, s->bytesPerRow, dx, dy);
++		sweet_gpu_vm_unmap(fVM, dst_iova, surf_size);
++		if (ok) {
++			uintptr_t kva = s->kernelAddress();
++			if (kva != 0) {
++				uint64_t first = (uint64_t)s->wrapDelta + s->offset + (uint64_t)dy * s->bytesPerRow;
++				uint64_t bytes = (uint64_t)h * s->bytesPerRow;
++				if (first + bytes <= s->memory->getLength()) {
++					sweet_gpu_clean_va(kva + (uintptr_t)first, bytes, true);
++				}
++			}
++			s->bumpSeed();
++		}
++		s->release();
++		ret = ok ? kIOReturnSuccess : kIOReturnNotReady;
++		break;
++	}
++
++	case 7: {       /* BOFromSurface: [surf_id] -> [handle, iova, user_va, size, w, h, bpr, fmt] */
++		if (nin < 1 || args->scalarOutputCount < 8) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint32_t h = 1;
++		while (h < SWEET_GPU_MAX_BOS && fBOs[h].mem != NULL) {
++			h++;
++		}
++		if (h == SWEET_GPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		SweetSurface *s = sweet_surface_copy((uint32_t)in[0]);
++		if (s == NULL || s->memory == NULL) {
++			OSSafeReleaseNULL(s);
++			ret = kIOReturnNotFound;
++			break;
++		}
++		uint32_t size = (uint32_t)((s->memory->getLength() + 0xfffULL) & ~0xfffULL);
++		uint32_t delta = s->wrapDelta + s->offset;
++		if (delta >= size) {
++			s->release();
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint64_t iova = allocIOVA(size);
++		if (iova == 0) {
++			s->release();
++			ret = kIOReturnNoSpace;
++			break;
++		}
++		IOMemoryMap *map = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++		if (map == NULL) {
++			s->release();
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		if (!sweet_gpu_vm_map(fVM, iova, s->memory, 0, size, true)) {
++			map->release();
++			s->release();
++			ret = kIOReturnVMError;
++			break;
++		}
++		s->memory->retain();
++		fBOs[h].mem = s->memory;
++		fBOs[h].map = map;
++		fBOs[h].surf = s;       /* retains s */
++		fBOs[h].iova = iova;
++		fBOs[h].size = size;
++		fBOs[h].delta = delta;
++		fBOs[h].usable_size = size - delta;
++		out[0] = h;
++		out[1] = iova + delta;
++		out[2] = map->getAddress() + delta;
++		out[3] = s->allocSize;
++		out[4] = s->width;
++		out[5] = s->height;
++		out[6] = s->bytesPerRow;
++		out[7] = s->pixelFormat;
++		args->scalarOutputCount = 8;
++		break;
++	}
++
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;

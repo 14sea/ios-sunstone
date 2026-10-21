@@ -1,0 +1,483 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index fda6fb1..8d3bed9 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -39,6 +39,7 @@
+ #define CP_WAIT_FOR_IDLE        0x26
+ #define CP_EVENT_WRITE          0x46
+ #define CP_BLIT                 0x2c
++#define CP_INDIRECT_BUFFER      0x3f
+ #define BLIT_OP_SCALE           3
+ #define CACHE_FLUSH_TS          0x04
+ #define CACHE_INVALIDATE        0x31
+@@ -62,6 +63,26 @@ static volatile uint32_t  *gpu_regs, *gpu_ring, *gpu_ctl;
+ static uint32_t            gpu_ring_dwords, gpu_wptr, gpu_seqno, gpu_queued;
+ static uint64_t            gpu_ctl_phys;
+ static uint64_t            gpu_frames, gpu_ns_total;
++static IOLock             *gpu_lock;    /* the ring: framebuffer copies and user submissions */
++
++static IOLock *
++gpu_lock_get(void)
++{
++	if (gpu_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gpu_lock)) {
++			IOLockFree(l);
++		}
++	}
++	return gpu_lock;
++}
++
++/* fence values are a wrapping sequence: done when the written value is at or past seq */
++static bool
++seq_done(uint32_t seq)
++{
++	return (int32_t)(*gpu_ctl - seq) >= 0;
++}
+ 
+ static void
+ gpu_off(const char *why)
+@@ -225,6 +246,29 @@ blit(uint64_t sbase, uint32_t spitch, uint32_t sw, uint32_t sh, uint32_t sx, uin
+ /* ~40 dwords per blit; a flush adds ~10. Keep a frame well inside the ring. */
+ #define BLIT_DWORDS 48
+ 
++/* Wait until the CP has consumed enough of the ring for n more dwords (lock held). */
++static bool
++ring_space(uint32_t n)
++{
++	for (int i = 0; i < 20000; i++) {       /* ~200 ms */
++		uint32_t rptr = gpu_regs[REG_CP_RB_RPTR];
++		uint32_t used = (gpu_wptr + gpu_ring_dwords - rptr) % gpu_ring_dwords;
++		if (used + n + 16 < gpu_ring_dwords) {
++			return true;
++		}
++		IODelay(10);
++	}
++	return false;
++}
++
++static void
++kick(void)
++{
++	__builtin_arm_dsb(0xf);
++	gpu_regs[REG_CP_RB_WPTR] = gpu_wptr;
++	gpu_queued = 0;
++}
++
+ bool
+ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+     uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy)
+@@ -238,6 +282,12 @@ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+ 		return false;
+ 	}
+ 	if (gpu_queued == 0) {
++		/* a batch: holds the ring until sweet_gpu_flush() */
++		IOLockLock(gpu_lock_get());
++		if (gpu_state <= 0 || !ring_space(gpu_ring_dwords / 2)) {
++			IOLockUnlock(gpu_lock);
++			return false;
++		}
+ 		/* the source was just written by the CPU (cleaned to PoC): drop UCHE */
+ 		event(CACHE_INVALIDATE, false);
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+@@ -282,13 +332,13 @@ sweet_gpu_flush(void)
+ 	event(PC_CCU_FLUSH_COLOR_TS, true);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	event(CACHE_FLUSH_TS, true);
+-	__builtin_arm_dsb(0xf);
+-	gpu_regs[REG_CP_RB_WPTR] = gpu_wptr;
+-	gpu_queued = 0;
+-	for (int i = 0; i < 20000 && *gpu_ctl != gpu_seqno; i++) {   /* ~200 ms */
++	uint32_t seq = gpu_seqno;
++	kick();
++	IOLockUnlock(gpu_lock);
++	for (int i = 0; i < 20000 && !seq_done(seq); i++) {   /* ~200 ms */
+ 		IODelay(10);
+ 	}
+-	if (*gpu_ctl != gpu_seqno) {
++	if (!seq_done(seq)) {
+ 		gpu_off("fence timeout");
+ 		return false;
+ 	}
+@@ -302,8 +352,91 @@ sweet_gpu_flush(void)
+ 	return true;
+ }
+ 
++/*
++ * User submissions (SweetGPUDevice.cpp): run dwords of commands at GPU
++ * address iova as an indirect buffer, then flush CCU and UCHE and write a
++ * fence. Returns the fence value to wait for.
++ */
++bool
++sweet_gpu_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seq_out)
++{
++	if (!gpu_init() || dwords == 0 || dwords >= (1u << 20)) {
++		return false;
++	}
++	IOLockLock(gpu_lock_get());
++	if (gpu_state <= 0 || !ring_space(64)) {
++		IOLockUnlock(gpu_lock);
++		return false;
++	}
++	event(CACHE_INVALIDATE, false);         /* the CPU wrote sources through WC mappings */
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_INDIRECT_BUFFER, 3));
++	emit((uint32_t)iova);
++	emit((uint32_t)(iova >> 32));
++	emit(dwords);
++	event(PC_CCU_FLUSH_COLOR_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(CACHE_FLUSH_TS, true);
++	*seq_out = gpu_seqno;
++	kick();
++	IOLockUnlock(gpu_lock);
++	return true;
++}
++
++bool
++sweet_gpu_wait(uint32_t seq, uint32_t timeout_us)
++{
++	if (gpu_state <= 0) {
++		return false;
++	}
++	for (uint32_t i = 0; i < timeout_us / 10 && !seq_done(seq); i++) {
++		IODelay(10);
++	}
++	return seq_done(seq);
++}
++
++uint64_t
++sweet_gpu_param(uint32_t which)
++{
++	if (!gpu_init()) {
++		return 0;
++	}
++	switch (which) {
++	case SWEET_GPU_PARAM_CHIP_ID:
++		return 0x06010901;              /* Adreno 619 (holi) */
++	case SWEET_GPU_PARAM_GPU_ID:
++		return 619;
++	case SWEET_GPU_PARAM_GMEM_SIZE:
++		return 512 * 1024;
++	case SWEET_GPU_PARAM_FENCE:
++		return *gpu_ctl;
++	case SWEET_GPU_PARAM_STATUS:
++		return gpu_regs[REG_RBBM_STATUS] | ((uint64_t)gpu_regs[REG_CP_HW_FAULT] << 32);
++	default:
++		return 0;
++	}
++}
++
+ #else /* !SWEET */
+ 
++bool
++sweet_gpu_submit_ib(uint64_t, uint32_t, uint32_t *)
++{
++	return false;
++}
++
++bool
++sweet_gpu_wait(uint32_t, uint32_t)
++{
++	return false;
++}
++
++uint64_t
++sweet_gpu_param(uint32_t)
++{
++	return 0;
++}
++
+ bool
+ sweet_gpu_copy(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t)
+ {
+diff --git a/iokit/Kernel/arm/SweetGPU.h b/iokit/Kernel/arm/SweetGPU.h
+index 5549d02..3130896 100644
+--- a/iokit/Kernel/arm/SweetGPU.h
++++ b/iokit/Kernel/arm/SweetGPU.h
+@@ -27,6 +27,19 @@ bool sweet_gpu_ready(void);
+ /* Run what sweet_gpu_copy() queued and wait for it. false: the GPU is off for good. */
+ bool sweet_gpu_flush(void);
+ 
++/* User submissions (SweetGPUDevice.cpp): see SweetGPU.cpp. */
++bool sweet_gpu_submit_ib(uint64_t iova, uint32_t dwords, uint32_t *seq_out);
++bool sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
++
++enum {
++	SWEET_GPU_PARAM_CHIP_ID   = 0,
++	SWEET_GPU_PARAM_GPU_ID    = 1,
++	SWEET_GPU_PARAM_GMEM_SIZE = 2,
++	SWEET_GPU_PARAM_FENCE     = 3,  /* last fence value written */
++	SWEET_GPU_PARAM_STATUS    = 4,  /* RBBM_STATUS | CP_HW_FAULT << 32 */
++};
++uint64_t sweet_gpu_param(uint32_t which);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetGPUDevice.cpp b/iokit/Kernel/arm/SweetGPUDevice.cpp
+new file mode 100644
+index 0000000..5c71e7a
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPUDevice.cpp
+@@ -0,0 +1,232 @@
++/*
++ * User-space access to the Adreno 619 for SWEET on sunstone: the kernel side
++ * a Mesa freedreno winsys will talk to (a small subset of Linux's msm DRM
++ * driver: buffer objects, indirect-buffer submission, fences).
++ *
++ * SweetGPUDevice (IOResources, published when SweetGPU took the GPU over from
++ * the shim) opens SweetGPUUserClient, whose external methods are:
++ *   0 GetParam   [param]           -> [value]          (SWEET_GPU_PARAM_*)
++ *   1 BONew      [size]            -> [handle, iova, user address, size]
++ *   2 BOFree     [handle]
++ *   3 Submit     [handle, offset, dwords] -> [fence]   commands at iova+offset as an IB
++ *   4 Wait       [fence, timeout ms]       -> status   kIOReturnTimeout if not reached
++ *
++ * Buffer objects are physically contiguous, write-combined in the kernel and
++ * in the client, so the CPU and the GPU see the same bytes without cache
++ * maintenance. GPU addresses are physical (identity GPU SMMU bank), and the
++ * GPU itself is not fenced off from other memory yet: bring-up only.
++ */
++#include "SweetGPU.h"
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++
++#define SWEET_GPU_MAX_BOS       256
++#define SWEET_GPU_MAX_BO_SIZE   (256u << 20)
++
++class SweetGPUDevice : public IOService {
++	OSDeclareDefaultStructors(SweetGPUDevice);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPUDevice, IOService);
++
++bool
++SweetGPUDevice::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	if (!sweet_gpu_ready()) {
++		IOLog("SWEET GPU: no GPU from the shim, no SweetGPUDevice\n");
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	registerService();
++	IOLog("SWEET GPU: SweetGPUDevice ready (chip %#llx)\n", sweet_gpu_param(SWEET_GPU_PARAM_CHIP_ID));
++	return true;
++}
++
++struct sweet_gpu_bo {
++	IOBufferMemoryDescriptor *mem;
++	IOMemoryMap              *map;      /* in the client task */
++	uint64_t                  iova;
++	uint32_t                  size;
++};
++
++class SweetGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetGPUUserClient);
++
++	task_t              fTask;
++	IOLock             *fLock;
++	struct sweet_gpu_bo fBOs[SWEET_GPU_MAX_BOS];
++	uint32_t            fLastFence;
++	bool                fFenced;
++
++	void freeBO(uint32_t handle);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
++
++bool
++SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	bzero(fBOs, sizeof(fBOs));
++	return fLock != NULL;
++}
++
++void
++SweetGPUUserClient::freeBO(uint32_t handle)
++{
++	struct sweet_gpu_bo *bo = &fBOs[handle];
++	/* the GPU may still use it: wait for this client's last submission */
++	if (fFenced) {
++		(void)sweet_gpu_wait(fLastFence, 500000);
++	}
++	OSSafeReleaseNULL(bo->map);
++	OSSafeReleaseNULL(bo->mem);
++	bzero(bo, sizeof(*bo));
++}
++
++IOReturn
++SweetGPUUserClient::clientClose(void)
++{
++	IOLockLock(fLock);
++	for (uint32_t i = 1; i < SWEET_GPU_MAX_BOS; i++) {
++		if (fBOs[i].mem != NULL) {
++			freeBO(i);
++		}
++	}
++	IOLockUnlock(fLock);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++SweetGPUUserClient::free(void)
++{
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *, OSObject *, void *)
++{
++	const uint64_t *in = args->scalarInput;
++	uint32_t nin = args->scalarInputCount;
++	uint64_t *out = args->scalarOutput;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(fLock);
++	switch (selector) {
++	case 0:         /* GetParam */
++		if (nin < 1 || args->scalarOutputCount < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		out[0] = sweet_gpu_param((uint32_t)in[0]);
++		args->scalarOutputCount = 1;
++		break;
++	case 1: {       /* BONew */
++		if (nin < 1 || args->scalarOutputCount < 4 || in[0] == 0 || in[0] > SWEET_GPU_MAX_BO_SIZE) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint32_t h = 1;
++		while (h < SWEET_GPU_MAX_BOS && fBOs[h].mem != NULL) {
++			h++;
++		}
++		if (h == SWEET_GPU_MAX_BOS) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		uint32_t size = (uint32_t)round_page((vm_size_t)in[0]);
++		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
++		    size, ~((mach_vm_address_t)page_size - 1));
++		IOMemoryMap *map = NULL;
++		if (mem != NULL) {
++			bzero(mem->getBytesNoCopy(), size);
++			map = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++		}
++		if (map == NULL) {
++			OSSafeReleaseNULL(mem);
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		fBOs[h].mem = mem;
++		fBOs[h].map = map;
++		fBOs[h].iova = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		fBOs[h].size = size;
++		out[0] = h;
++		out[1] = fBOs[h].iova;
++		out[2] = map->getAddress();
++		out[3] = size;
++		args->scalarOutputCount = 4;
++		break;
++	}
++	case 2:         /* BOFree */
++		if (nin < 1 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS || fBOs[in[0]].mem == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		freeBO((uint32_t)in[0]);
++		break;
++	case 3: {       /* Submit */
++		if (nin < 3 || args->scalarOutputCount < 1 || in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS ||
++		    fBOs[in[0]].mem == NULL || (in[1] & 3) || in[2] == 0 ||
++		    in[1] + in[2] * 4 > fBOs[in[0]].size) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint32_t fence = 0;
++		if (!sweet_gpu_submit_ib(fBOs[in[0]].iova + in[1], (uint32_t)in[2], &fence)) {
++			ret = kIOReturnNotReady;
++			break;
++		}
++		fLastFence = fence;
++		fFenced = true;
++		out[0] = fence;
++		args->scalarOutputCount = 1;
++		break;
++	}
++	case 4:         /* Wait */
++		if (nin < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		IOLockUnlock(fLock);    /* do not hold the client while sleeping */
++		return sweet_gpu_wait((uint32_t)in[0], (uint32_t)(in[1] > 10000 ? 10000000 : in[1] * 1000)) ?
++		       kIOReturnSuccess : kIOReturnTimeout;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..97dcf20 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetGPUDevice;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetGPUDevice;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5207ffc..0bfab2a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetGPUDevice.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
