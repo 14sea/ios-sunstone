@@ -174,6 +174,24 @@ scripts, tools and patches and shows uncommitted state; the chain scripts (boot-
 packing and stop (rc 2) on a change to anything that enters the build. Uncommitted work in `work/xnu`
 is only reported (a kernel is built from `fork/xnu/patches`). `precheck.sh --stamp` after review.
 
+## TODO (2026-10-21, after the gap review against ios-sweet and ios-topaz)
+
+Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
+
+| # | Item | Owner | Status | Notes |
+| --- | --- | --- | --- | --- |
+| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C (after 3, 4) | [ ] | first the hardware survey: modem region, PAS id, GLINK channels, WLFW version, firmware from `modem_a`; needs item 3b first |
+| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer (topaz 0131-0139 equivalents) | U | [~] | review notes in the 2026-10-21 chat: compile fixes, TLBIALL 0x618, SCTLR CFCFG bit, CP_PROTECT in the shim, fence page, TOCTOU; 0098 back as 0109, renumber the 0108 clash |
+| 3a | Console filter `sweetlog=WORDS` (topaz 0112), `sweetfb_console=1` (0120) | C | [ ] | 0120 touches SweetFramebuffer.cpp: after the user commits item 2 |
+| 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [ ] | needed before Wi-Fi (wifid hung topaz's boot) |
+| 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [~] | already in the item 2 WIP |
+| 4 | RTC offset without a boot-arg: keep it on UFS next to the log ring, update it from setUTCTimeOfDay, seed from recovery's persist/time/ats_2 | C | [ ] | boot-arg stays as override |
+| 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
+| 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
+| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | - | [ ] | after the slider (done) |
+| 8 | Battery: remaining capacity (0x84), charging current sign check while on a charger | - | [ ] | small |
+| 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
+
 ## Open items
 
 1. GPU user client with SMMU isolation (WIP in work/xnu by the user; brings 0098 back): review, then
