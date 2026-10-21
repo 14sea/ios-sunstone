@@ -195,6 +195,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0097, 0099 | Boot-image file drop before launchd, exact-size writes |
 | 0100–0101 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C, temperature, cycles |
 | 0102–0106 | DSI0 DCS commands: panel off/on, brightness; command packet in low RAM; `AppleARMBacklight` with `IODisplayParameters` for the slider |
+| 0107 | Cache sync of executable pages above 4 GiB (`pmap_sync_page_attributes_phys` truncated the address) |
 
 ## Key hardware facts (sunstone)
 

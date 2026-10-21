@@ -59,7 +59,9 @@ boot-28 (service without the parameters) got nothing; boot-29 with them: `SWEET 
 brightness = 512 / 423 / 365 ...` -> `panel level 0x400 / 0x34e / 0x2da: done`, slider smooth, present
 time unchanged (~3 ms, no digital dimming cost on sunstone). It also writes `brightness-nits = 0` and
 `IOMFBBrightnessLevel = 0`, which 0106 ignores once `{brightness}` has arrived (they turned into DBV 4).
-`sweetbl` defaults to 1 since 0106. Reverse-engineering notes: `../research/dsi/NOTES-brightness.md`.
+`sweetbl` defaults to 1 since 0106; boot-31 (`../out/boot31-log15.txt`) confirms: no DBV 4 any more, slider
+`brightness = 1023 .. 611` -> `panel level 0x7ff .. 0x4c6`. Reverse-engineering notes:
+`../research/dsi/NOTES-brightness.md`.
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -119,6 +121,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0104 | DSI command packet in a fixed low-RAM page 0xca000000 (IOBMD physical mask is not a limit here) |
 | 0105 | `AppleARMBacklight` publishes `IODisplayParameters`, maps `{brightness}` to the panel DBV |
 | 0106 | backlight service on by default (`sweetbl=0` off), nits writes ignored once `{brightness}` arrived |
+| 0107 | `pmap_sync_page_attributes_phys`: `ptoa(pp)` instead of the 32-bit `pp << PAGE_SHIFT` (every RAM page is above 4 GiB; callers: vm_fault exec-page I/D sync, vm_pageout) |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -147,12 +150,20 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good). `gpu-g*.img` are shim-only GPU tests.
+
+## Build pre-check
+
+Someone else edits the GPU code in parallel (work/xnu `SweetGPU.cpp/.h`: per-client SMMU stage-1 page
+tables, WIP on 2026-10-21 afternoon). `../tools-testsea/precheck.sh` hashes the shim sources, build
+scripts, tools and patches and shows uncommitted state; the chain scripts (boot-30 on) run it before
+packing and stop (rc 2) on a change to anything that enters the build. Uncommitted work in `work/xnu`
+is only reported (a kernel is built from `fork/xnu/patches`). `precheck.sh --stamp` after review.
 
 ## Open items
 
-1. Decide how test programs reach the phone now that 0098 is gone: the drop still works for
-   binaries and LaunchDaemon plists; keep `launchd.plist` edits size-safe (0099).
+1. GPU user client with SMMU isolation (WIP in work/xnu by the user; brings 0098 back): review, then
+   patches. Test programs reach the phone through the drop (0097/0099).
 2. No RTC (date starts 31 Dec 1969).
 3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
 4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
