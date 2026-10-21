@@ -1,0 +1,241 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7d0ba3b..1fbe044 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_drop.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
++bsd/dev/sweet_rtc.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+new file mode 100644
+index 0000000..a357481
+--- /dev/null
++++ b/bsd/dev/sweet_rtc.c
+@@ -0,0 +1,144 @@
++/*
++ * sunstone: the PMK8350 RTC (SPMI SID 6, qcom,pmk8350-rtc at 0x6100; Linux
++ * rtc-pm8xxx.c pmk8350_regs: ctrl 0x6146 bit 7 enable, read data 0x6148..0x614b
++ * little endian, seconds). Read only, through the SPMI arbiter's observer
++ * channel as sweet_keys.c does (EXT_READL, one byte per command).
++ *
++ * The counter is not wall time: Qualcomm Android never writes the RTC and keeps
++ * the offset to UTC in persist/time/ats_*. On this phone the RTC read
++ * 82199857 (1972-08-09) at 1792595277 UTC (2026-10-21), so boot-arg
++ * sweetrtcoff=1710395420 (SweetPlatformExpert) turns it into the real time
++ * until the battery is removed.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_rtc_init(void);
++int sweet_rtc_read(uint32_t *secs);
++
++#define RTC_CORE_PA     0x01c40000u
++#define RTC_OBS_PA      0x03e00000u
++#define RTC_CNFG_PA     0x01c0a000u
++#define RTC_SID         6u
++#define RTC_CTRL        0x6146u
++#define RTC_READ        0x6148u
++#define RTC_NO_APID     0xffffu
++
++static vm_offset_t rtc_core, rtc_obs, rtc_cnfg;
++static uint16_t rtc_apid = RTC_NO_APID;
++static bool rtc_tried, rtc_ready;
++
++static uint32_t
++rtc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* v5 arbiter: PPID -> APID through the core's mapping table; prefer the apps-owned entry */
++static uint16_t
++rtc_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = RTC_NO_APID;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = rtc_rd(rtc_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = rtc_rd(rtc_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == RTC_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++rtc_read8(uint16_t addr, uint8_t *out)
++{
++	uint32_t off = 0x80u * rtc_apid;        /* observer channel, EE 0 */
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);    /* EXT_READL, 1 byte */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rtc_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = rtc_rd(rtc_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)rtc_rd(rtc_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++int
++sweet_rtc_init(void)
++{
++	if (rtc_tried) {
++		return rtc_ready ? 0 : -1;
++	}
++	rtc_tried = true;
++	rtc_core = ml_io_map(RTC_CORE_PA, 0x2000);
++	rtc_cnfg = ml_io_map(RTC_CNFG_PA, 0x1000);
++	rtc_obs = ml_io_map(RTC_OBS_PA, 0x10000);
++	if (!rtc_core || !rtc_cnfg || !rtc_obs) {
++		printf("SWEET RTC: SPMI mapping failed\n");
++		return -1;
++	}
++	uint32_t version = rtc_rd(rtc_core, 0), count = rtc_rd(rtc_core, 4) & 0x7ffu;
++	if (version < 0x50000000u || version >= 0x70000000u || count == 0 || count > 512) {
++		printf("SWEET RTC: unsupported SPMI arbiter %#x apids=%u\n", version, count);
++		return -1;
++	}
++	rtc_apid = rtc_find_apid((RTC_SID << 8) | (RTC_READ >> 8), count);
++	if (rtc_apid == RTC_NO_APID) {
++		printf("SWEET RTC: no APID for sid %u peripheral %#x\n", RTC_SID, RTC_READ >> 8);
++		return -1;
++	}
++	uint8_t ctrl = 0;
++	if (!rtc_read8(RTC_CTRL, &ctrl)) {
++		printf("SWEET RTC: control read failed (apid %u)\n", rtc_apid);
++		return -1;
++	}
++	rtc_ready = true;
++	uint32_t secs = 0;
++	(void)sweet_rtc_read(&secs);
++	printf("SWEET RTC: PMK8350 apid %u ctrl %#x (%s), raw %u s\n", rtc_apid, ctrl,
++	    (ctrl & 0x80u) ? "running" : "DISABLED", secs);
++	return 0;
++}
++
++/* Linux pm8xxx_rtc_read_raw: four bytes, then the LSB again to catch a carry. */
++int
++sweet_rtc_read(uint32_t *secs)
++{
++	uint8_t v[4], again;
++	if (!rtc_ready || secs == NULL) {
++		return -1;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (!rtc_read8((uint16_t)(RTC_READ + i), &v[i])) {
++				return -1;
++			}
++		}
++		if (!rtc_read8(RTC_READ, &again)) {
++			return -1;
++		}
++		if (again >= v[0]) {
++			*secs = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..4b8d6ad 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,12 +9,29 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++/* bsd/dev/sweet_rtc.c: the PMK8350 RTC over SPMI (sunstone) */
++extern "C" int sweet_rtc_init(void);
++extern "C" int sweet_rtc_read(uint32_t *secs);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	/*
++	 * Time of day: the PMIC RTC counts seconds from an arbitrary start (Android
++	 * keeps the UTC offset in persist/time/ats_*, not in the chip); boot-arg
++	 * sweetrtcoff=<seconds> adds that offset. A set from iOS only adjusts the
++	 * offset for this boot and logs the value to bake. StartIOKit waits up to
++	 * 30 s for the "IORTC" resource before clock_initialize_calendar(): start()
++	 * publishes it once the RTC answers, which also removes that stall.
++	 */
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
++	bool     fRTC;
++	uint64_t fRTCOffset;
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+@@ -31,9 +48,44 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++
++	uint64_t off = 0;
++	(void)PE_parse_boot_argn("sweetrtcoff", &off, sizeof(off));
++	fRTCOffset = off;
++	fRTC = sweet_rtc_init() == 0;
++	uint32_t raw = 0;
++	if (fRTC && sweet_rtc_read(&raw) == 0) {
++		IOLog("SWEET RTC: raw %u + offset %llu = %llu UTC\n", raw, off, (uint64_t)raw + off);
++	} else {
++		IOLog("SWEET RTC: unavailable, calendar starts at the offset %llu\n", off);
++	}
++	publishResource("IORTC");       /* StartIOKit: clock_initialize_calendar() may proceed */
+ 	return true;
+ }
+ 
++void
++SweetPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	uint32_t raw = 0;
++	*nsecs = 0;
++	if (fRTC && sweet_rtc_read(&raw) == 0) {
++		*secs = (clock_sec_t)((uint64_t)raw + fRTCOffset);
++	} else {
++		*secs = (clock_sec_t)fRTCOffset;
++	}
++}
++
++void
++SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, __unused clock_nsec_t nsecs)
++{
++	uint32_t raw = 0;
++	if (fRTC && sweet_rtc_read(&raw) == 0 && (uint64_t)secs > raw) {
++		fRTCOffset = (uint64_t)secs - raw;
++		IOLog("SWEET RTC: time set to %lu, new offset %llu (boot-arg sweetrtcoff=%llu)\n",
++		    (unsigned long)secs, fRTCOffset, fRTCOffset);
++	}
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
