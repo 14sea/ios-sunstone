@@ -10,7 +10,7 @@ kernel, xnu-8796, on Qualcomm phones) to the Xiaomi **Redmi Note 12 5G** (`sunst
 iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
 As of **2026-10-21** the phone boots to the **iOS home screen on all eight cores**, with
-**touch, the power/volume keys and a real battery gauge**. Frames are composed by CoreAnimation on the CPU and
+**touch, the power/volume keys, a real battery gauge and panel power control**. Frames are composed by CoreAnimation on the CPU and
 copied to the panel by the Adreno 2D engine, page-flipped at 60 Hz by the display
 controller; UI threads are steered to the two A78 cores. Our own iOS programs reach the
 phone through the boot image (a small archive the kernel installs into the root before
@@ -39,7 +39,8 @@ original engineering log.
 | GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. No 3D / no CoreAnimation rendering on the GPU |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings |
 | Touch and keys | FocalTech FT5452 over a GPIO bit-banged I2C (TrustZone owns the QUP serial engine), power and volume keys from the PMICs |
-| Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, charger state |
+| Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, temperature, cycle count, charger state |
+| Panel | DCS 0x28/0x29 over DSI0 at display off/on (the AMOLED really switches off), DCS 0x51 brightness from `IOMFBBrightnessLevel`; the CoreBrightness backlight service is opt-in (`sweetbl=1`) |
 | Debug | Persistent console log at the end of `userdata`, kernel/user stack sampler, boot-image file drop (`tools/mkdrop.py`) for test programs and launchd jobs |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
@@ -50,8 +51,9 @@ original engineering log.
 - **No GPU rendering**: CoreAnimation draws in software, the GPU only copies frames. The GPU
   user client that let a process drive the GPU (patch 0098) was withdrawn: it exposed all
   physical memory and is kept in `xnu/patches-unused/` only.
-- **Battery temperature and cycle count** are not read yet (fixed 25 C). **No real-time clock**: the
-  date starts at 31 December 1969.
+- **Brightness slider** is dead by default: publishing `AppleARMBacklight` makes CoreBrightness dim every
+  frame digitally, which the CPU renderer cannot afford (topaz); `sweetbl=1` to try. **No real-time clock**:
+  the date starts at 31 December 1969.
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
 ## How sunstone differs from topaz
@@ -135,6 +137,7 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 | `sweetfb_noconsole=1`, `sweetfb_hz=60` | Stop drawing kernel text after the first iOS frame; vsync rate |
 | `sweetgpu=0`, `sweetfb_flip=0` | CPU frame copies / no page flips |
 | `sweetbig=0xc0`, `sweetbig_pri=46` | Which cores count as big, and from which priority threads prefer them |
+| `sweetbattery=0`, `sweetdsi=0`, `sweetbl=1` | Static battery; no DSI commands (CPU fade at display off); publish the backlight service for the brightness slider |
 | `sweetsample=NAME,...` | Stack sampler for these processes |
 | `launchd_unsecure_cache=1`, `wdt=-1 wdt_test=no_user_checkin` | launchd without AMFI; no hardware watchdog |
 
@@ -155,7 +158,7 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 ## Roadmap
 
 1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~, ~~battery gauge~~: done.
-2. **Brightness** and display on/off (topaz 0104–0110), battery temperature, **RTC**.
+2. ~~Panel off/on and DCS brightness~~: done; brightness slider (`sweetbl=1`) to evaluate. **RTC**.
 3. **Wi-Fi/modem**: port `TopazModem` to the SM4375 modem subsystem.
 4. **GPU** clocks above 300 MHz (GX rail vote) and a safe path to GPU rendering.
 5. CPU frequency control in the kernel (today a fixed vote from the shim), audio, Bluetooth.
@@ -192,7 +195,8 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0094–0095 | Display page flips at vsync, absolute vsync schedule, cache cleaning by address |
 | 0096 | UI threads prefer the A78 cores |
 | 0097, 0099 | Boot-image file drop before launchd, exact-size writes |
-| 0100 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C |
+| 0100–0101 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C, temperature, cycles |
+| 0102–0104 | DSI0 DCS commands: panel off/on, brightness; command packet in low RAM |
 
 ## Key hardware facts (sunstone)
 
@@ -202,6 +206,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 - Panel 1080×2400, continuous splash at `0x85200000` (a8r8g8b8, stride 4320); MDP VIG0 scanout.
 - Touch FocalTech FT5452 at `0x38` on qupv3_se8 (SDA/SCL GPIO19/20, reset 21, IRQ 22).
 - Battery bus qupv3_se7 (`0x4c84000`, GPIO27/28): SM5602 gauge `0x71`, SC8989X charger `0x6a` (IRQ GPIO53, EN GPIO18).
+- DSI0 controller `0x5e94000` (v2.4), PHY `0x5e94400`; panel `xiaomi m17` DSC video 120 Hz, DCS brightness DBV 4..0x7ff MSB first. DMA addresses are 32-bit: packets must sit below 4 GiB.
 - GPU Adreno 619 (`a619_holi`): GPU `0x5900000`, SMMU `0x5940000`, GPU CC `0x5990000`, zap PAS 13.
 
 ## Credits
