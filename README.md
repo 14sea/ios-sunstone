@@ -36,7 +36,7 @@ original engineering log.
 | Storage | UFS host driver (`0x4804000`); the iOS root is a journaled HFS+ volume in `userdata`, read/write, with a GPT watchdog |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
 | Display | `SweetSurface` IOSurface + `AppleCLCD` (1125×2436 canvas on the 1080×2400 panel). Full-screen frames are blitted by the GPU into two back buffers and the MDP VIG0 pipe flips at vsync; other frames fall back to the CPU |
-| GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. No 3D / no CoreAnimation rendering on the GPU |
+| GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. User-space access through `SweetGPUDevice` with a per-process SMMU page table, validated command streams and CP_PROTECT (`tools/ios/sweetgpu` test). No CoreAnimation rendering on the GPU yet |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings |
 | Touch and keys | FocalTech FT5452 over a GPIO bit-banged I2C (TrustZone owns the QUP serial engine), power and volume keys from the PMICs |
 | Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, temperature, cycle count, charger state |
@@ -49,9 +49,8 @@ original engineering log.
 
 - **No Wi-Fi, cellular, Bluetooth, audio, camera, sensors, GPS, SEP.** topaz's `TopazModem`
   targets the SM6225 and is not ported. `bluetoothd` and `fairplayd.H2` relaunch constantly.
-- **No GPU rendering**: CoreAnimation draws in software, the GPU only copies frames. The GPU
-  user client that let a process drive the GPU (patch 0098) was withdrawn: it exposed all
-  physical memory and is kept in `xnu/patches-unused/` only.
+- **No GPU rendering yet**: CoreAnimation draws in software, the GPU copies frames; the isolated user
+  client (0109-0111) is the base for a Mesa/GL path.
 - The RTC offset to UTC is a boot-arg (Android keeps it in `persist`); it changes only when the battery is pulled. No auto-brightness (no ambient light sensor).
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
@@ -137,7 +136,8 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 | `sweetgpu=0`, `sweetfb_flip=0` | CPU frame copies / no page flips |
 | `sweetbig=0xc0`, `sweetbig_pri=46` | Which cores count as big, and from which priority threads prefer them |
 | `sweetbattery=0`, `sweetdsi=0`, `sweetbl=0` | Static battery; no DSI commands (CPU fade at display off); no backlight service (slider dead) |
-| `sweetrtcoff=N` | Seconds to add to the PMIC RTC counter to get UTC (per phone; this one: 1710395420) |
+| `sweetrtcoff=N` | Seconds to add to the PMIC RTC counter to get UTC; normally not needed, the kernel keeps it on `userdata` (`tools/sweet-rtc-seed.sh`) |
+| `sweetcons=WORD,WORD`, `sweetbusy=N` | Draw only console lines with these words; list busy IOServices after N s |
 | `sweetsample=NAME,...` | Stack sampler for these processes |
 | `launchd_unsecure_cache=1`, `wdt=-1 wdt_test=no_user_checkin` | launchd without AMFI; no hardware watchdog |
 
@@ -198,6 +198,8 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0100–0101 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C, temperature, cycles |
 | 0102–0106 | DSI0 DCS commands: panel off/on, brightness; command packet in low RAM; `AppleARMBacklight` with `IODisplayParameters` for the slider |
 | 0107 | Cache sync of executable pages above 4 GiB (`pmap_sync_page_attributes_phys` truncated the address) |
+| 0109–0111 | GPU user client with per-process SMMU page tables, validated IBs, CP_PROTECT; IOSurface pieces for the GL renderer |
+| 0115–0116 | Console word filter, busy-service lister, IOKit quiesce; RTC offset stored on UFS |
 | 0108 | RTC from the PMK8350 PMIC, `IORTC` resource (removes a 30 s wait at boot) |
 
 ## Key hardware facts (sunstone)

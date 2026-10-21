@@ -8,7 +8,8 @@ Read this first; `NOTES.md` is sweet's history, `README.md` the user-facing summ
 
 **The phone boots the iPhone X iOS 16.7.16 userland to SpringBoard on all 8 cores,
 with touch, keys, a real battery gauge (with temperature and cycle count), DCS panel off/on, a working
-brightness slider, the real date and time, GPU-assisted display and the root read-write in `userdata`.**
+brightness slider, the real date and time, GPU-assisted display, an SMMU-isolated GPU user client and the root
+read-write in `userdata`.**
 Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
 
 - `SWEET CPU: 8/8 CPUs initialized`, PSCI CPU_ON for MPIDR 0x100-0x700.
@@ -103,9 +104,18 @@ last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log
   GPLL0/2 = 300 MHz. G2 2D blits verified on the shim screen (`gpu-g2*.img`).
 - Kernel `SweetGPU` (0093) uses the ring for 2D copies into the two back buffers (0xc8000000,
   0xc9000000) that the MDP flips to (0094); sources cleaned by VA (0095).
-- **0098 (`SweetGPUDevice` user client) and `tools/ios/sweetgpu` are withdrawn** to
-  `xnu/patches-unused/`: the GPU reaches all physical memory and the client was unauthenticated.
-  GPU rendering for CoreAnimation is not pursued on this branch.
+- **GPU user client is back as 0109-0111 (user's work, 2026-10-21 evening)**: every `SweetGPUUserClient`
+  gets its own ARMv8 stage-1 page table on GPU SMMU CB0 (4 KB granule, 39-bit VA; BOs at IOVA
+  0x10000000-0x40000000, ring/SQE read-only, a private fence page at 0xe0030000, a kernel-only read-only
+  staged copy of every IB at 0xe0080000 validated against a PM4 whitelist), CP_PROTECT programmed from
+  the kernel, CB0 switched per submission only after the kernel's blits and fence landed, faults and
+  timeouts fail that submission only. boot-36 (`../out/boot36-log19.txt`, `tools/ios/sweetgpu`):
+  `Submit valid IB -> 0x0`, `word@+0x100=0xc0ffee42` (CP_MEM_WRITE through the client page table),
+  privileged opcode rejected (0xe00002e2), unmapped IOVA -> `SMMU fault (asid 2): fsr 0x402 far
+  0x10200000 syn 0x12` and kIOReturnVMError while display copies kept running (26 stats lines after).
+  Open: CP_PROTECT table vs the Linux catalog a630 list (3 ranges), CP reset after a wedge, GPU clock.
+  0111 adds the topaz 0131-0139 IOSurface pieces (values, bulk attachments, client memory wrapping,
+  detach/release protocol) and the empty `IOAcceleratorES`.
 
 ## Patch series
 
@@ -136,6 +146,11 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0106 | backlight service on by default (`sweetbl=0` off), nits writes ignored once `{brightness}` arrived |
 | 0107 | `pmap_sync_page_attributes_phys`: `ptoa(pp)` instead of the 32-bit `pp << PAGE_SHIFT` (every RAM page is above 4 GiB; callers: vm_fault exec-page I/D sync, vm_pageout) |
 | 0108 | RTC: PMK8350 over SPMI (`sweet_rtc.c`), `sweetrtcoff=` offset, `IORTC` resource (no 30 s StartIOKit wait) |
+| 0109 | `SweetGPUDevice` user client (was 0098): BOs, submit, fences |
+| 0110 | per-client GPU SMMU page tables, staged+validated IBs, CP_PROTECT, private fences (user) |
+| 0111 | SweetSurface for CoreAnimation's GL renderer (topaz 0131-0139), empty `IOAcceleratorES`, BOFromSurface/CopyToSurface (user) |
+| 0115 | debug aids: `sweetcons=WORDS` console filter, `sweetbusy=N`, no IOKit-daemon busy hold (topaz 0112/0127/0128) |
+| 0116 | RTC offset stored on UFS below the log ring (`SWEETRTC`), applied at boot, written when iOS sets the time; `tools/sweet-rtc-seed.sh` |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -164,7 +179,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
@@ -181,11 +196,11 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C (after 3, 4) | [ ] | first the hardware survey: modem region, PAS id, GLINK channels, WLFW version, firmware from `modem_a`; needs item 3b first |
-| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer (topaz 0131-0139 equivalents) | U | [~] | review notes in the 2026-10-21 chat: compile fixes, TLBIALL 0x618, SCTLR CFCFG bit, CP_PROTECT in the shim, fence page, TOCTOU; 0098 back as 0109, renumber the 0108 clash |
-| 3a | Console filter `sweetlog=WORDS` (topaz 0112), `sweetfb_console=1` (0120) | C | [ ] | 0120 touches SweetFramebuffer.cpp: after the user commits item 2 |
-| 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [ ] | needed before Wi-Fi (wifid hung topaz's boot) |
-| 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [~] | already in the item 2 WIP |
-| 4 | RTC offset without a boot-arg: keep it on UFS next to the log ring, update it from setUTCTimeOfDay, seed from recovery's persist/time/ats_2 | C | [ ] | boot-arg stays as override |
+| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
+| 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (0120) | C | [~] | filter done (0115); 0120 still to port |
+| 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |
+| 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [x] | 0111 |
+| 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
 | 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | - | [ ] | after the slider (done) |
