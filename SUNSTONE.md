@@ -35,7 +35,9 @@ what Linux in the recovery reported (4412000 uV, 100 %, CHARGE_FULL 4859000, STA
 Charger REG0B 0x3c: VBUS SDP, CHRG_STAT 3 (termination done), PG -> published 100 %, external,
 not charging. Formulas verified against the Xiaomi spes `sm5602_fg.c` (`../research/sm5602/NOTES.md`).
 0101 (boot-25) adds temperature (0x0A through the DT thermal table: 23-25 C vs Linux 24.0) and the
-cycle count (0x0B: 83, as Linux). Remaining capacity (0x84) is not read.
+cycle count (0x0B: 83, as Linux). 0120 (boot-40): RMC (0x84) and BAT_CAP feed the capacities and time remaining; with the USB cable pulled the
+current goes negative (-494 to -790 mA) and RMC falls 4864 -> 4831 mAh, plugged back in it reads +84 mA with
+`charging=1` (REG0B 0x34): the sign convention matches IOPMPowerSource (positive = charging).
 
 ### Panel brightness / display off (0102-0104, boot-27, `../out/boot27-log12.txt`)
 
@@ -203,7 +205,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping), 40 battery (capacities, sign check). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
@@ -228,7 +230,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
 | 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | - | [ ] | after the slider (done) |
-| 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [~] | 0120 built; sign check needs a boot with the USB cable pulled for a minute |
+| 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 
 ## Open items
