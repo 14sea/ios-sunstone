@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b9d11c1..32048d5 100644
+index b9d11c1..e3c1e6f 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -707,6 +707,7 @@ sweet_ufs_init(void)
+@@ -49,6 +49,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_rtc_store_boot(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -707,6 +708,7 @@ sweet_ufs_init(void)
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
@@ -10,7 +18,7 @@ index b9d11c1..32048d5 100644
  	sweet_sample_start();
  	thread_t gpt_thread;
  	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
-@@ -854,6 +855,90 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -854,6 +856,90 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  	}
  }
  
