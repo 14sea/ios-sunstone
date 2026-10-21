@@ -7,6 +7,7 @@ starting from ios-topaz. Status: kernel-only bring-up, no iOS root yet.
   hardware drivers off by default), plus sunstone patches:
   - 0083 early framebuffer at the sunstone splash 0x85200000 (32MB block 0x84000000)
   - 0084 CPU topology: MPIDR Aff1 = core (0x000-0x700), boot on CPU 0
+  - 0088 per-CPU record of the kernel pc/frames hit by each timer IRQ (where a CPU spins)
   - 0087 sampler: no task lock / user-map reads for threads in the kernel; kpcb for preempted ones
   - 0086 sampler: kernel wait event + kernel backtrace of blocked threads, free pages
   - 0085 GPT watchdog (topaz 0088 rebased): UFS refuses writes to both GPT copies,
