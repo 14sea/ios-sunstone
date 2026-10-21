@@ -7,7 +7,7 @@ Read this first; `NOTES.md` is sweet's history, `README.md` the user-facing summ
 ## Status 2026-10-21 (latest)
 
 **The phone boots the iPhone X iOS 16.7.16 userland to SpringBoard on all 8 cores,
-with touch, keys, GPU-assisted display and the root read-write in `userdata`.**
+with touch, keys, a real battery gauge, GPU-assisted display and the root read-write in `userdata`.**
 Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
 
 - `SWEET CPU: 8/8 CPUs initialized`, PSCI CPU_ON for MPIDR 0x100-0x700.
@@ -21,6 +21,18 @@ Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
   vsync; UI threads are steered to the A78 cores (`sched picks A78 ...`).
 - Our first iOS program ran from the boot-image drop:
   `SWEETTEST: hello from user space: pid 62 uid 0, Darwin 22.6.0 iPhone10,3, hw.model D22AP`.
+
+### Battery (0100, boot-24, `../out/boot24-log9.txt`)
+
+sunstone has topaz's battery chips: SM5602 fuel gauge at 0x71 and the bq25890-map SC8989X charger
+at 0x6a, on qupv3_se7_i2c = QUPV3_WRAP1 S1 (0x4c84000, GPIO27/28 `qup11_f1`, live DT). Unlike the
+touch SE8, **SE7 keeps its FIFO interface** (`SWEET I2C1: se7 fw=0x303 proto=3 status=0 ifdis=0`), so
+`bsd/dev/sweet_i2c1.c` runs in GENI FIFO mode (the GPIO bit-bang fallback is there but unused).
+First poll: `gauge 99% 4412mV 0mA full=4859mAh soc=0x639c volt=0x48f1 cur=0x8002 chg=0x3c` = exactly
+what Linux in the recovery reported (4412000 uV, 100 %, CHARGE_FULL 4859000, STATUS Full, USB SDP).
+Charger REG0B 0x3c: VBUS SDP, CHRG_STAT 3 (termination done), PG -> published 100 %, external,
+not charging. Formulas verified against the Xiaomi spes `sm5602_fg.c` (`../research/sm5602/NOTES.md`).
+Not read yet: temperature (0x0A + the DT thermal table), cycle count (0x0B), remaining capacity (0x84).
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -37,11 +49,11 @@ the files into the root right before launchd (`SWEET DROP: path (bytes, mode) ->
 **`../out/boot22-log7.txt` is byte-identical to `boot21-log6.txt`**: boot-22 died before the log
 ring was flushed, so the pull returned boot-21's log again. Treat log7 as a duplicate.
 
-Reading the log: the phone has no USB while XNU runs. From fastboot: `fastboot set_active b`,
-`fastboot reboot recovery` (crDroid recovery in slot b), then `adb root` (the recovery's adbd starts
-unprivileged: `blockdev: Permission denied` without it), then the last-1025-blocks `dd` of
-`userdata` (`tools/sweet-log-pull.sh`) and `tools/sweet-log.py`. **Slot b is active after this**;
-the next `wait-flash-NN.sh` sets slot a again.
+Reading the log: the phone has no USB while XNU runs. On testsea `~/ios-build/pull-log.sh N` waits
+for the phone in fastboot (user: Power + Volume down), does `fastboot set_active b` + `reboot recovery`
+(crDroid recovery in slot b), `adb root` (the recovery's adbd starts unprivileged), then the
+last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log.py`). Copy to
+`../out/bootNN-logN.txt`. **Slot b is active after this**; the next `wait-flash-NN.sh` sets slot a again.
 
 ### GPU
 
@@ -73,6 +85,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0096 | UI threads (pri >= 46, realtime) prefer the A78 cores; `sweetbig=<mask>` (0xc0), `sweetbig_pri=` |
 | 0097 | install files from the boot image (SWEETDRP) before launchd |
 | 0099 | drop writes files at their exact size (`va_data_size`, fsync) |
+| 0100 | battery: SM5602 gauge + SC8989X charger over QUPV3_WRAP1 S1 (`sweet_i2c1.c`, FIFO or bit-bang); `sweetbattery=0` static, `=2` sweet PM6150 |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -101,13 +114,13 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore. `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery. `gpu-g*.img` are shim-only GPU tests.
 
 ## Open items
 
 1. Decide how test programs reach the phone now that 0098 is gone: the drop still works for
    binaries and LaunchDaemon plists; keep `launchd.plist` edits size-safe (0099).
-2. Battery is a static fallback (100 %, external power); no RTC (date starts 31 Dec 1969).
+2. Battery: add temperature (0x0A + DT thermal table), cycle count (0x0B); no RTC (date starts 31 Dec 1969).
 3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
 4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
    0xfd92000) is on, the kernel side (`sweetcpufreq`) is off.

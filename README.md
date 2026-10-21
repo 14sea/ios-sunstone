@@ -10,7 +10,7 @@ kernel, xnu-8796, on Qualcomm phones) to the Xiaomi **Redmi Note 12 5G** (`sunst
 iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
 As of **2026-10-21** the phone boots to the **iOS home screen on all eight cores**, with
-**touch and the power/volume keys**. Frames are composed by CoreAnimation on the CPU and
+**touch, the power/volume keys and a real battery gauge**. Frames are composed by CoreAnimation on the CPU and
 copied to the panel by the Adreno 2D engine, page-flipped at 60 Hz by the display
 controller; UI threads are steered to the two A78 cores. Our own iOS programs reach the
 phone through the boot image (a small archive the kernel installs into the root before
@@ -39,6 +39,7 @@ original engineering log.
 | GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. No 3D / no CoreAnimation rendering on the GPU |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings |
 | Touch and keys | FocalTech FT5452 over a GPIO bit-banged I2C (TrustZone owns the QUP serial engine), power and volume keys from the PMICs |
+| Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, charger state |
 | Debug | Persistent console log at the end of `userdata`, kernel/user stack sampler, boot-image file drop (`tools/mkdrop.py`) for test programs and launchd jobs |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
@@ -49,7 +50,7 @@ original engineering log.
 - **No GPU rendering**: CoreAnimation draws in software, the GPU only copies frames. The GPU
   user client that let a process drive the GPU (patch 0098) was withdrawn: it exposed all
   physical memory and is kept in `xnu/patches-unused/` only.
-- **Battery** is a static fallback (100 %, on external power). **No real-time clock**: the
+- **Battery temperature and cycle count** are not read yet (fixed 25 C). **No real-time clock**: the
   date starts at 31 December 1969.
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
@@ -153,8 +154,8 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 
 ## Roadmap
 
-1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~: done.
-2. **Battery** gauge and charger (PM6125 / PMR735A), **RTC**.
+1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~, ~~battery gauge~~: done.
+2. **Brightness** and display on/off (topaz 0104–0110), battery temperature, **RTC**.
 3. **Wi-Fi/modem**: port `TopazModem` to the SM4375 modem subsystem.
 4. **GPU** clocks above 300 MHz (GX rail vote) and a safe path to GPU rendering.
 5. CPU frequency control in the kernel (today a fixed vote from the shim), audio, Bluetooth.
@@ -191,6 +192,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0094–0095 | Display page flips at vsync, absolute vsync schedule, cache cleaning by address |
 | 0096 | UI threads prefer the A78 cores |
 | 0097, 0099 | Boot-image file drop before launchd, exact-size writes |
+| 0100 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C |
 
 ## Key hardware facts (sunstone)
 
@@ -199,6 +201,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 - GICv3 at `0xf200000` (redistributors `0xf240000`, stride `0x20000`, 8 PEs).
 - Panel 1080×2400, continuous splash at `0x85200000` (a8r8g8b8, stride 4320); MDP VIG0 scanout.
 - Touch FocalTech FT5452 at `0x38` on qupv3_se8 (SDA/SCL GPIO19/20, reset 21, IRQ 22).
+- Battery bus qupv3_se7 (`0x4c84000`, GPIO27/28): SM5602 gauge `0x71`, SC8989X charger `0x6a` (IRQ GPIO53, EN GPIO18).
 - GPU Adreno 619 (`a619_holi`): GPU `0x5900000`, SMMU `0x5940000`, GPU CC `0x5990000`, zap PAS 13.
 
 ## Credits
