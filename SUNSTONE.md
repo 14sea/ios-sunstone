@@ -229,7 +229,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
-| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | - | [ ] | after the slider (done) |
+| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] | survey 2026-10-21: the ALS (ams TMD2725/TMD2755 at 0x39, SSC I2C bus 2, IRQ 98 per the vendor/persist sensor registry) hangs off the sensor hub in the ADSP; no AP-side I2C/QUP reaches it. Needs ADSP boot (PAS 1, adsp.mdt relocatable into adsp@86700000 0x2800000), the lpass GLINK edge (IPCC client 3), the sensor PD and its FastRPC file access (sscrpcd), then the SEE QMI/protobuf client (cf. postmarketOS libssc). Shares the ADSP work with item 5 |
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 
