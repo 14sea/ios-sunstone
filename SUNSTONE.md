@@ -7,8 +7,8 @@ Read this first; `NOTES.md` is sweet's history, `README.md` the user-facing summ
 ## Status 2026-10-21 (latest)
 
 **The phone boots the iPhone X iOS 16.7.16 userland to SpringBoard on all 8 cores,
-with touch, keys, a real battery gauge (with temperature and cycle count), DCS panel off/on and
-brightness, GPU-assisted display and the root read-write in `userdata`.**
+with touch, keys, a real battery gauge (with temperature and cycle count), DCS panel off/on, a working
+brightness slider, GPU-assisted display and the root read-write in `userdata`.**
 Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
 
 - `SWEET CPU: 8/8 CPUs initialized`, PSCI CPU_ON for MPIDR 0x100-0x700.
@@ -49,10 +49,17 @@ and clears the limit (`IOBufferMemoryDescriptor.cpp` ~line 275), so the buffer s
 0x8 -> 0xb (DMA busy) forever, no error bit. 0104 puts the packet at 0xca000000 (low RAM xnu does not
 own, next to the flip back buffers) through a device mapping. 0103 programs the DMA like techpack
 `dsi_ctrl_hw_cmn_kickoff_command` (embedded mode, FIFO watermarks off, all DSI clocks forced on) and
-dumps DSI0 registers at start / first command / timeout. Brightness: `IOMFBBrightnessLevel`
-(nits 16.16) on the framebuffer -> DBV; nobody sets it yet because `AppleARMBacklight` is only
-published with `sweetbl=1` (topaz: CoreBrightness then digitally dims every frame, too slow on the
-CPU renderer). `sweetdsi=0` disables the DSI commands. Reference sources in `../research/dsi/`.
+dumps DSI0 registers at start / first command / timeout. `sweetdsi=0` disables the DSI commands. Reference sources in `../research/dsi/`.
+
+**Brightness slider (0105/0106, boot-29, `../out/boot29-log14.txt`)**: iOS 16.7 CoreBrightness picks
+`CBDisplayModuleiOS` for an `AppleARMBacklight` service and, in Display.m `DisplayCreateWithID`, reads
+the macOS-style `IODisplayParameters = {brightness = {value, min, max}}` from it; its brightness thread
+then writes `{brightness = N, backlight-level, FadePeriod, ...}` back with IORegistryEntrySetCFProperties.
+boot-28 (service without the parameters) got nothing; boot-29 with them: `SWEET BL: backlight set
+brightness = 512 / 423 / 365 ...` -> `panel level 0x400 / 0x34e / 0x2da: done`, slider smooth, present
+time unchanged (~3 ms, no digital dimming cost on sunstone). It also writes `brightness-nits = 0` and
+`IOMFBBrightnessLevel = 0`, which 0106 ignores once `{brightness}` has arrived (they turned into DBV 4).
+`sweetbl` defaults to 1 since 0106. Reverse-engineering notes: `../research/dsi/NOTES-brightness.md`.
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -110,6 +117,8 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0102 | DSI0 DCS: brightness 0x51 from `IOMFBBrightnessLevel`, panel 0x28/0x29 at RequestPowerChange, `AppleARMBacklight` with `sweetbl=1`, `sweetdsi=0` off |
 | 0103 | DSI command DMA programmed like techpack kickoff_command, LP11 retry, DSI0 register dumps |
 | 0104 | DSI command packet in a fixed low-RAM page 0xca000000 (IOBMD physical mask is not a limit here) |
+| 0105 | `AppleARMBacklight` publishes `IODisplayParameters`, maps `{brightness}` to the panel DBV |
+| 0106 | backlight service on by default (`sweetbl=0` off), nits writes ignored once `{brightness}` arrived |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -138,13 +147,13 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works). `gpu-g*.img` are shim-only GPU tests.
 
 ## Open items
 
 1. Decide how test programs reach the phone now that 0098 is gone: the drop still works for
    binaries and LaunchDaemon plists; keep `launchd.plist` edits size-safe (0099).
-2. Brightness slider: try `sweetbl=1` (AppleARMBacklight) and measure the frame-rate cost; no RTC (date starts 31 Dec 1969).
+2. No RTC (date starts 31 Dec 1969).
 3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
 4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
    0xfd92000) is on, the kernel side (`sweetcpufreq`) is off.
