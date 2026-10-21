@@ -1,0 +1,479 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..6a9cd97 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,8 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling): with the Adreno 2D engine when the shim handed the GPU over and
++ * the surface is physically contiguous (SweetGPU.cpp), else on the CPU. Vsync (notification type 5) is a 60 Hz timer that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -35,6 +36,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include "SweetGPU.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -105,6 +107,7 @@ public:
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	bool          fGPUFailed;       /* SweetGPU gave up: copy on the CPU */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -312,6 +315,7 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	bool gpu = false, cpu_only = fGPUFailed;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -390,6 +394,29 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && !cpu_only) {
++			/* GPU: needs the whole rectangle in one physical run, cleaned to PoC */
++			uint64_t first = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			IOByteCount seg = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
++			if (pa != 0 && seg >= last - s->offset &&
++			    s->memory->performOperation(kIOMemoryIncoherentIOStore, first, last - first) == kIOReturnSuccess &&
++			    sweet_gpu_copy(pa, s->bytesPerRow, (uint32_t)sx, (uint32_t)sy, (uint32_t)w, (uint32_t)h,
++			    fPhys, fRowBytes, (uint32_t)dx, (uint32_t)dy)) {
++				gpu = true;
++				src = 0;
++			}
++		}
++		if (src != 0 && bpe == 4 && gpu) {
++			/* keep layer order: lower layers queued on the GPU land first */
++			gpu = false;
++			if (!sweet_gpu_flush()) {
++				s->release();
++				fGPUFailed = true;
++				present(rec);
++				return;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+@@ -399,6 +426,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (gpu && !sweet_gpu_flush()) {
++		/* the GPU gave up: this frame and all later ones on the CPU */
++		fGPUFailed = true;
++		present(rec);
++	}
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+new file mode 100644
+index 0000000..50dae9a
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -0,0 +1,305 @@
++/*
++ * Adreno 619 2D copies for SWEET on sunstone.
++ *
++ * The shim brings the GPU up before xnu (ios-sunstone shim/gpu.c: GDSCs
++ * and clocks, identity GPU SMMU bank, zap shader through TZ, SQE, ring,
++ * CP_ME_INIT, 2D context state, core at 300 MHz) and leaves a handoff block
++ * at 0xe0040000. All of that lives below 4 GB, outside xnu's RAM. Here we
++ * only append packets to the ring and move CP_RB_WPTR.
++ *
++ * GPU addresses are physical (the SMMU bank passes them through), so
++ * sources must be physically contiguous. The panel stride (4320 bytes) is
++ * not a multiple of 64 as the 2D engine wants, but two rows are: even and
++ * odd panel rows are two blits with doubled pitches, the odd one based 32
++ * bytes before its first row and shifted right by 8 pixels.
++ *
++ * Packets and registers follow Mesa freedreno (fd6_blitter.cc) and were
++ * tested in the shim first (G2a-G2d). boot-arg sweetgpu=0 turns this off.
++ */
++#include "SweetGPU.h"
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++
++#define GPU_HANDOFF_PHYS        0xe0040000ULL
++#define GPU_LOW_PHYS            0xe0000000ULL   /* ring, fence word, handoff */
++#define GPU_LOW_SIZE            0x50000ULL
++#define GPU_REGS_SIZE           0x4000ULL
++
++#define REG_CP_RB_RPTR          0x806
++#define REG_CP_RB_WPTR          0x807
++#define REG_RBBM_STATUS         0x210
++#define REG_CP_HW_FAULT         0x821
++
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_EVENT_WRITE          0x46
++#define CP_BLIT                 0x2c
++#define BLIT_OP_SCALE           3
++#define CACHE_FLUSH_TS          0x04
++#define CACHE_INVALIDATE        0x31
++#define PC_CCU_FLUSH_COLOR_TS   0x1d
++#define DEBUG_LABEL             0x3f
++#define FMT6_8_8_8_8_UNORM      0x30
++
++struct sweet_gpu_handoff {
++	char     magic[8];              /* "SUNGPUHO" */
++	uint32_t version, ok;
++	uint64_t ring_phys;
++	uint32_t ring_dwords, wptr;
++	uint64_t ctl_phys;
++	uint32_t seqno, core_mhz;
++	uint64_t regs_phys;
++};
++
++static int                 gpu_state;   /* 0 not tried, 1 ready, -1 off */
++static IOMemoryMap        *gpu_low_map, *gpu_regs_map;
++static volatile uint32_t  *gpu_regs, *gpu_ring, *gpu_ctl;
++static uint32_t            gpu_ring_dwords, gpu_wptr, gpu_seqno, gpu_queued;
++static uint64_t            gpu_ctl_phys;
++static uint64_t            gpu_frames, gpu_ns_total;
++
++static void
++gpu_off(const char *why)
++{
++	gpu_state = -1;
++	IOLog("SWEET GPU: off: %s (rbbm 0x%x hwf 0x%x rptr 0x%x wptr 0x%x)\n", why,
++	    gpu_regs ? gpu_regs[REG_RBBM_STATUS] : 0, gpu_regs ? gpu_regs[REG_CP_HW_FAULT] : 0,
++	    gpu_regs ? gpu_regs[REG_CP_RB_RPTR] : 0, gpu_wptr);
++}
++
++static IOMemoryMap *
++gpu_map(uint64_t phys, uint64_t size)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(phys, size, kIODirectionInOut);
++	if (md == NULL) {
++		return NULL;
++	}
++	IOMemoryMap *map = md->map(kIOMapInhibitCache);
++	md->release();
++	return map;
++}
++
++static bool
++gpu_init(void)
++{
++	int on = 1;
++
++	if (gpu_state != 0) {
++		return gpu_state > 0;
++	}
++	gpu_state = -1;
++	if (PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) && on == 0) {
++		IOLog("SWEET GPU: disabled by sweetgpu=0\n");
++		return false;
++	}
++	gpu_low_map = gpu_map(GPU_LOW_PHYS, GPU_LOW_SIZE);
++	if (gpu_low_map == NULL) {
++		IOLog("SWEET GPU: cannot map 0x%llx\n", GPU_LOW_PHYS);
++		return false;
++	}
++	uintptr_t low = (uintptr_t)gpu_low_map->getVirtualAddress();
++	struct sweet_gpu_handoff ho;
++	/* device memory: aligned word loads only (no memcpy tail tricks) */
++	volatile const uint32_t *hw = (volatile const uint32_t *)(low + (GPU_HANDOFF_PHYS - GPU_LOW_PHYS));
++	for (size_t i = 0; i < sizeof(ho) / 4; i++) {
++		((uint32_t *)&ho)[i] = hw[i];
++	}
++	if (memcmp(ho.magic, "SUNGPUHO", 8) != 0 || ho.version != 1 || !ho.ok ||
++	    ho.ring_phys < GPU_LOW_PHYS || ho.ring_phys + ho.ring_dwords * 4 > GPU_LOW_PHYS + GPU_LOW_SIZE ||
++	    ho.ctl_phys < GPU_LOW_PHYS || ho.ctl_phys + 4 > GPU_LOW_PHYS + GPU_LOW_SIZE ||
++	    ho.ring_dwords == 0 || ho.wptr >= ho.ring_dwords) {
++		IOLog("SWEET GPU: no handoff from the shim (magic %.8s ok %u): CPU copies\n", ho.magic, ho.ok);
++		return false;
++	}
++	gpu_regs_map = gpu_map(ho.regs_phys, GPU_REGS_SIZE);
++	if (gpu_regs_map == NULL) {
++		IOLog("SWEET GPU: cannot map regs 0x%llx\n", ho.regs_phys);
++		return false;
++	}
++	gpu_regs = (volatile uint32_t *)gpu_regs_map->getVirtualAddress();
++	gpu_ring = (volatile uint32_t *)(low + (ho.ring_phys - GPU_LOW_PHYS));
++	gpu_ctl = (volatile uint32_t *)(low + (ho.ctl_phys - GPU_LOW_PHYS));
++	gpu_ctl_phys = ho.ctl_phys;
++	gpu_ring_dwords = ho.ring_dwords;
++	gpu_wptr = ho.wptr;
++	gpu_seqno = ho.seqno;
++	if (gpu_regs[REG_CP_RB_RPTR] != gpu_wptr) {
++		gpu_off("ring not idle at handoff");
++		return false;
++	}
++	gpu_state = 1;
++	IOLog("SWEET GPU: Adreno 619 from the shim: core %u MHz, ring 0x%llx (%u dwords) wptr %u seq %u, rbbm 0x%x\n",
++	    ho.core_mhz, ho.ring_phys, ho.ring_dwords, gpu_wptr, gpu_seqno, gpu_regs[REG_RBBM_STATUS]);
++	return true;
++}
++
++static uint32_t
++par(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (par(cnt) << 15) | ((op & 0x7f) << 16) | (par(op) << 23);
++}
++
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | cnt | (par(cnt) << 7) | (reg << 8) | (par(reg) << 27);
++}
++
++static void
++emit(uint32_t v)
++{
++	gpu_ring[gpu_wptr % gpu_ring_dwords] = v;
++	gpu_wptr = (gpu_wptr + 1) % gpu_ring_dwords;
++	gpu_queued++;
++}
++
++static void
++reg1(uint32_t reg, uint32_t v)
++{
++	emit(pkt4(reg, 1));
++	emit(v);
++}
++
++static void
++event(uint32_t ev, bool ts)
++{
++	emit(pkt7(CP_EVENT_WRITE, ts ? 4 : 1));
++	emit(ev);
++	if (ts) {
++		emit((uint32_t)gpu_ctl_phys);
++		emit((uint32_t)(gpu_ctl_phys >> 32));
++		emit(++gpu_seqno);
++	}
++}
++
++/* One BLIT_OP_SCALE copy, 1:1, RGBA8-sized pixels moved as they are. */
++static void
++blit(uint64_t sbase, uint32_t spitch, uint32_t sw, uint32_t sh, uint32_t sx, uint32_t sy,
++    uint64_t dbase, uint32_t dpitch, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
++{
++	emit(pkt4(0x8401, 6));          /* GRAS_A2D_SRC_X/YMIN/MAX (.8 fixed), DEST_TL/BR */
++	emit(sx << 8);
++	emit((sx + w - 1) << 8);
++	emit(sy << 8);
++	emit((sy + h - 1) << 8);
++	emit(dx | (dy << 16));
++	emit((dx + w - 1) | ((dy + h - 1) << 16));
++	uint32_t cntl = (FMT6_8_8_8_8_UNORM << 8) | (0xfu << 20);
++	reg1(0x8c00, cntl);             /* RB_A2D_BLT_CNTL */
++	reg1(0x8400, cntl);             /* GRAS_A2D_BLT_CNTL */
++	reg1(0xacc0, (FMT6_8_8_8_8_UNORM << 3) | (0xfu << 12)); /* SP_A2D_OUTPUT_INFO */
++	reg1(0x8c01, 0);                /* RB_A2D_PIXEL_CNTL */
++	emit(pkt4(0xb4c0, 5));          /* TPL1_A2D_SRC_TEXTURE_INFO, SIZE, BASE, PITCH */
++	emit(FMT6_8_8_8_8_UNORM | (1u << 20) | (1u << 22));
++	emit(sw | (sh << 15));
++	emit((uint32_t)sbase);
++	emit((uint32_t)(sbase >> 32));
++	emit((spitch >> 6) << 9);
++	emit(pkt4(0xb4ca, 3));          /* no UBWC flags */
++	emit(0);
++	emit(0);
++	emit(0);
++	reg1(0x8c17, FMT6_8_8_8_8_UNORM); /* RB_A2D_DEST_BUFFER_INFO: linear */
++	emit(pkt4(0x8c18, 3));
++	emit((uint32_t)dbase);
++	emit((uint32_t)(dbase >> 32));
++	emit(dpitch >> 6);
++	event(DEBUG_LABEL, false);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_BLIT, 1));
++	emit(BLIT_OP_SCALE);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++}
++
++/* ~40 dwords per blit; a flush adds ~10. Keep a frame well inside the ring. */
++#define BLIT_DWORDS 48
++
++bool
++sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
++    uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy)
++{
++	if (!gpu_init() || w == 0 || h == 0) {
++		return false;
++	}
++	/* two rows of each must be a multiple of 64 bytes; 14-bit coordinates */
++	if ((2 * src_pitch) % 64 || (2 * fb_stride) % 64 || sx + w + 16 > 16384 || dx + w + 16 > 16384 ||
++	    (h + 1) / 2 >= 16384 || gpu_queued + 2 * BLIT_DWORDS + 16 > gpu_ring_dwords / 2) {
++		return false;
++	}
++	if (gpu_queued == 0) {
++		/* the source was just written by the CPU (cleaned to PoC): drop UCHE */
++		event(CACHE_INVALIDATE, false);
++		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	}
++	for (uint32_t par_ = 0; par_ < 2; par_++) {
++		uint32_t r0 = dy + ((par_ + 2 - (dy & 1)) & 1);         /* first panel row of this parity */
++		if (r0 >= dy + h) {
++			continue;
++		}
++		uint32_t n = (dy + h - r0 + 1) / 2;
++		uint64_t drow = fb + (uint64_t)r0 * fb_stride + (uint64_t)dx * 4;
++		uint64_t srow = src + (uint64_t)(sy + r0 - dy) * src_pitch + (uint64_t)sx * 4;
++		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
++		blit(srow & ~63ULL, 2 * src_pitch, sxo + w, n, sxo, 0,
++		    drow & ~63ULL, 2 * fb_stride, dxo, 0, w, n);
++	}
++	return true;
++}
++
++bool
++sweet_gpu_flush(void)
++{
++	if (gpu_state <= 0 || gpu_queued == 0) {
++		return gpu_state > 0;
++	}
++	uint64_t t0 = mach_absolute_time(), t1, ns;
++
++	event(PC_CCU_FLUSH_COLOR_TS, true);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	event(CACHE_FLUSH_TS, true);
++	__builtin_arm_dsb(0xf);
++	gpu_regs[REG_CP_RB_WPTR] = gpu_wptr;
++	gpu_queued = 0;
++	for (int i = 0; i < 20000 && *gpu_ctl != gpu_seqno; i++) {   /* ~200 ms */
++		IODelay(10);
++	}
++	if (*gpu_ctl != gpu_seqno) {
++		gpu_off("fence timeout");
++		return false;
++	}
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	gpu_ns_total += ns;
++	if (++gpu_frames <= 8 || (gpu_frames % 1000) == 0) {
++		IOLog("SWEET GPU: frame %llu: %llu us (avg %llu us), rbbm 0x%x\n", gpu_frames, ns / 1000,
++		    gpu_ns_total / gpu_frames / 1000, gpu_regs[REG_RBBM_STATUS]);
++	}
++	return true;
++}
++
++#else /* !SWEET */
++
++bool
++sweet_gpu_copy(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t)
++{
++	return false;
++}
++
++bool
++sweet_gpu_flush(void)
++{
++	return false;
++}
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetGPU.h b/iokit/Kernel/arm/SweetGPU.h
+new file mode 100644
+index 0000000..51a22cd
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.h
+@@ -0,0 +1,31 @@
++/*
++ * Adreno 619 2D copies for SWEET on sunstone (see SweetGPU.cpp).
++ */
++#ifndef _SWEET_GPU_H
++#define _SWEET_GPU_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Queue a copy of a w x h rectangle of 32-bit pixels from physically
++ * contiguous memory (pixel sx,sy of a surface at physical src with
++ * src_pitch bytes per row) to the panel (physical fb, fb_stride bytes per
++ * row) at dx,dy. Returns false if nothing was queued: no GPU, or a layout
++ * the 2D engine cannot do; the caller then copies on the CPU.
++ */
++bool sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
++    uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy);
++
++/* Run what sweet_gpu_copy() queued and wait for it. false: the GPU is off for good. */
++bool sweet_gpu_flush(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SWEET_GPU_H */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..13356a2 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -73,6 +73,8 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++#define SWEET_SURFACE_CONTIG_MIN        (1u << 20)
++static uint32_t      sweet_surface_contig_failed;
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -688,8 +690,23 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			/*
++			 * Screen-sized surfaces physically contiguous, so that SweetGPU can
++			 * copy them to the panel (the GPU sees physical addresses); fall
++			 * back to scattered pages when that fails.
++			 */
++			if (s->allocSize >= SWEET_SURFACE_CONTIG_MIN) {
++				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++				    s->allocSize, ~((mach_vm_address_t)page_size - 1));
++				if (mem == NULL && sweet_surface_contig_failed++ < 8) {
++					IOLog("SWEET SURF: no contiguous %u bytes, using pages\n", s->allocSize);
++				}
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..5207ffc 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
