@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 373e0c1..8da05d9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,8 +45,8 @@
+  * disp.c). RequestPowerChange(0) then really switches the panel off instead
+  * of fading the frame to black. CoreBrightness sets IOMFBBrightnessLevel
+  * (nits, 16.16) on the framebuffer; the AppleARMBacklight service it needs
+- * for the slider is published only with sweetbl=1 (with it CoreBrightness
+- * also digitally dims every frame, which the CPU renderer cannot afford).
++ * for the slider is published by default (sweetbl=0 turns it off; boot-29
++ * showed no frame-rate cost on sunstone, unlike topaz's report).
+  * Boot-arg sweetdsi=0 disables the DSI commands (fade path as before).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+@@ -200,6 +200,7 @@ public:
+ 	IOLock       *fBlLock;
+ 	bool          fDsiOk;         /* commands complete; false after a timeout */
+ 	bool          fBlSet;         /* iOS set a level: restore it at display on */
++	bool          fBlLegacy;      /* the backlight service got {brightness}: IOMFBBrightnessLevel is noise */
+ 	uint32_t      fBlLevel;       /* panel DBV, kept while the display is off */
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	bool          dsiKick(uint32_t size, bool lpm);
+@@ -236,6 +237,7 @@ class AppleARMBacklight : public IOService {
+ public:
+ 	AppleCLCD *fFB;
+ 	uint32_t   fValue;
++	bool       fLegacy;        /* CoreBrightness drives {brightness}: ignore the nits writes (it sends 0) */
+ 	void       publishParameters(uint32_t value);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+@@ -344,7 +346,7 @@ AppleCLCD::start(IOService *provider)
+ 		fDsiOk = true;
+ 		dsiDump("start");
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+-		uint32_t blOn = 0;
++		uint32_t blOn = 1;
+ 		PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+@@ -914,6 +916,9 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
++	if (fBlLegacy || v == 0) {
++		return kIOReturnSuccess;        /* CoreBrightness sets this to 0 beside the real {brightness} */
++	}
+ 	/* 0..SWEET_FB_MAX_NITS nits -> DBV min..max */
+ 	uint64_t level = (v * SWEET_FB_DBV_MAX) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
+ 	if (level > SWEET_FB_DBV_MAX) {
+@@ -969,6 +974,8 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 		if (v > SWEET_BL_MAX) {
+ 			v = SWEET_BL_MAX;
+ 		}
++		fLegacy = true;
++		fFB->fBlLegacy = true;
+ 		publishParameters((uint32_t)v);
+ 		uint64_t level = (v * SWEET_FB_DBV_MAX) / SWEET_BL_MAX;
+ 		if (level < SWEET_FB_DBV_MIN) {
+@@ -985,7 +992,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 		return kIOReturnSuccess;
+ 	}
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
+-	if (n != NULL && fFB != NULL) {
++	if (n != NULL && fFB != NULL && !fLegacy) {
+ 		OSDictionary *m = OSDictionary::withCapacity(1);
+ 		/* same 16.16 nits scale as IOMFBBrightnessLevel */
+ 		uint64_t v = n->unsigned64BitValue();
