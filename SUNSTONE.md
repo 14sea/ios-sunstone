@@ -8,7 +8,7 @@ Read this first; `NOTES.md` is sweet's history, `README.md` the user-facing summ
 
 **The phone boots the iPhone X iOS 16.7.16 userland to SpringBoard on all 8 cores,
 with touch, keys, a real battery gauge (with temperature and cycle count), DCS panel off/on, a working
-brightness slider, GPU-assisted display and the root read-write in `userdata`.**
+brightness slider, the real date and time, GPU-assisted display and the root read-write in `userdata`.**
 Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
 
 - `SWEET CPU: 8/8 CPUs initialized`, PSCI CPU_ON for MPIDR 0x100-0x700.
@@ -62,6 +62,19 @@ time unchanged (~3 ms, no digital dimming cost on sunstone). It also writes `bri
 `sweetbl` defaults to 1 since 0106; boot-31 (`../out/boot31-log15.txt`) confirms: no DBV 4 any more, slider
 `brightness = 1023 .. 611` -> `panel level 0x7ff .. 0x4c6`. Reverse-engineering notes:
 `../research/dsi/NOTES-brightness.md`.
+
+### Real-time clock (0108, boot-32, `../out/boot32-log16.txt`)
+
+Linux's RTC is the **PMK8350** one (SPMI SID 6, `rtc@6100`, qcom,pmk8350-rtc; read data 0x6148..0x614b,
+ctrl 0x6146). It does not hold wall time: Qualcomm Android never writes it and keeps the UTC offset in
+persist/time/ats_* (recovery read 82199857 = 1972-08-09 at 1792595277 UTC). `bsd/dev/sweet_rtc.c` reads
+it through the SPMI observer channel; `SweetPlatformExpert` adds boot-arg `sweetrtcoff` (1710395420 for
+this phone, until the battery is pulled; `mkboot.sh` default) in get/setUTCTimeOfDay and publishes the
+`IORTC` resource. boot-32: `SWEET RTC: raw 82200712 + offset 1710395420 = 1792596132 UTC`, launchd logs
+`2026-10-21 08:22:12` (device time zone PST), i.e. the right time within seconds. Side effect: StartIOKit
+waited up to 30 s for IORTC before `clock_initialize_calendar()` on every boot (launchd's first stamp was
+16:00:51 = 51 s after the epoch); that wait is gone. If iOS sets the time, the kernel logs the new offset
+to bake. Note: testsea's clock runs ~1 min 50 s ahead of this host (visible in every chain log).
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -122,6 +135,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0105 | `AppleARMBacklight` publishes `IODisplayParameters`, maps `{brightness}` to the panel DBV |
 | 0106 | backlight service on by default (`sweetbl=0` off), nits writes ignored once `{brightness}` arrived |
 | 0107 | `pmap_sync_page_attributes_phys`: `ptoa(pp)` instead of the 32-bit `pp << PAGE_SHIFT` (every RAM page is above 4 GiB; callers: vm_fault exec-page I/D sync, vm_pageout) |
+| 0108 | RTC: PMK8350 over SPMI (`sweet_rtc.c`), `sweetrtcoff=` offset, `IORTC` resource (no 30 s StartIOKit wait) |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -150,7 +164,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
@@ -164,7 +178,7 @@ is only reported (a kernel is built from `fork/xnu/patches`). `precheck.sh --sta
 
 1. GPU user client with SMMU isolation (WIP in work/xnu by the user; brings 0098 back): review, then
    patches. Test programs reach the phone through the drop (0097/0099).
-2. No RTC (date starts 31 Dec 1969).
+2. RTC offset is a per-phone boot-arg; reading persist/time/ats_* (or writing the offset somewhere) would make it automatic.
 3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
 4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
    0xfd92000) is on, the kernel side (`sweetcpufreq`) is off.

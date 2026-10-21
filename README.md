@@ -10,7 +10,7 @@ kernel, xnu-8796, on Qualcomm phones) to the Xiaomi **Redmi Note 12 5G** (`sunst
 iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
 As of **2026-10-21** the phone boots to the **iOS home screen on all eight cores**, with
-**touch, the power/volume keys, a real battery gauge, panel power control and the brightness slider**. Frames are composed by CoreAnimation on the CPU and
+**touch, the power/volume keys, a real battery gauge, panel power control, the brightness slider and the real time**. Frames are composed by CoreAnimation on the CPU and
 copied to the panel by the Adreno 2D engine, page-flipped at 60 Hz by the display
 controller; UI threads are steered to the two A78 cores. Our own iOS programs reach the
 phone through the boot image (a small archive the kernel installs into the root before
@@ -42,6 +42,7 @@ original engineering log.
 | Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, temperature, cycle count, charger state |
 | Panel | DCS 0x28/0x29 over DSI0 at display off/on (the AMOLED really switches off); brightness slider through an `AppleARMBacklight` service with `IODisplayParameters` (what iOS 16.7 CoreBrightness expects), DCS 0x51 to the panel |
 | Debug | Persistent console log at the end of `userdata`, kernel/user stack sampler, boot-image file drop (`tools/mkdrop.py`) for test programs and launchd jobs |
+| Clock | PMK8350 RTC over SPMI plus a per-phone offset boot-arg (`sweetrtcoff`); the date is right from the first boot |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
 ## What does not work (yet)
@@ -51,7 +52,7 @@ original engineering log.
 - **No GPU rendering**: CoreAnimation draws in software, the GPU only copies frames. The GPU
   user client that let a process drive the GPU (patch 0098) was withdrawn: it exposed all
   physical memory and is kept in `xnu/patches-unused/` only.
-- **No real-time clock**: the date starts at 31 December 1969. No auto-brightness (no ambient light sensor).
+- The RTC offset to UTC is a boot-arg (Android keeps it in `persist`); it changes only when the battery is pulled. No auto-brightness (no ambient light sensor).
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
 ## How sunstone differs from topaz
@@ -136,6 +137,7 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 | `sweetgpu=0`, `sweetfb_flip=0` | CPU frame copies / no page flips |
 | `sweetbig=0xc0`, `sweetbig_pri=46` | Which cores count as big, and from which priority threads prefer them |
 | `sweetbattery=0`, `sweetdsi=0`, `sweetbl=0` | Static battery; no DSI commands (CPU fade at display off); no backlight service (slider dead) |
+| `sweetrtcoff=N` | Seconds to add to the PMIC RTC counter to get UTC (per phone; this one: 1710395420) |
 | `sweetsample=NAME,...` | Stack sampler for these processes |
 | `launchd_unsecure_cache=1`, `wdt=-1 wdt_test=no_user_checkin` | launchd without AMFI; no hardware watchdog |
 
@@ -156,7 +158,7 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 ## Roadmap
 
 1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~, ~~battery gauge~~: done.
-2. ~~Panel off/on, DCS brightness, brightness slider~~: done. **RTC**.
+2. ~~Panel off/on, DCS brightness, brightness slider, RTC~~: done.
 3. **Wi-Fi/modem**: port `TopazModem` to the SM4375 modem subsystem.
 4. **GPU** clocks above 300 MHz (GX rail vote) and a safe path to GPU rendering.
 5. CPU frequency control in the kernel (today a fixed vote from the shim), audio, Bluetooth.
@@ -196,6 +198,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0100–0101 | Battery: SM5602 gauge and SC8989X charger over QUPV3_WRAP1 S1 I2C, temperature, cycles |
 | 0102–0106 | DSI0 DCS commands: panel off/on, brightness; command packet in low RAM; `AppleARMBacklight` with `IODisplayParameters` for the slider |
 | 0107 | Cache sync of executable pages above 4 GiB (`pmap_sync_page_attributes_phys` truncated the address) |
+| 0108 | RTC from the PMK8350 PMIC, `IORTC` resource (removes a 30 s wait at boot) |
 
 ## Key hardware facts (sunstone)
 
