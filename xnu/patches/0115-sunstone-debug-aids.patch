@@ -1,0 +1,210 @@
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 59c834e..6a518c3 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)                 /* SWEET takes no hold for it (IOStartIOKit.cpp) */
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..0f71f63 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,7 +188,16 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: no IOKit daemon ever reports that it has launched (no kexts to manage), so this
++	 * hold kept the registry root busy forever: IOKit never quiesced, configd's InterfaceNamer
++	 * never said "quiet", and wifid (and SpringBoard behind it) waited for that at boot.
++	 */
++	if (false) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+diff --git a/iokit/Kernel/arm/SweetBusy.cpp b/iokit/Kernel/arm/SweetBusy.cpp
+new file mode 100644
+index 0000000..e7e3d5d
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBusy.cpp
+@@ -0,0 +1,57 @@
++/*
++ * Debugging (topaz 0127): boot-arg sweetbusy=N prints, N seconds after the
++ * platform expert starts and every 30 s after, every IOService that is still
++ * busy. configd (InterfaceNamer) waits for IOKit to quiesce before it names
++ * network interfaces, and everyone who lists interfaces waits for that.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IORegistryEntry.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++static uint32_t sweet_busy_secs;
++
++static void
++sweet_busy_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	IOSleep(sweet_busy_secs * 1000);
++	for (int round = 0; round < 10; round++) {
++		unsigned busy = 0;
++		IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++		if (it != NULL) {
++			IORegistryEntry *e;
++			while ((e = it->getNextObject()) != NULL) {
++				IOService *s = OSDynamicCast(IOService, e);
++				if (s != NULL && s->getBusyState() != 0) {
++					busy++;
++					IOLog("SWEET BUSY: %s <%s> busy %u\n", s->getName(), s->getMetaClass()->getClassName(),
++					    (unsigned)s->getBusyState());
++				}
++			}
++			it->release();
++		}
++		IOLog("SWEET BUSY: round %d: %u busy services\n", round, busy);
++		IOSleep(30000);
++	}
++	thread_terminate(current_thread());
++}
++
++extern "C" void
++sweet_busy_init(void)
++{
++	thread_t thread;
++	if (!PE_parse_boot_argn("sweetbusy", &sweet_busy_secs, sizeof(sweet_busy_secs)) || sweet_busy_secs == 0) {
++		return;
++	}
++	if (kernel_thread_start(sweet_busy_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else
++extern "C" void sweet_busy_init(void);
++extern "C" void sweet_busy_init(void) {}
++#endif
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 4b8d6ad..4275acf 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -14,6 +14,7 @@
+ /* bsd/dev/sweet_rtc.c: the PMK8350 RTC over SPMI (sunstone) */
+ extern "C" int sweet_rtc_init(void);
+ extern "C" int sweet_rtc_read(uint32_t *secs);
++extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -60,6 +61,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 		IOLog("SWEET RTC: unavailable, calendar starts at the offset %llu\n", off);
+ 	}
+ 	publishResource("IORTC");       /* StartIOKit: clock_initialize_calendar() may proceed */
++	sweet_busy_init();
+ 	return true;
+ }
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 0bfab2a..920df87 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -8,6 +8,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ 
+ # SWEET device-tree platform (empty translation unit on other boards)
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
++iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..4b24d21 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -42,6 +42,7 @@
+ #include <console/video_console.h>
+ #include <console/serial_protos.h>
+ #include <kern/startup.h>
++#include <pexpert/pexpert.h>
+ #include <kern/thread.h>
+ #include <kern/cpu_data.h>
+ #include <kern/sched_prim.h>
+@@ -274,6 +275,38 @@ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c *
+  * the GUI. A panic draws again.
+  */
+ int sweet_console_muted;
++
++/*
++ * Boot-arg sweetcons=WORD,WORD,...: only console lines containing one of the
++ * words are drawn (a panic always is); everything still reaches the
++ * persistent log. (topaz 0112, there as sweetlog=WORDS; here sweetlog=0/1
++ * keeps its sweet meaning, the persistent log switch.)
++ */
++static char sweet_cons_words[128];
++static int sweet_cons_filter = -1;
++static char sweet_cons_line[256];
++static int sweet_cons_len;
++
++static bool
++sweet_cons_wanted(const char *line, int len)
++{
++	const char *w = sweet_cons_words;
++
++	while (*w) {
++		const char *end = w;
++		while (*end && *end != ',') {
++			end++;
++		}
++		int wl = (int)(end - w);
++		for (int i = 0; wl > 0 && i + wl <= len; i++) {
++			if (strncmp(line + i, w, wl) == 0) {
++				return true;
++			}
++		}
++		w = *end ? end + 1 : end;
++	}
++	return false;
++}
+ #endif
+ 
+ static inline void
+@@ -286,6 +319,28 @@ _cnputs(char *c, int size, bool poll)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
++	if (sweet_cons_filter < 0) {
++		sweet_cons_filter = PE_parse_boot_argn("sweetcons", sweet_cons_words, sizeof(sweet_cons_words)) &&
++		    sweet_cons_words[0] != '\0';
++	}
++	if (sweet_cons_filter > 0 && !panic_active()) {
++		/* collect whole lines; draw the ones that match */
++		while (size-- > 0) {
++			char ch = *c++;
++			if (sweet_cons_len < (int)sizeof(sweet_cons_line) - 1) {
++				sweet_cons_line[sweet_cons_len++] = ch;
++			}
++			if (ch == '\n') {
++				if (sweet_cons_wanted(sweet_cons_line, sweet_cons_len) && !disableConsoleOutput) {
++					for (int i = 0; i < sweet_cons_len; i++) {
++						_cnputc(sweet_cons_line[i], poll);
++					}
++				}
++				sweet_cons_len = 0;
++			}
++		}
++		return;
++	}
+ #endif
+ 
+ 	if (disableConsoleOutput) {

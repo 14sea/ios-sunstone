@@ -1,0 +1,177 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b9d11c1..32048d5 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -707,6 +707,7 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_rtc_store_boot();
+ 	sweet_sample_start();
+ 	thread_t gpt_thread;
+ 	if (kernel_thread_start(sweet_gpt_watch, NULL, &gpt_thread) == KERN_SUCCESS) {
+@@ -854,6 +855,90 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * RTC offset record (sunstone, SweetPlatformExpert / sweet_rtc.c): the PMIC RTC
++ * counts from an arbitrary start, so the seconds to add for UTC live in the
++ * device block just below the log area:
++ *   "SWEETRTC" | u32 version 1 | u32 0 | u64 offset | u64 raw counter when written
++ * Written when iOS sets the time (setUTCTimeOfDay) and by tools/sweet-rtc-seed.sh
++ * from a recovery; boot-arg sweetrtcoff= overrides it.
++ */
++struct sweet_rtc_record {
++	char magic[8];
++	uint32_t version, pad;
++	uint64_t offset, raw;
++};
++
++int sweet_rtc_store_read(uint64_t *offset, uint64_t *raw);
++int sweet_rtc_store_write(uint64_t offset, uint64_t raw);
++extern void sweet_rtc_offset_from_store(uint64_t offset, uint64_t raw);  /* SweetPlatformExpert.cpp */
++
++static uint64_t
++sweet_rtc_block(void)
++{
++	return su.first_block + su.nblocks - SWEET_LOG_BLOCKS - 1;
++}
++
++int
++sweet_rtc_store_read(uint64_t *offset, uint64_t *raw)
++{
++	struct sweet_rtc_record r;
++	int error;
++
++	if (!su.ready || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(sweet_rtc_block(), 1);
++	if (!error) {
++		memcpy(&r, (void *)(su.dma + DMA_BOUNCE), sizeof(r));
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return error;
++	}
++	if (memcmp(r.magic, "SWEETRTC", 8) != 0 || r.version != 1 || r.offset == 0) {
++		return ENOENT;
++	}
++	*offset = r.offset;
++	*raw = r.raw;
++	return 0;
++}
++
++int
++sweet_rtc_store_write(uint64_t offset, uint64_t raw)
++{
++	struct sweet_rtc_record r = {
++		.magic = { 'S', 'W', 'E', 'E', 'T', 'R', 'T', 'C' },
++		.version = 1, .pad = 0, .offset = offset, .raw = raw,
++	};
++	int error;
++
++	if (!su.ready || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return EROFS;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++	memcpy((void *)(su.dma + DMA_BOUNCE), &r, sizeof(r));
++	error = ufs_write_blocks(sweet_rtc_block(), 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET RTC: offset %llu stored at block 0x%llx (%d)\n", offset, sweet_rtc_block(), error);
++	return error;
++}
++
++static void
++sweet_rtc_store_boot(void)
++{
++	uint64_t offset = 0, raw = 0;
++
++	if (sweet_rtc_store_read(&offset, &raw) == 0) {
++		sweet_rtc_offset_from_store(offset, raw);
++	}
++}
++
+ static void
+ sweet_log_start(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 4275acf..2d7af92 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,12 @@
+ extern "C" int sweet_rtc_init(void);
+ extern "C" int sweet_rtc_read(uint32_t *secs);
+ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
++/* bsd/dev/sweet_ufs.c: the RTC offset record below the persistent log */
++extern "C" int sweet_rtc_store_write(uint64_t offset, uint64_t raw);
++extern "C" void sweet_rtc_offset_from_store(uint64_t offset, uint64_t raw);
++extern "C" void clock_initialize_calendar(void);
++
++static class SweetPlatformExpert *gSweetPE;
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -32,6 +38,7 @@ public:
+ 	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
+ 	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+ 	bool     fRTC;
++	bool     fRTCOffsetFromArg;     /* sweetrtcoff= given: wins over the stored record */
+ 	uint64_t fRTCOffset;
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+@@ -51,8 +58,9 @@ SweetPlatformExpert::start(IOService *provider)
+ 	IOLog("SWEET: platform expert registered\n");
+ 
+ 	uint64_t off = 0;
+-	(void)PE_parse_boot_argn("sweetrtcoff", &off, sizeof(off));
++	fRTCOffsetFromArg = PE_parse_boot_argn("sweetrtcoff", &off, sizeof(off)) && off != 0;
+ 	fRTCOffset = off;
++	gSweetPE = this;
+ 	fRTC = sweet_rtc_init() == 0;
+ 	uint32_t raw = 0;
+ 	if (fRTC && sweet_rtc_read(&raw) == 0) {
+@@ -82,10 +90,34 @@ SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, __unused clock_nsec_t nse
+ {
+ 	uint32_t raw = 0;
+ 	if (fRTC && sweet_rtc_read(&raw) == 0 && (uint64_t)secs > raw) {
+-		fRTCOffset = (uint64_t)secs - raw;
+-		IOLog("SWEET RTC: time set to %lu, new offset %llu (boot-arg sweetrtcoff=%llu)\n",
+-		    (unsigned long)secs, fRTCOffset, fRTCOffset);
++		uint64_t off = (uint64_t)secs - raw;
++		uint64_t delta = off > fRTCOffset ? off - fRTCOffset : fRTCOffset - off;
++		fRTCOffset = off;
++		IOLog("SWEET RTC: time set to %lu, offset %llu\n", (unsigned long)secs, off);
++		if (delta >= 2) {
++			(void)sweet_rtc_store_write(off, raw);
++		}
++	}
++}
++
++/* sweet_ufs.c found the record on userdata (after IOKit's calendar init): apply it unless a boot-arg says otherwise */
++extern "C" void
++sweet_rtc_offset_from_store(uint64_t offset, uint64_t raw)
++{
++	SweetPlatformExpert *pe = gSweetPE;
++	if (pe == NULL) {
++		return;
++	}
++	if (pe->fRTCOffsetFromArg) {
++		IOLog("SWEET RTC: stored offset %llu ignored, boot-arg sweetrtcoff=%llu\n", offset, pe->fRTCOffset);
++		return;
+ 	}
++	pe->fRTCOffset = offset;
++	uint32_t now = 0;
++	(void)sweet_rtc_read(&now);
++	IOLog("SWEET RTC: stored offset %llu (written at raw %llu), raw now %u: calendar -> %llu UTC\n",
++	    offset, raw, now, (uint64_t)now + offset);
++	clock_initialize_calendar();
+ }
+ 
+ const char *
