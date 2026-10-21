@@ -174,6 +174,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0117 | topaz TopazModem (0113-0130) with sunstone modem_a tables (`tools/fwtable_all.py`), `sweet_ufs_read_part()` (user) |
 | 0118 | modem/WLAN on sunstone: carveout, SMEM, pool 0xd8000000, IPCC doorbells, WLAN SID 0x80, MSA, rmtfs size, trap-safe SMMU access; `modem=1`, `wifi=1` |
 | 0119 | WLAN data-path test `wlantest=1`: join from the `SWEETWLN` record, DHCP, ARP, ping; `tools/sweet-wlan-seed.sh` |
+| 0120 | battery: RMC (0x84) as AppleRawCurrentCapacity, BAT_CAP as Max/NominalChargeCapacity, TimeRemaining/AvgTimeToEmpty/Full, log on charger changes |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -220,22 +221,29 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | --- | --- | --- | --- | --- |
 | 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio, WPA2 join and IP data path done (0117-0119, boot-39). Next: the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
 | 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
-| 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (0120) | C | [~] | filter done (0115); 0120 still to port |
+| 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (topaz 0120) | C | [~] | filter done (0115); topaz 0120 touches SweetFramebuffer.cpp (user's area) |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |
 | 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [x] | 0111 |
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
 | 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | - | [ ] | after the slider (done) |
-| 8 | Battery: remaining capacity (0x84), charging current sign check while on a charger | - | [ ] | small |
+| 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [~] | 0120 built; sign check needs a boot with the USB cable pulled for a minute |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 
 ## Open items
 
-1. GPU user client with SMMU isolation (WIP in work/xnu by the user; brings 0098 back): review, then
-   patches. Test programs reach the phone through the drop (0097/0099).
-2. RTC offset is a per-phone boot-arg; reading persist/time/ats_* (or writing the offset somewhere) would make it automatic.
-3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
-4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
-   0xfd92000) is on, the kernel side (`sweetcpufreq`) is off.
-5. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.
+1. **Wi-Fi in iOS**: the kernel radio, WPA2 join and IP data path work (0117-0119); iOS does not see the
+   interface. That needs an ifnet plus the IO80211/Apple80211 control interface wifid expects, which
+   means reverse engineering wifid; parked by the user's decision (2026-10-21).
+2. WLAN MSA: the two SCM assigns of wlan@86500000 return -2/0x56 (region probably held by the
+   hypervisor); harmless so far. The WLAN MAC is the driver's fixed locally administered address
+   (persist/wlan_mac.bin is not read).
+3. Test credentials for `wlantest=1` sit on userdata (`tools/sweet-wlan-seed.sh --clear` wipes them).
+4. GPU (user): clocks above 300 MHz need the GX rail vote; CP_PROTECT table vs the Linux catalog's a630
+   list; CP reset after a wedge (a bad IB can still turn the GPU path off until reboot).
+5. CPU frequency: only the shim's one-time EPSS vote; the kernel side stays off (`sweetcpufreq=0`).
+6. Recurring crashes, all pre-existing: driverkitd sig 9 every boot; PosterBoard now and then; Settings
+   (Preferences) when it draws app icons through CoreImage's GL path (no GL renderer yet).
+7. No audio, Bluetooth, cellular data, camera, sensors (no auto-brightness), GPS, SEP.
+8. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.

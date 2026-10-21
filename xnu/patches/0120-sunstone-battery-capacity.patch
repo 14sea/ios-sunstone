@@ -1,0 +1,119 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2ad8304..d3e8b00 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -36,6 +36,8 @@ private:
+ 	int fTempCenti;         /* battery temperature, centidegrees C, when fTempValid */
+ 	bool fTempValid;
+ 	uint32_t fCycles;
++	uint32_t fFccMah;       /* SM5602 BAT_CAP (full charge capacity), 0 = unknown */
++	uint32_t fRmcMah;       /* SM5602 RMC (remaining capacity), valid with fFccMah */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -84,6 +86,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fTempCenti = 2500;
+ 	fTempValid = false;
+ 	fCycles = 0;
++	fFccMah = 0;
++	fRmcMah = 0;
+ 	return true;
+ }
+ 
+@@ -113,11 +117,19 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5000). powerd computes C*100/M. */
+-	const unsigned capacity = (5000u * percent + 50u) / 100u;
++	/*
++	 * Consistent mAh units. powerd computes the percentage as C*100/M, so M is the gauge's full
++	 * charge capacity (BAT_CAP) and C follows the gauge's own SOC (it is filtered; RMC/FCC is not
++	 * quite the same number). The raw remaining capacity (RMC) goes to AppleRawCurrentCapacity.
++	 * Without a gauge reading: the design capacity (DT nominal 5000 mAh).
++	 */
++	const unsigned design = 5000u;
++	const unsigned maxCap = (measured && fFccMah != 0) ? fFccMah : design;
++	const unsigned capacity = (maxCap * percent + 50u) / 100u;
++	const unsigned rawCap = (measured && fFccMah != 0) ? fRmcMah : capacity;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5000);
++	setMaxCapacity(maxCap);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -126,13 +138,25 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setAtCriticalLevel(false);
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+-	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++	/* minutes from the remaining capacity and the measured current; unknown (never 0) otherwise */
++	int toEmpty = -1, toFull = -1;
++	if (measured && currentValid && fFccMah != 0) {
++		if (!charging && ma <= -10) {
++			toEmpty = (int)((uint64_t)fRmcMah * 60u / (unsigned)(-ma));
++		} else if (charging && ma >= 10 && fFccMah > fRmcMah) {
++			toFull = (int)((uint64_t)(fFccMah - fRmcMah) * 60u / (unsigned)ma);
++		}
++	}
++	setTimeRemaining(charging ? toFull : toEmpty);
++	putNumber("AvgTimeToEmpty", toEmpty > 0 ? (UInt32)toEmpty : 65535u);
++	putNumber("AvgTimeToFull", toFull > 0 ? (UInt32)toFull : 65535u);
+ 	setCycleCount(fCycles); /* SM5602 SOC_CYCLE when the gauge is read, else 0 */
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+-	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5000);
+-	putNumber("DesignCapacity", 5000);
++	putNumber("AppleRawCurrentCapacity", rawCap);
++	putNumber("AppleRawMaxCapacity", maxCap);
++	putNumber("NominalChargeCapacity", maxCap);
++	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; the gauge's external thermistor, else fixed 25 C. */
+ 	putNumber("Temperature", (UInt32)fTempCenti);
+@@ -149,7 +173,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5000, mv, (UInt32)ma, fCycles,
++		UInt32 values[] = {capacity, maxCap, mv, (UInt32)ma, fCycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -291,6 +315,9 @@ SweetBattery::pollGauge(void)
+ 	tex = texOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+ 	bool cycOk = sweet_i2c1_read(0x71, 0x0b, w, 2) == 0;
+ 	cyc = cycOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
++	uint16_t rmc = 0;
++	bool rmcOk = sweet_i2c1_read(0x71, 0x84, w, 2) == 0;     /* RMC: sm5602_fg.c fg_read_rmc() */
++	rmc = rmcOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+ 
+ 	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
+ 	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
+@@ -312,11 +339,21 @@ SweetBattery::pollGauge(void)
+ 	if (cycOk) {
+ 		fCycles = cyc;
+ 	}
++	unsigned rmcMah = (rmc & 0x7fffu) * 1000u / 2048u;
++	/* only plausible capacities (design 5000 mAh); a bad read keeps the design value */
++	if (fullOk && fullMah >= 1000 && fullMah <= 6000 && rmcOk && rmcMah <= fullMah + fullMah / 10) {
++		fFccMah = fullMah;
++		fRmcMah = rmcMah > fullMah ? fullMah : rmcMah;
++	}
+ 	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++	/* every minute, and whenever the charger state changes (sign check: discharging is negative) */
+ 	static unsigned logs;
+-	if (logs++ % 30 == 0) {
+-		IOLog("SWEET BATTERY: gauge %u%% %umV %dmA full=%umAh %dC cycles=%u soc=%#x volt=%#x cur=%#x tex=%#x chg=%#x external=%d charging=%d\n",
+-		    percent, mv, ma, fullMah, tempC, cyc, soc, volt, cur, tex, st, external, charging);
++	static int lastState = -1;
++	int state = (external ? 1 : 0) | (charging ? 2 : 0) | (done ? 4 : 0);
++	if (logs++ % 6 == 0 || state != lastState) {
++		IOLog("SWEET BATTERY: gauge %u%% %umV %dmA rmc=%umAh full=%umAh %dC cycles=%u soc=%#x volt=%#x cur=%#x rmc=%#x tex=%#x chg=%#x external=%d charging=%d full=%d\n",
++		    percent, mv, ma, rmcMah, fullMah, tempC, cyc, soc, volt, cur, rmc, tex, st, external, charging, done);
++		lastState = state;
+ 	}
+ 	return true;
+ }
