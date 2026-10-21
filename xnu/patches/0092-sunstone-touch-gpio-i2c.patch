@@ -1,0 +1,245 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 12c2228..1e13106 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -84,6 +84,7 @@ void sweet_touch_init(void);
+ 
+ static struct {
+ 	vm_offset_t se, gcc, west;
++	bool bitbang, bb_held;     /* sunstone: GPIO I2C on SDA/SCL (SE8 is GSI-only) */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -240,11 +241,205 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
++/*
++ * sunstone: TrustZone loads SE8 (qupv3_se8_i2c) for GSI DMA only:
++ * GENI_IF_DISABLE_RO (0x64) bit 0 FIFO_IF_DISABLE is set, so the FIFO path
++ * below cannot run. Instead SDA/SCL (GPIO19/20) are muxed to plain GPIO and
++ * driven open-drain: OUT stays 0, "low" = output enable, "high" = input with
++ * the pull-up. About 100 kHz, clock stretching honoured.
++ */
++#define BB_HALF_US       5u
++#define BB_STRETCH_US    1000u
++
++static void
++bb_line(unsigned pin, bool low)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	uint32_t cfg = touch_rd(st.west, off);
++	touch_wr(st.west, off, low ? (cfg | 0x200u) : (cfg & ~0x200u));
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return (touch_rd(st.west, TOUCH_GPIO_IO(pin)) & 1u) != 0;
++}
++
++static bool
++bb_scl_high(void)
++{
++	bb_line(TOUCH_PIN_SCL, false);
++	for (unsigned i = 0; i < BB_STRETCH_US; i++) {
++		if (bb_get(TOUCH_PIN_SCL)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bb_setup(void)
++{
++	/* plain GPIO (mux 0), pull-up, 6 mA when driving low, OUT latch 0 */
++	touch_gpio(TOUCH_PIN_SDA, 0, 3, 2, false, false);
++	touch_gpio(TOUCH_PIN_SCL, 0, 3, 2, false, false);
++	touch_wr(st.west, TOUCH_GPIO_IO(TOUCH_PIN_SDA), touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_SDA)) & ~2u);
++	touch_wr(st.west, TOUCH_GPIO_IO(TOUCH_PIN_SCL), touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_SCL)) & ~2u);
++	delay(BB_HALF_US);
++	/* bus recovery: up to 9 clocks while a slave holds SDA low, then STOP */
++	for (unsigned i = 0; i < 9 && !bb_get(TOUCH_PIN_SDA); i++) {
++		bb_line(TOUCH_PIN_SCL, true);
++		delay(BB_HALF_US);
++		(void)bb_scl_high();
++		delay(BB_HALF_US);
++	}
++	bb_line(TOUCH_PIN_SDA, true);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	delay(BB_HALF_US);
++	bb_line(TOUCH_PIN_SDA, false);
++	delay(BB_HALF_US);
++	st.bb_held = false;
++	printf("SWEET TOUCH: bit-bang I2C on GPIO%u/%u, idle sda=%d scl=%d\n", TOUCH_PIN_SDA,
++	    TOUCH_PIN_SCL, bb_get(TOUCH_PIN_SDA), bb_get(TOUCH_PIN_SCL));
++}
++
++static bool
++bb_start(bool repeated)
++{
++	if (repeated) {
++		bb_line(TOUCH_PIN_SDA, false);
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return false;
++		}
++		delay(BB_HALF_US);
++	}
++	if (!bb_get(TOUCH_PIN_SDA)) {
++		return false;           /* bus not free */
++	}
++	bb_line(TOUCH_PIN_SDA, true);
++	delay(BB_HALF_US);
++	bb_line(TOUCH_PIN_SCL, true);
++	delay(BB_HALF_US);
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(TOUCH_PIN_SDA, true);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	delay(BB_HALF_US);
++	bb_line(TOUCH_PIN_SDA, false);
++	delay(BB_HALF_US);
++	st.bb_held = false;
++}
++
++/* Returns 0 on ACK, ENXIO on NACK, ETIMEDOUT if SCL stays low. */
++static int
++bb_write_byte(uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		bb_line(TOUCH_PIN_SDA, !((b >> i) & 1u));
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		delay(BB_HALF_US);
++		bb_line(TOUCH_PIN_SCL, true);
++	}
++	bb_line(TOUCH_PIN_SDA, false);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bool nack = bb_get(TOUCH_PIN_SDA);
++	delay(BB_HALF_US);
++	bb_line(TOUCH_PIN_SCL, true);
++	return nack ? ENXIO : 0;
++}
++
++static int
++bb_read_byte(uint8_t *out, bool ack)
++{
++	uint8_t b = 0;
++	bb_line(TOUCH_PIN_SDA, false);
++	for (int i = 0; i < 8; i++) {
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		b = (uint8_t)((b << 1) | (bb_get(TOUCH_PIN_SDA) ? 1u : 0u));
++		delay(BB_HALF_US);
++		bb_line(TOUCH_PIN_SCL, true);
++	}
++	bb_line(TOUCH_PIN_SDA, ack);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	delay(BB_HALF_US);
++	bb_line(TOUCH_PIN_SCL, true);
++	bb_line(TOUCH_PIN_SDA, false);
++	*out = b;
++	return 0;
++}
++
++/* Same contract as touch_msg_run: one write or one read; stretch = no STOP. */
++static int
++touch_bb_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	int err;
++	if ((nt && nr) || (!nt && !nr) || nr > 90) {
++		return EIO;
++	}
++	if (!bb_start(st.bb_held)) {
++		bb_setup();
++		return EBUSY;
++	}
++	err = bb_write_byte((uint8_t)((addr << 1) | (nr ? 1u : 0u)));
++	if (err) {
++		goto stop;
++	}
++	for (unsigned i = 0; i < nt; i++) {
++		err = bb_write_byte(tx[i]);
++		if (err) {
++			err = err == ENXIO ? EIO : err;
++			goto stop;
++		}
++		st.sent++;
++	}
++	for (unsigned i = 0; i < nr; i++) {
++		err = bb_read_byte(&rx[i], i + 1 < nr);
++		if (err) {
++			goto stop;
++		}
++		st.got++;
++	}
++	if (nt && stretch) {
++		st.bb_held = true;      /* repeated START for the read that follows */
++		return 0;
++	}
++stop:
++	bb_stop();
++	if (err == ETIMEDOUT) {
++		bb_setup();
++	}
++	return err;
++}
++
+ /* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
++	if (st.bitbang) {
++		return touch_bb_msg(addr, tx, nt, rx, nr, stretch);
++	}
+ 	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+@@ -566,6 +761,11 @@ touch_se_init(void)
+ 	printf("SWEET TOUCH: se2 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
++	if (((fw >> 8) & 0xffu) == 3u && (touch_rd(st.se, 0x64) & 1u)) {
++		printf("SWEET TOUCH: SE8 FIFO interface disabled (GSI-only); I2C by GPIO bit-bang\n");
++		st.bitbang = true;
++		return true;
++	}
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+@@ -654,8 +854,12 @@ touch_thread(void *arg, wait_result_t result)
+ 	/* TopazTouch touch.c: IRQ input, AVDD on, I2C pins, then the reset pulse. */
+ 	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);       /* CTL 0xc3 */
+ 	touch_gpio(TOUCH_PIN_AVDD, 0, 3, 3, true, true);        /* CTL 0x2c3, high */
+-	touch_gpio(TOUCH_PIN_SDA, 1, 3, 0, false, false);       /* qup12 SDA, pull-up 2 mA (DT) */
+-	touch_gpio(TOUCH_PIN_SCL, 1, 3, 0, false, false);       /* qup12 SCL */
++	if (st.bitbang) {
++		bb_setup();                                     /* GPIO19/20 as open-drain GPIO */
++	} else {
++		touch_gpio(TOUCH_PIN_SDA, 1, 3, 0, false, false);       /* qup12 SDA, pull-up 2 mA (DT) */
++		touch_gpio(TOUCH_PIN_SCL, 1, 3, 0, false, false);       /* qup12 SCL */
++	}
+ 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);      /* CTL 0x2c3, low */
+ 	touch_wait(20);
+ 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);

@@ -7,6 +7,7 @@ starting from ios-topaz. Status: kernel-only bring-up, no iOS root yet.
   hardware drivers off by default), plus sunstone patches:
   - 0083 early framebuffer at the sunstone splash 0x85200000 (32MB block 0x84000000)
   - 0084 CPU topology: MPIDR Aff1 = core (0x000-0x700), boot on CPU 0
+  - 0092 touch I2C by GPIO bit-bang on GPIO19/20: TZ loads SE8 for GSI DMA only (FIFO_IF_DISABLE)
   - 0091 touch (FT5452 on qupv3_se8_i2c, from topaz 0083-0090) and keys (PM6125 PON + PMR735A GPIO1)
   - 0090 sampler walks the user stack of waiting threads again
   - 0089 ARMv8.2 + PAN back (-mcpu=cortex-a55+crypto, __ARM_PAN_AVAILABLE__): topaz 0081 dropped PAN,
