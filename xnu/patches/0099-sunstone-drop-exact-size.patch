@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_drop.c b/bsd/dev/sweet_drop.c
+index 55013bd..3ae11c3 100644
+--- a/bsd/dev/sweet_drop.c
++++ b/bsd/dev/sweet_drop.c
+@@ -17,6 +17,9 @@
+ #include <sys/fcntl.h>
+ #include <sys/proc.h>
+ #include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/mount.h>
++#include <sys/errno.h>
+ #include <sys/uio.h>
+ #include <sys/kauth.h>
+ #include <pexpert/device_tree.h>
+@@ -35,19 +38,32 @@ sweet_drop_one(const char *path, uint32_t mode, const void *data, uint32_t size)
+ 	vfs_context_t ctx = vfs_context_current();
+ 	vnode_t vp = NULLVP;
+ 	struct vnode_attr va;
+-	int err;
++	int err, resid = 0;
+ 
+ 	err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, (int)(mode & 07777), 0, &vp, ctx);
+ 	if (err != 0) {
+ 		return err;
+ 	}
+ 	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)size, 0, UIO_SYSSPACE, 0,
+-	    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (err == 0 && resid != 0) {
++		err = EIO;
++	}
+ 	if (err == 0) {
++		/*
++		 * O_TRUNC does not shorten an existing file here (HFS+): set the
++		 * size explicitly, or a shorter new file keeps the old tail. A
++		 * binary plist with 3 stale bytes after its trailer made launchd
++		 * refuse launchd.plist ("No service cache") and init exit.
++		 */
+ 		VATTR_INIT(&va);
+ 		VATTR_SET(&va, va_mode, (mode_t)(mode & 07777));
++		VATTR_SET(&va, va_data_size, (off_t)size);
+ 		err = vnode_setattr(vp, &va, ctx);
+ 	}
++	if (err == 0) {
++		err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
+ 	(void)vnode_close(vp, FWRITE, ctx);
+ 	return err;
+ }
