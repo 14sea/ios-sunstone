@@ -1218,7 +1218,7 @@ index 3130896..fd28cd7 100644
  uint64_t sweet_gpu_param(uint32_t which);
  
 diff --git a/iokit/Kernel/arm/SweetGPUDevice.cpp b/iokit/Kernel/arm/SweetGPUDevice.cpp
-index 5c71e7a..2f10bfb 100644
+index 5c71e7a..ad29c3e 100644
 --- a/iokit/Kernel/arm/SweetGPUDevice.cpp
 +++ b/iokit/Kernel/arm/SweetGPUDevice.cpp
 @@ -1,22 +1,41 @@
@@ -1340,7 +1340,7 @@ index 5c71e7a..2f10bfb 100644
  
  public:
  	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
-@@ -83,41 +117,142 @@ public:
+@@ -83,41 +117,146 @@ public:
  
  OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
  
@@ -1359,12 +1359,16 @@ index 5c71e7a..2f10bfb 100644
 +		return true;
 +	}
 +	/* Allow explicit GPU entitlements. */
-+	OSPtr<OSObject> ent = copyClientEntitlement(task, "com.sunstone.gpu-access");
-+	if (ent.get() == kOSBooleanTrue) {
++	OSObject *ent = copyClientEntitlement(task, "com.sunstone.gpu-access");
++	bool ok = (ent == kOSBooleanTrue);
++	OSSafeReleaseNULL(ent);
++	if (ok) {
 +		return true;
 +	}
-+	OSPtr<OSObject> privEnt = copyClientEntitlement(task, "com.apple.private.gpu-access");
-+	if (privEnt.get() == kOSBooleanTrue) {
++	ent = copyClientEntitlement(task, "com.apple.private.gpu-access");
++	ok = (ent == kOSBooleanTrue);
++	OSSafeReleaseNULL(ent);
++	if (ok) {
 +		return true;
 +	}
 +	/*
@@ -1492,7 +1496,7 @@ index 5c71e7a..2f10bfb 100644
  	terminate();
  	return kIOReturnSuccess;
  }
-@@ -125,8 +260,18 @@ SweetGPUUserClient::clientClose(void)
+@@ -125,8 +264,18 @@ SweetGPUUserClient::clientClose(void)
  void
  SweetGPUUserClient::free(void)
  {
@@ -1511,7 +1515,7 @@ index 5c71e7a..2f10bfb 100644
  	}
  	IOUserClient::free();
  }
-@@ -142,7 +287,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -142,7 +291,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  
  	IOLockLock(fLock);
  	switch (selector) {
@@ -1520,7 +1524,7 @@ index 5c71e7a..2f10bfb 100644
  		if (nin < 1 || args->scalarOutputCount < 1) {
  			ret = kIOReturnBadArgument;
  			break;
-@@ -150,7 +295,8 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -150,7 +299,8 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  		out[0] = sweet_gpu_param((uint32_t)in[0]);
  		args->scalarOutputCount = 1;
  		break;
@@ -1530,7 +1534,7 @@ index 5c71e7a..2f10bfb 100644
  		if (nin < 1 || args->scalarOutputCount < 4 || in[0] == 0 || in[0] > SWEET_GPU_MAX_BO_SIZE) {
  			ret = kIOReturnBadArgument;
  			break;
-@@ -164,12 +310,24 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -164,12 +314,24 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  			break;
  		}
  		uint32_t size = (uint32_t)round_page((vm_size_t)in[0]);
@@ -1558,7 +1562,7 @@ index 5c71e7a..2f10bfb 100644
  			map = mem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
  		}
  		if (map == NULL) {
-@@ -177,34 +335,65 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -177,34 +339,65 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  			ret = kIOReturnNoMemory;
  			break;
  		}
@@ -1632,7 +1636,7 @@ index 5c71e7a..2f10bfb 100644
  			break;
  		}
  		fLastFence = fence;
-@@ -213,14 +402,161 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -213,14 +406,161 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  		args->scalarOutputCount = 1;
  		break;
  	}
