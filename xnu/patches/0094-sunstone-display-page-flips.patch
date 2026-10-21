@@ -1,0 +1,362 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6a9cd97..03f63f8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -26,7 +26,15 @@
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+  * scaling): with the Adreno 2D engine when the shim handed the GPU over and
+- * the surface is physically contiguous (SweetGPU.cpp), else on the CPU. Vsync (notification type 5) is a 60 Hz timer that
++ * the surface is physically contiguous (SweetGPU.cpp), else on the CPU.
++ *
++ * sunstone page flips: a frame that is one full-screen layer is copied by
++ * the GPU into one of two back buffers in low RAM that xnu does not own
++ * (0xc8000000/0xc9000000, pitch 4352: one aligned blit), and the MDP's
++ * VIG0 pipe (which scans the splash) is pointed at it; the CTL flush
++ * latches at the panel's next vsync (120 Hz), so no frame shows half
++ * copied. Anything else goes back to the splash buffer and the copy path.
++ * The CPU never touches the back buffers. boot-arg sweetfb_flip=0. Vsync (notification type 5) is a 60 Hz timer that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -39,6 +47,7 @@
+ #include "SweetGPU.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -53,6 +62,13 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++static uint64_t sweet_fb_swap_count;
++
++#define SWEET_MDP_CTL0          0x05e02000ULL   /* MDP 0x5e01000 + 0x1000 */
++#define SWEET_MDP_VIG0          0x05e05000ULL   /* MDP + 0x4000 */
++#define SWEET_FLIP_PITCH        4352u           /* 68 x 64 */
++static const uint64_t sweet_flip_phys[2] = { 0xc8000000ULL, 0xc9000000ULL };
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -108,6 +124,20 @@ public:
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	bool          fGPUFailed;       /* SweetGPU gave up: copy on the CPU */
++	/* page flips: VIG0 / CTL0 of the sm6375 MDP (dpu_6_9_sm6375.h) */
++	volatile uint32_t *fVig0, *fCtl0;
++	uint64_t      fScanPhys;        /* what VIG0 fetches now */
++	bool          fFlips;
++	bool          flipPresent(const uint8_t *rec);
++	void          scanFrom(uint64_t pa, uint32_t stride);
++	bool          flipLatched(uint32_t wait_us);
++	void          flipToBoot(void);
++	void          pauseConsole(void);
++	/* vsync on an absolute schedule: present() time does not stretch it */
++	uint64_t      fNextVsync, fVsyncAbs;
++	void          rearm(IOTimerEventSource *t);
++	/* stats, logged every 300 vsyncs */
++	uint64_t      fStPresents, fStFlips, fStCleanNs, fStGpuNs, fStTotalNs, fStSwaps;
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -198,7 +228,21 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &fVsyncAbs);
++	fNextVsync = mach_absolute_time() + fVsyncAbs;
++	fVsync->wakeAtTime(fNextVsync);
++
++	int flips = 1;
++	PE_parse_boot_argn("sweetfb_flip", &flips, sizeof(flips));
++	vm_offset_t mdp = flips ? ml_io_map(SWEET_MDP_CTL0, 0x4000) : 0;
++	if (mdp != 0) {
++		fCtl0 = (volatile uint32_t *)mdp;
++		fVig0 = (volatile uint32_t *)(mdp + (SWEET_MDP_VIG0 - SWEET_MDP_CTL0));
++		fScanPhys = fVig0[0x14 / 4];
++		fFlips = fScanPhys == fPhys && fVig0[0x24 / 4] == fRowBytes && sweet_gpu_ready();
++		IOLog("SWEET FB: MDP VIG0 scans %#llx stride %u, page flips %s\n", fScanPhys,
++		    fVig0[0x24 / 4], fFlips ? "on" : "off");
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -209,6 +253,17 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++void
++AppleCLCD::rearm(IOTimerEventSource *t)
++{
++	uint64_t now = mach_absolute_time();
++	fNextVsync += fVsyncAbs;
++	if (fNextVsync <= now) {
++		fNextVsync = now + fVsyncAbs;   /* fell behind: skip, do not burst */
++	}
++	t->wakeAtTime(fNextVsync);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -228,6 +283,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++		/* the fade works on the splash buffer: show it with the last frame */
++		if (fb->fFadeStep == 0 && fb->fScanPhys != fb->fPhys && fb->fVig0 != NULL) {
++			IOLockUnlock(fb->fLock);
++			fb->flipToBoot();
++			IOLockLock(fb->fLock);
++		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -242,7 +303,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearm(sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -256,10 +317,21 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time(), ns;
+ 		fb->present(rec);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		fb->fStPresents++;
++		fb->fStTotalNs += ns;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	if ((count % 300) == 0 && fb->fStPresents != 0) {
++		uint64_t n = fb->fStPresents, swaps = sweet_fb_swap_count - fb->fStSwaps;
++		IOLog("SWEET FB: 300 vsyncs: %llu swaps, %llu presents (%llu flips), avg us: present %llu clean %llu gpu %llu\n",
++		    swaps, n, fb->fStFlips, fb->fStTotalNs / n / 1000, fb->fStCleanNs / n / 1000, fb->fStGpuNs / n / 1000);
++		fb->fStSwaps = sweet_fb_swap_count;
++		fb->fStPresents = fb->fStFlips = fb->fStCleanNs = fb->fStGpuNs = fb->fStTotalNs = 0;
++	}
++	fb->rearm(sender);
+ }
+ 
+ void
+@@ -290,7 +362,6 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -312,12 +383,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::pauseConsole(void)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-	bool gpu = false, cpu_only = fGPUFailed;
+-
+-
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -327,6 +394,123 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++}
++
++void
++AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++{
++	fVig0[0x14 / 4] = (uint32_t)pa;         /* SSPP_SRC0_ADDR */
++	fVig0[0x24 / 4] = stride;               /* SSPP_SRC_YSTRIDE0 */
++	__builtin_arm_dsb(0xf);
++	fCtl0[0x18 / 4] = (1u << 17) | (1u << 0); /* CTL_FLUSH: CTL + VIG0, latched at vsync */
++	__builtin_arm_dsb(0xf);
++	fScanPhys = pa;
++}
++
++bool
++AppleCLCD::flipLatched(uint32_t wait_us)
++{
++	for (uint32_t i = 0; i < wait_us / 10; i++) {
++		if ((fCtl0[0x18 / 4] & ((1u << 17) | 1u)) == 0) {
++			return true;
++		}
++		IODelay(10);
++	}
++	return (fCtl0[0x18 / 4] & ((1u << 17) | 1u)) == 0;
++}
++
++/* Back to the splash buffer, carrying the frame on screen over (GPU). */
++void
++AppleCLCD::flipToBoot(void)
++{
++	if (fScanPhys == fPhys) {
++		return;
++	}
++	if (!fGPUFailed && sweet_gpu_copy(fScanPhys, SWEET_FLIP_PITCH, 0, 0, fWidth, fHeight,
++	    fPhys, fRowBytes, 0, 0) && !sweet_gpu_flush()) {
++		fGPUFailed = true;
++	}
++	scanFrom(fPhys, fRowBytes);
++	(void)flipLatched(20000);
++}
++
++/*
++ * One full-screen layer, physically contiguous: GPU copy of the panel
++ * window into the back buffer, then flip. false: use the copy path.
++ */
++bool
++AppleCLCD::flipPresent(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), layer = 0, n = 0;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			n++;
++		}
++	}
++	if (n != 1 || fGPUFailed) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
++	if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
++	    (get32(b, 8) != 0 && get32(b, 8) != fLogicalW) || (get32(b, 12) != 0 && get32(b, 12) != fLogicalH)) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL) {
++		return false;
++	}
++	bool ok = false;
++	if (s != fSurface && s->memory != NULL && s->width == fLogicalW && s->height == fLogicalH &&
++	    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1) {
++		uint64_t first = (uint64_t)s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4;
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(fOffY + fHeight - 1) * s->bytesPerRow +
++		    (uint64_t)(fOffX + fWidth) * 4;
++		IOByteCount seg = 0;
++		addr64_t pa = last <= s->memory->getLength() ?
++		    s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone) : 0;
++		if (pa != 0 && seg >= last - s->offset) {
++			/* the back buffer may still be on screen until the last flip latched */
++			(void)flipLatched(10000);
++			uint32_t back = fScanPhys == sweet_flip_phys[0] ? 1 : 0;
++			uint64_t t0 = mach_absolute_time(), t1, t2, ns;
++			if (s->memory->performOperation(kIOMemoryIncoherentIOStore, first, last - first) == kIOReturnSuccess) {
++				t1 = mach_absolute_time();
++				if (sweet_gpu_copy(pa, s->bytesPerRow, (uint32_t)fOffX, (uint32_t)fOffY, fWidth, fHeight,
++				    sweet_flip_phys[back], SWEET_FLIP_PITCH, 0, 0)) {
++					if (sweet_gpu_flush()) {
++						t2 = mach_absolute_time();
++						scanFrom(sweet_flip_phys[back], SWEET_FLIP_PITCH);
++						absolutetime_to_nanoseconds(t1 - t0, &ns);
++						fStCleanNs += ns;
++						absolutetime_to_nanoseconds(t2 - t1, &ns);
++						fStGpuNs += ns;
++						fStFlips++;
++						ok = true;
++					} else {
++						fGPUFailed = true;
++					}
++				}
++			}
++		}
++	}
++	s->release();
++	return ok;
++}
++
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	bool gpu = false, cpu_only = fGPUFailed;
++
++	pauseConsole();
++	if (fFlips && flipPresent(rec)) {
++		return;
++	}
++	if (fVig0 != NULL && fScanPhys != fPhys) {
++		flipToBoot();           /* the copy path draws into the splash buffer */
++	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 50dae9a..fda6fb1 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -234,7 +234,7 @@ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+ 	}
+ 	/* two rows of each must be a multiple of 64 bytes; 14-bit coordinates */
+ 	if ((2 * src_pitch) % 64 || (2 * fb_stride) % 64 || sx + w + 16 > 16384 || dx + w + 16 > 16384 ||
+-	    (h + 1) / 2 >= 16384 || gpu_queued + 2 * BLIT_DWORDS + 16 > gpu_ring_dwords / 2) {
++	    h >= 16384 || gpu_queued + 2 * BLIT_DWORDS + 16 > gpu_ring_dwords / 2) {
+ 		return false;
+ 	}
+ 	if (gpu_queued == 0) {
+@@ -242,6 +242,14 @@ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+ 		event(CACHE_INVALIDATE, false);
+ 		emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	}
++	if (fb_stride % 64 == 0 && src_pitch % 64 == 0) {
++		/* aligned destination (the flip buffers): one blit */
++		uint64_t drow = fb + (uint64_t)dy * fb_stride + (uint64_t)dx * 4;
++		uint64_t srow = src + (uint64_t)sy * src_pitch + (uint64_t)sx * 4;
++		uint32_t dxo = (uint32_t)(drow & 63) / 4, sxo = (uint32_t)(srow & 63) / 4;
++		blit(srow & ~63ULL, src_pitch, sxo + w, h, sxo, 0, drow & ~63ULL, fb_stride, dxo, 0, w, h);
++		return true;
++	}
+ 	for (uint32_t par_ = 0; par_ < 2; par_++) {
+ 		uint32_t r0 = dy + ((par_ + 2 - (dy & 1)) & 1);         /* first panel row of this parity */
+ 		if (r0 >= dy + h) {
+@@ -257,6 +265,12 @@ sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+ 	return true;
+ }
+ 
++bool
++sweet_gpu_ready(void)
++{
++	return gpu_init();
++}
++
+ bool
+ sweet_gpu_flush(void)
+ {
+@@ -302,4 +316,10 @@ sweet_gpu_flush(void)
+ 	return false;
+ }
+ 
++bool
++sweet_gpu_ready(void)
++{
++	return false;
++}
++
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetGPU.h b/iokit/Kernel/arm/SweetGPU.h
+index 51a22cd..5549d02 100644
+--- a/iokit/Kernel/arm/SweetGPU.h
++++ b/iokit/Kernel/arm/SweetGPU.h
+@@ -21,6 +21,9 @@ extern "C" {
+ bool sweet_gpu_copy(uint64_t src, uint32_t src_pitch, uint32_t sx, uint32_t sy,
+     uint32_t w, uint32_t h, uint64_t fb, uint32_t fb_stride, uint32_t dx, uint32_t dy);
+ 
++/* The shim handed the GPU over and it has not failed (tries the handoff once). */
++bool sweet_gpu_ready(void);
++
+ /* Run what sweet_gpu_copy() queued and wait for it. false: the GPU is off for good. */
+ bool sweet_gpu_flush(void);
+ 
