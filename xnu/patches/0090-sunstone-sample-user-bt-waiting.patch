@@ -1,0 +1,28 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 7b4e018..91b61ae 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1012,10 +1012,10 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+ 
+ 	/*
+-	 * sunstone: no task_lock and no reads of the user map here. launchd's
+-	 * first mach_vm_allocate stops in the kernel holding its vm_map lock,
+-	 * and a user-stack walk (vm_map_read_user faults on that map) then
+-	 * blocked this sampler for good. Diagnostic only: the thread list is
++	 * sunstone: no task_lock. The user-stack walk is skipped only for a
++	 * thread preempted inside the kernel (kpcb set); waiting threads get
++	 * their full user backtrace (the hang that once blocked this walk was
++	 * the PAN livelock fixed by 0089). Diagnostic only: the thread list is
+ 	 * read without the lock.
+ 	 */
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+@@ -1030,7 +1030,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			fp = get_saved_state_fp(ss);
+ 			n = snprintf(line, sizeof(line), "SMP %s t%d tid %llu pc 0x%llx lr 0x%llx sp 0x%llx bt", name, t,
+ 			    thread->thread_id, get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-			for (int i = 0; !in_kernel && i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++			for (int i = 0; kpcb == NULL && i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 				uint64_t frame[2];
+ 				if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 					break;
