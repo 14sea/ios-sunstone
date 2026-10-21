@@ -1,0 +1,103 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index bb43bbb..d5fd23b 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1011,46 +1011,61 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	}
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+ 
+-	task_lock(task);
++	/*
++	 * sunstone: no task_lock and no reads of the user map here. launchd's
++	 * first mach_vm_allocate stops in the kernel holding its vm_map lock,
++	 * and a user-stack walk (vm_map_read_user faults on that map) then
++	 * blocked this sampler for good. Diagnostic only: the thread list is
++	 * read without the lock.
++	 */
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
++		arm_saved_state_t *kpcb = thread->machine.kpcb;
++		bool in_kernel = kpcb != NULL || (thread->state & TH_WAIT);
+ 		char line[400];
+-		int n;
++		int n, t = tn++;
+ 		uint64_t fp;
+ 
+-		if (ss == NULL || !is_saved_state64(ss)) {
+-			continue;
+-		}
+-		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+-			uint64_t frame[2];
+-			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+-				break;
+-			}
+-			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
+-			if (frame[0] <= fp) {
+-				break;
++		if (ss != NULL && is_saved_state64(ss)) {
++			fp = get_saved_state_fp(ss);
++			n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, t,
++			    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++			for (int i = 0; !in_kernel && i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++				uint64_t frame[2];
++				if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++					break;
++				}
++				n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++				if (frame[0] <= fp) {
++					break;
++				}
++				fp = frame[0];
+ 			}
+-			fp = frame[0];
++			printf("%s%s\n", line, in_kernel ? " (in kernel)" : "");
+ 		}
+-		printf("%s\n", line);
+ 
+ 		/*
+-		 * sunstone: a thread blocked in the kernel (dyld's first
+-		 * mach_vm_allocate never returned): its wait event and the
+-		 * kernel frame-pointer chain from the context saved at the
+-		 * switch. Only waiting threads, and every frame must lie in the
+-		 * thread's own kernel stack.
++		 * Kernel side: kpcb is the kernel state saved when the thread was
++		 * interrupted in the kernel (preempted while running there);
++		 * otherwise a waiting thread's context saved at the switch. Every
++		 * frame must lie in the thread's own kernel stack.
+ 		 */
+-		if ((thread->state & TH_WAIT) && thread->kernel_stack != 0) {
+-			arm_kernel_saved_state_t *ks = &thread_get_kernel_state(thread)->machine.ss;
++		if (in_kernel && thread->kernel_stack != 0) {
+ 			uint64_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
+-			uint64_t kfp = ks->fp;
+-			n = snprintf(line, sizeof(line), "SMP %s t%d kst 0x%x wev 0x%llx klr 0x%llx kbt",
+-			    name, tn - 1, thread->state, (uint64_t)VM_KERNEL_UNSLIDE_OR_PERM(thread->wait_event),
+-			    (uint64_t)VM_KERNEL_UNSLIDE(ks->lr));
++			uint64_t kpc = 0, klr, kfp;
++			if (kpcb != NULL && is_saved_state64(kpcb)) {
++				kpc = get_saved_state_pc(kpcb);
++				klr = get_saved_state_lr(kpcb);
++				kfp = get_saved_state_fp(kpcb);
++			} else {
++				arm_kernel_saved_state_t *ks = &thread_get_kernel_state(thread)->machine.ss;
++				klr = ks->lr;
++				kfp = ks->fp;
++			}
++			n = snprintf(line, sizeof(line), "SMP %s t%d %s kst 0x%x wev 0x%llx kpc 0x%llx klr 0x%llx kbt",
++			    name, t, kpcb != NULL ? "PREEMPTED" : "WAITING", thread->state,
++			    (uint64_t)VM_KERNEL_UNSLIDE_OR_PERM(thread->wait_event),
++			    (uint64_t)VM_KERNEL_UNSLIDE(kpc), (uint64_t)VM_KERNEL_UNSLIDE(klr));
+ 			for (int i = 0; i < 20 && kfp >= lo && kfp + 16 <= hi && (kfp & 7) == 0 &&
+ 			    n < (int)sizeof(line) - 20; i++) {
+ 				uint64_t *frame = (uint64_t *)kfp;
+@@ -1063,7 +1078,6 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			printf("%s\n", line);
+ 		}
+ 	}
+-	task_unlock(task);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
