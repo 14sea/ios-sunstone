@@ -99,6 +99,16 @@ Gunyah); the firmware still reaches mission mode and scans. Firmware reports MAC
 uses its own locally administered address. **iOS does not see any of it yet**: topaz's public tree has
 no consumer of the `topaz_wlan_*` C API (no ifnet, no IO80211/Apple80211 layer for wifid).
 
+### ADSP (0121/0122, boot-41/42, `../out/boot42-log25.txt`)
+
+`adsp=1` boots the LPASS DSP through PAS (id 1) with the generic `pas_boot()`: adsp.mdt is linked at
+0x53400000 and relocated into adsp@86700000 (0x2800000, exactly its size), init_image/mem_setup/auth
+`ret=0`. boot-41 ran it but saw no READY; it waits for our side: with our outbound SMP2P item 429
+(master-kernel, sleepstate) made first and IPCC client 3 rung (0122), boot-42 shows
+`slave-kernel 00000006 READY` 40 ms after auth. SMEM apps<->adsp then holds 478/479/480 (its GLINK edge),
+429/443 (SMP2P) and 606/611/613. The LPI cx/mx proxy rails were not voted and were not needed.
+Next: GLINK + QRTR on the lpass edge (the GLINK code is modem-only so far), then the sensor PD.
+
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
 `tools/mkdrop.py` packs files (optionally a merged `launchd.plist` with one extra job) into a
@@ -177,6 +187,8 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0118 | modem/WLAN on sunstone: carveout, SMEM, pool 0xd8000000, IPCC doorbells, WLAN SID 0x80, MSA, rmtfs size, trap-safe SMMU access; `modem=1`, `wifi=1` |
 | 0119 | WLAN data-path test `wlantest=1`: join from the `SWEETWLN` record, DHCP, ARP, ping; `tools/sweet-wlan-seed.sh` |
 | 0120 | battery: RMC (0x84) as AppleRawCurrentCapacity, BAT_CAP as Max/NominalChargeCapacity, TimeRemaining/AvgTimeToEmpty/Full, log on charger changes |
+| 0121 | generic PAS loader with qcom_mdt_load relocation; ADSP boot (`adsp=1`, PAS 1, adsp@86700000) |
+| 0122 | ADSP: our outbound SMP2P item 429 first (READY comes only then), SMEM/SMP2P dumps |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -205,7 +217,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping), 40 battery (capacities, sign check). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping), 40 battery (capacities, sign check), 41 adsp (runs, no READY), 42 adsp2 (READY). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
