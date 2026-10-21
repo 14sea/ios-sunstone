@@ -1,0 +1,704 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index af8160f..7d0ba3b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_drop.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+new file mode 100644
+index 0000000..389c0b1
+--- /dev/null
++++ b/bsd/dev/sweet_i2c1.c
+@@ -0,0 +1,485 @@
++/*
++ * sunstone: polled I2C on QUPV3_WRAP1 S1 (qupv3_se7_i2c at 0x4c84000), the
++ * battery bus: SM5602 fuel gauge at 0x71 and the bq25890-map SC8989X charger
++ * at 0x6a (live DT 2026-10-21; the same chips as topaz, which has them on
++ * QUP0 SE1). Read-only use by SweetBattery: nothing is written to either chip.
++ *
++ * Two transports, chosen at init like the sunstone touch driver (SE8):
++ *  - GENI FIFO mode (topaz sweet_i2c1.c / Linux i2c-qcom-geni.c) when the SE
++ *    still has its FIFO interface;
++ *  - open-drain GPIO bit-bang on SDA/SCL GPIO27/28 when TrustZone loaded the
++ *    SE for GSI DMA only (GENI_IF_DISABLE_RO 0x64 bit 0 FIFO_IF_DISABLE), as
++ *    it does for SE8. ~100 kHz, clock stretching honoured.
++ * Clocks: WRAP1 S1 branch (bit 22) and the WRAP1 core/AHB votes in GCC
++ * 0x7900c, RCG 0x5314c from XO (gcc-sm6375.c). Pins: gpio27/28 function 1
++ * (qup11_f1, pinctrl-sm6375.c), 2 mA, pull-up (DT qupv3_se7_i2c_active).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_i2c1_init(void);
++int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
++
++#define I2C1_SE_PA      0x04c84000u     /* qupv3_se7_i2c = QUPV3_WRAP1 S1 */
++#define I2C1_GCC_PA     0x01400000u
++#define I2C1_TLMM_PA    0x00500000u     /* one tile (pinctrl-blair.c); GPIO n at n*0x1000 */
++#define I2C1_GCC_VOTE   0x7900cu
++#define I2C1_GCC_BITS   0x5e0000u       /* WRAP1 S1 22, M_AHB 17, S_AHB 18, CORE 19, CORE_2X 20 */
++#define I2C1_RCG        0x5314cu        /* WRAP1 S1 CMD_RCGR; CFG +4, CBCR -4 = 0x53148 */
++#define I2C1_PIN_SDA    27u
++#define I2C1_PIN_SCL    28u
++#define GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define GPIO_IO(n)      (GPIO_CFG(n) + 4u)
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_IF_DISABLE   0x064u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_TX_WM        0x80cu
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13))
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++#define BB_HALF_US      5u
++#define BB_STRETCH_US   1000u
++
++static vm_offset_t i2c1_se, i2c1_gcc, i2c1_tlmm;
++static bool i2c1_ready, i2c1_bitbang, i2c1_bb_held;
++static LCK_GRP_DECLARE(sweet_i2c1_grp, "sweet_i2c1");
++static LCK_MTX_DECLARE(sweet_i2c1_lock, &sweet_i2c1_grp);
++
++static uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++wait_clear(vm_offset_t b, uint32_t o, uint32_t m)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd(b, o) & m)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: mux/pull/drive and optional output latch (as sweet_touch.c touch_gpio). */
++static void
++gpio_cfg(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = GPIO_CFG(pin);
++	uint32_t cfg = rd(i2c1_tlmm, off);
++	if (out) {
++		wr(i2c1_tlmm, GPIO_IO(pin), (rd(i2c1_tlmm, GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	wr(i2c1_tlmm, off, cfg);
++}
++
++/* --- GPIO bit-bang (open drain: OUT latch 0, low = output enable) --- */
++
++static void
++bb_line(unsigned pin, bool low)
++{
++	uint32_t off = GPIO_CFG(pin);
++	uint32_t cfg = rd(i2c1_tlmm, off);
++	wr(i2c1_tlmm, off, low ? (cfg | 0x200u) : (cfg & ~0x200u));
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return (rd(i2c1_tlmm, GPIO_IO(pin)) & 1u) != 0;
++}
++
++static bool
++bb_scl_high(void)
++{
++	bb_line(I2C1_PIN_SCL, false);
++	for (unsigned i = 0; i < BB_STRETCH_US; i++) {
++		if (bb_get(I2C1_PIN_SCL)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bb_setup(void)
++{
++	/* plain GPIO (mux 0), pull-up, 6 mA when driving low, OUT latch 0 */
++	gpio_cfg(I2C1_PIN_SDA, 0, 3, 2, false, false);
++	gpio_cfg(I2C1_PIN_SCL, 0, 3, 2, false, false);
++	wr(i2c1_tlmm, GPIO_IO(I2C1_PIN_SDA), rd(i2c1_tlmm, GPIO_IO(I2C1_PIN_SDA)) & ~2u);
++	wr(i2c1_tlmm, GPIO_IO(I2C1_PIN_SCL), rd(i2c1_tlmm, GPIO_IO(I2C1_PIN_SCL)) & ~2u);
++	delay(BB_HALF_US);
++	/* bus recovery: up to 9 clocks while a slave holds SDA low, then STOP */
++	for (unsigned i = 0; i < 9 && !bb_get(I2C1_PIN_SDA); i++) {
++		bb_line(I2C1_PIN_SCL, true);
++		delay(BB_HALF_US);
++		(void)bb_scl_high();
++		delay(BB_HALF_US);
++	}
++	bb_line(I2C1_PIN_SDA, true);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	delay(BB_HALF_US);
++	bb_line(I2C1_PIN_SDA, false);
++	delay(BB_HALF_US);
++	i2c1_bb_held = false;
++	printf("SWEET I2C1: bit-bang I2C on GPIO%u/%u, idle sda=%d scl=%d\n", I2C1_PIN_SDA,
++	    I2C1_PIN_SCL, bb_get(I2C1_PIN_SDA), bb_get(I2C1_PIN_SCL));
++}
++
++static bool
++bb_start(bool repeated)
++{
++	if (repeated) {
++		bb_line(I2C1_PIN_SDA, false);
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return false;
++		}
++		delay(BB_HALF_US);
++	}
++	if (!bb_get(I2C1_PIN_SDA)) {
++		return false;           /* bus not free */
++	}
++	bb_line(I2C1_PIN_SDA, true);
++	delay(BB_HALF_US);
++	bb_line(I2C1_PIN_SCL, true);
++	delay(BB_HALF_US);
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(I2C1_PIN_SDA, true);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	delay(BB_HALF_US);
++	bb_line(I2C1_PIN_SDA, false);
++	delay(BB_HALF_US);
++	i2c1_bb_held = false;
++}
++
++/* 0 on ACK, ENXIO on NACK, ETIMEDOUT if SCL stays low. */
++static int
++bb_write_byte(uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		bb_line(I2C1_PIN_SDA, !((b >> i) & 1u));
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		delay(BB_HALF_US);
++		bb_line(I2C1_PIN_SCL, true);
++	}
++	bb_line(I2C1_PIN_SDA, false);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bool nack = bb_get(I2C1_PIN_SDA);
++	delay(BB_HALF_US);
++	bb_line(I2C1_PIN_SCL, true);
++	return nack ? ENXIO : 0;
++}
++
++static int
++bb_read_byte(uint8_t *out, bool ack)
++{
++	uint8_t b = 0;
++	bb_line(I2C1_PIN_SDA, false);
++	for (int i = 0; i < 8; i++) {
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		b = (uint8_t)((b << 1) | (bb_get(I2C1_PIN_SDA) ? 1u : 0u));
++		delay(BB_HALF_US);
++		bb_line(I2C1_PIN_SCL, true);
++	}
++	bb_line(I2C1_PIN_SDA, ack);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	delay(BB_HALF_US);
++	bb_line(I2C1_PIN_SCL, true);
++	bb_line(I2C1_PIN_SDA, false);
++	*out = b;
++	return 0;
++}
++
++/* One write or one read; stretch = no STOP (repeated START for the read that follows). */
++static int
++bb_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	int err;
++	if (!bb_start(i2c1_bb_held)) {
++		bb_setup();
++		return EBUSY;
++	}
++	err = bb_write_byte((uint8_t)((addr << 1) | (nr ? 1u : 0u)));
++	if (err) {
++		goto stop;
++	}
++	for (unsigned i = 0; i < nt; i++) {
++		err = bb_write_byte(tx[i]);
++		if (err) {
++			err = err == ENXIO ? EIO : err;
++			goto stop;
++		}
++	}
++	for (unsigned i = 0; i < nr; i++) {
++		err = bb_read_byte(&rx[i], i + 1 < nr);
++		if (err) {
++			goto stop;
++		}
++	}
++	if (nt && stretch) {
++		i2c1_bb_held = true;
++		return 0;
++	}
++stop:
++	bb_stop();
++	if (err == ETIMEDOUT) {
++		bb_setup();
++	}
++	return err;
++}
++
++/* --- GENI FIFO mode --- */
++
++static void
++fifo_abort(void)
++{
++	wr(i2c1_se, SE_CTRL, 4);                /* cancel */
++	for (unsigned i = 0; i < 1000 && !(rd(i2c1_se, SE_IRQ) & (1u << 4)); ++i) {
++		delay(1);
++	}
++	if (!(rd(i2c1_se, SE_IRQ) & (1u << 4))) {
++		wr(i2c1_se, SE_CTRL, 2);        /* abort */
++		for (unsigned i = 0; i < 1000 && !(rd(i2c1_se, SE_IRQ) & (1u << 5)); ++i) {
++			delay(1);
++		}
++	}
++	for (unsigned i = 0; i < 64 && (rd(i2c1_se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)rd(i2c1_se, SE_RX);
++	}
++	wr(i2c1_se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* One message: write nt (<= 3) bytes or read nr (<= 64) bytes. */
++static int
++fifo_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	unsigned sent = 0, got = 0;
++	if (!wait_clear(i2c1_se, SE_STATUS, 1u)) {
++		return EBUSY;
++	}
++	wr(i2c1_se, SE_IRQ_CLR, 0xffffffffu);
++	wr(i2c1_se, SE_TX_WM, nt ? 1u : 0u);
++	wr(i2c1_se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	wr(i2c1_se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = rd(i2c1_se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			int err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 2000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = rd(i2c1_se, SE_IRQ);
++			}
++			if (!(irq & SE_DONE) || (rd(i2c1_se, SE_STATUS) & 1u)) {
++				fifo_abort();
++			}
++			wr(i2c1_se, SE_IRQ_CLR, 0xffffffffu);
++			return err;
++		}
++		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			wr(i2c1_se, SE_TX, word);
++			sent = nt;
++			wr(i2c1_se, SE_TX_WM, 0);
++		}
++		uint32_t count = rd(i2c1_se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 16) {
++			break;
++		}
++		while (count--) {
++			uint32_t word = rd(i2c1_se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			wr(i2c1_se, SE_IRQ_CLR, 0xffffffffu);
++			return (got == nr && sent == nt) ? 0 : EIO;
++		}
++		wr(i2c1_se, SE_IRQ_CLR, irq & ~SE_DONE);
++		delay(1);
++	}
++	fifo_abort();
++	return ETIMEDOUT;
++}
++
++static int
++fifo_init(void)
++{
++	uint32_t fw = rd(i2c1_se, SE_FW);
++	uint32_t tx = rd(i2c1_se, SE_HW_TX), rxp = rd(i2c1_se, SE_HW_RX);
++	if (((fw >> 8) & 0xffu) != 3u || ((tx >> 24) & 0x3fu) != 32u || ((rxp >> 24) & 0x3fu) != 32u) {
++		printf("SWEET I2C1: SE7 is not an I2C engine (fw %#x tx %#x rx %#x)\n", fw, tx, rxp);
++		return EIO;
++	}
++	if (rd(i2c1_se, SE_STATUS) & 0x1001u) {
++		printf("SWEET I2C1: SE7 busy (status %#x)\n", rd(i2c1_se, SE_STATUS));
++		return EBUSY;
++	}
++	wr(i2c1_se, 0xe18, 0);
++	wr(i2c1_se, 0xe1c, 0);
++	wr(i2c1_se, 0x644, 0);
++	wr(i2c1_se, SE_IRQ_CLR, 0xffffffffu);
++	wr(i2c1_se, 0x648, 0xffffffffu);
++	wr(i2c1_se, SE_DMA, 0);
++	wr(i2c1_se, 0x28, rd(i2c1_se, 0x28) | 0x7fu);
++	wr(i2c1_se, 0xe30, rd(i2c1_se, 0xe30) | 0x0fu);
++	wr(i2c1_se, 0x24, 0x7f);
++	wr(i2c1_se, 0x20, 1);
++	wr(i2c1_se, SE_CLK_SEL, 0);
++	wr(i2c1_se, SE_MCLK, (2u << 4) | 1u);                  /* 400 kHz from 19.2 MHz */
++	wr(i2c1_se, SE_SCL, (5u << 20) | (11u << 10) | 22u);
++	wr(i2c1_se, 0x254, 0);
++	wr(i2c1_se, 0x260, SE_PACK0);
++	wr(i2c1_se, 0x264, SE_PACK1);
++	wr(i2c1_se, 0x284, SE_PACK0);
++	wr(i2c1_se, 0x288, SE_PACK1);
++	wr(i2c1_se, SE_TX_WM, 0);
++	wr(i2c1_se, 0x810, 0);
++	wr(i2c1_se, 0x814, ((rxp >> 16) & 0x3fu) - 1u);
++	wr(i2c1_se, SE_IRQ_EN, SE_DONE | SE_ERRORS | (3u << 26) | SE_TX_WM_IRQ);
++	if (rd(i2c1_se, 0x260) != SE_PACK0 || rd(i2c1_se, 0x284) != SE_PACK0) {
++		printf("SWEET I2C1: packing readback mismatch\n");
++		return EIO;
++	}
++	/* qup11_f1 on GPIO27/28: function 1, 2 mA, pull-up (DT) */
++	gpio_cfg(I2C1_PIN_SDA, 1, 3, 0, false, false);
++	gpio_cfg(I2C1_PIN_SCL, 1, 3, 0, false, false);
++	printf("SWEET I2C1: SE7 FIFO ready (fw %#x)\n", fw);
++	return 0;
++}
++
++int
++sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	if (!i2c1_ready || len == 0 || len > 64) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_i2c1_lock);
++	int err;
++	if (i2c1_bitbang) {
++		err = bb_msg(addr, &reg, 1, NULL, 0, true);
++		if (!err) {
++			err = bb_msg(addr, NULL, 0, buf, len, false);
++		}
++	} else {
++		err = fifo_msg(addr, &reg, 1, NULL, 0, true);
++		if (!err) {
++			err = fifo_msg(addr, NULL, 0, buf, len, false);
++		}
++	}
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
++int
++sweet_i2c1_init(void)
++{
++	if (i2c1_ready) {
++		return 0;
++	}
++	i2c1_gcc = ml_io_map(I2C1_GCC_PA, 0x80000);
++	i2c1_tlmm = ml_io_map(I2C1_TLMM_PA, 0x58000);          /* GPIO 0..87 */
++	i2c1_se = ml_io_map(I2C1_SE_PA, 0x4000);
++	if (!i2c1_gcc || !i2c1_tlmm || !i2c1_se) {
++		return ENOMEM;
++	}
++	/* OR our votes in: other bits of the shared register belong to others. XO, divider 1. */
++	wr(i2c1_gcc, I2C1_GCC_VOTE, rd(i2c1_gcc, I2C1_GCC_VOTE) | I2C1_GCC_BITS);
++	printf("SWEET I2C1: gcc vote=%#x rcg=%#x cfg=%#x cbcr=%#x\n",
++	    rd(i2c1_gcc, I2C1_GCC_VOTE), rd(i2c1_gcc, I2C1_RCG),
++	    rd(i2c1_gcc, I2C1_RCG + 4u), rd(i2c1_gcc, I2C1_RCG - 4u));
++	wr(i2c1_gcc, I2C1_RCG + 4u, 1u);
++	wr(i2c1_gcc, I2C1_RCG, rd(i2c1_gcc, I2C1_RCG) | 1u);
++	if (!wait_clear(i2c1_gcc, I2C1_RCG, 1u)) {
++		printf("SWEET I2C1: RCG update timeout\n");
++		return EIO;
++	}
++	if (!wait_clear(i2c1_gcc, I2C1_RCG - 4u, 1u << 31)) {
++		printf("SWEET I2C1: SE7 branch halted (cbcr %#x)\n", rd(i2c1_gcc, I2C1_RCG - 4u));
++		return EIO;
++	}
++	uint32_t fw = rd(i2c1_se, SE_FW);
++	printf("SWEET I2C1: se7 fw=%#x proto=%u status=%#x ifdis=%#x\n", fw, (fw >> 8) & 0xffu,
++	    rd(i2c1_se, SE_STATUS), rd(i2c1_se, SE_IF_DISABLE));
++	if (((fw >> 8) & 0xffu) == 3u && (rd(i2c1_se, SE_IF_DISABLE) & 1u)) {
++		printf("SWEET I2C1: SE7 FIFO interface disabled (GSI-only); I2C by GPIO bit-bang\n");
++		i2c1_bitbang = true;
++		bb_setup();
++	} else {
++		int err = fifo_init();
++		if (err) {
++			return err;
++		}
++	}
++	i2c1_ready = true;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..568f831 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,10 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery bring-up service.
++ * sunstone: the SM5602 fuel gauge and the bq25890-map (SC8989X) charger on
++ * qupv3_se7_i2c (bsd/dev/sweet_i2c1.c) are polled read-only every 10 seconds;
++ * sweetbattery=0 keeps the static fallback (100%, AC, not charging).
++ * sweet's PM6150 SPMI path (sweetbattery=2) stays for reference; its
++ * voltage-derived SOC is an UNCALIBRATED estimate.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -15,6 +17,9 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_i2c1.c: sunstone battery bus (QUPV3_WRAP1 S1) */
++extern "C" int sweet_i2c1_init(void);
++extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,13 +31,14 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fGauge;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	bool pollGauge(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -51,7 +57,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fGauge = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +107,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (DT nominal=5000). powerd computes C*100/M. */
++	const unsigned capacity = (5000u * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(5000);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +125,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", 5000);
++	putNumber("DesignCapacity", 5000);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +143,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, 5000, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,7 +160,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (fGauge ? "SM5602 gauge" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -203,9 +209,65 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * sunstone/topaz (MakrSas/topaz-woa TopazBattery gauge.c): SM5602 fuel gauge
++ * at 0x71 (16-bit little-endian words) and the bq25890-map charger at 0x6a,
++ * REG0B. Read-only: nothing is written to either chip; charging runs in
++ * hardware.
++ */
++bool
++SweetBattery::pollGauge(void)
++{
++	uint8_t w[2], st = 0;
++	uint16_t soc, volt, cur, full;
++	if (sweet_i2c1_read(0x71, 0x05, w, 2)) {
++		return false;
++	}
++	soc = (uint16_t)(w[0] | w[1] << 8);
++	if (sweet_i2c1_read(0x71, 0x07, w, 2)) {
++		return false;
++	}
++	volt = (uint16_t)(w[0] | w[1] << 8);
++	if (sweet_i2c1_read(0x71, 0x08, w, 2)) {
++		return false;
++	}
++	cur = (uint16_t)(w[0] | w[1] << 8);
++	bool fullOk = sweet_i2c1_read(0x71, 0x62, w, 2) == 0;
++	full = fullOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
++	bool chgOk = sweet_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
++
++	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
++	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
++	int ma = (int)((cur & 0x7fffu) * 1000u / 4088u * 2u);
++	if (cur & 0x8000u) {
++		ma = -ma;               /* bit 15: discharging */
++	}
++	unsigned fullMah = (full & 0x7fffu) * 1000u / 2048u;
++	if (percent > 100 || mv < 2800 || mv > 4600) {
++		return false;
++	}
++	unsigned vbus = (st >> 5) & 7u, chrg = (st >> 3) & 3u;
++	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
++	bool charging = external && (chrg == 1 || chrg == 2);
++	bool done = external && chrg == 3;
++	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: gauge %u%% %umV %dmA full=%umAh soc=%#x volt=%#x cur=%#x chg=%#x external=%d charging=%d\n",
++		    percent, mv, ma, fullMah, soc, volt, cur, st, external, charging);
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fGauge) {
++		if (!pollGauge()) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -252,7 +314,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(self->fGauge ? 10000 : 30000);
+ 	}
+ }
+ 
+@@ -262,9 +324,16 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 1;   /* sunstone: SM5602/charger over I2C by default; 0 = static fallback, 2 = sweet PM6150 */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (real == 1) {
++		int err = sweet_i2c1_init();
++		fGauge = err == 0;
++		if (err) {
++			IOLog("SWEET BATTERY: battery bus init failed (%d); static fallback\n", err);
++		}
++	}
++	fReal = fGauge || (real == 2 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -273,7 +342,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fGauge ? 10000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
