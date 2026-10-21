@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 03f63f8..8db52c5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -64,6 +64,26 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * Clean a CPU-written surface to the point of coherency before the GPU reads
++ * it. Not IOMemoryDescriptor::performOperation(kIOMemoryIncoherentIOStore):
++ * for large ranges that does CleanPoC_Dcache(), a set/way clean of the
++ * calling core only, while CoreAnimation draws on the other cores. DC CVAC by
++ * address is broadcast to every core (topaz 0111 does the same).
++ */
++static void
++sweet_clean_poc(uintptr_t va, uint64_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = 4UL << ((ctr >> 16) & 0xf), end = va + len;
++	__builtin_arm_dsb(0xf);
++	for (uintptr_t p = va & ~(line - 1); p < end; p += line) {
++		__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__builtin_arm_dsb(0xf);
++}
++
+ #define SWEET_MDP_CTL0          0x05e02000ULL   /* MDP 0x5e01000 + 0x1000 */
+ #define SWEET_MDP_VIG0          0x05e05000ULL   /* MDP + 0x4000 */
+ #define SWEET_FLIP_PITCH        4352u           /* 68 x 64 */
+@@ -474,7 +494,9 @@ AppleCLCD::flipPresent(const uint8_t *rec)
+ 			(void)flipLatched(10000);
+ 			uint32_t back = fScanPhys == sweet_flip_phys[0] ? 1 : 0;
+ 			uint64_t t0 = mach_absolute_time(), t1, t2, ns;
+-			if (s->memory->performOperation(kIOMemoryIncoherentIOStore, first, last - first) == kIOReturnSuccess) {
++			uintptr_t va = s->kernelAddress();
++			if (va != 0) {
++				sweet_clean_poc(va + first, last - first);
+ 				t1 = mach_absolute_time();
+ 				if (sweet_gpu_copy(pa, s->bytesPerRow, (uint32_t)fOffX, (uint32_t)fOffY, fWidth, fHeight,
+ 				    sweet_flip_phys[back], SWEET_FLIP_PITCH, 0, 0)) {
+@@ -584,7 +606,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			IOByteCount seg = 0;
+ 			addr64_t pa = s->memory->getPhysicalSegment(s->offset, &seg, kIOMemoryMapperNone);
+ 			if (pa != 0 && seg >= last - s->offset &&
+-			    s->memory->performOperation(kIOMemoryIncoherentIOStore, first, last - first) == kIOReturnSuccess &&
++			    (sweet_clean_poc(src + first, last - first), true) &&
+ 			    sweet_gpu_copy(pa, s->bytesPerRow, (uint32_t)sx, (uint32_t)sy, (uint32_t)w, (uint32_t)h,
+ 			    fPhys, fRowBytes, (uint32_t)dx, (uint32_t)dy)) {
+ 				gpu = true;
