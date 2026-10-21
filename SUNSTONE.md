@@ -32,18 +32,16 @@ the files into the root right before launchd (`SWEET DROP: path (bytes, mode) ->
 | --- | --- | --- |
 | 21 (`drop-m1.bin`) | launchd.plist 795442 B (+sweettest job), sweettest | OK, sweettest ran |
 | 22 (`drop-m2.bin`/`m2b`) | launchd.plist 795439 B (+sweetgpu job) | **init exited**: `O_TRUNC` via `vnode_open` did not shorten the HFS+ file, 3 stale bytes after the plist trailer, launchd refused the cache (fixed by 0099) |
-| 23 (`drop-restore.bin`) | original launchd.plist 795217 B, written by 0099 at its exact size | flashed and rebooted 12:23:51; **log not pulled yet** |
+| 23 (`drop-restore.bin`) | original launchd.plist 795217 B, written by 0099 at its exact size | **OK** (`../out/boot23-log8.txt`): `SWEET DROP: ... (795217 bytes, mode 644) -> 0`, `Cache sent to launchd successfully`, SpringBoard and backboardd up, 33 touch events, same two crashes as boot-21 (driverkitd sig 9, PosterBoard) |
 
 **`../out/boot22-log7.txt` is byte-identical to `boot21-log6.txt`**: boot-22 died before the log
 ring was flushed, so the pull returned boot-21's log again. Treat log7 as a duplicate.
 
-Boot-23 log: `~/ios-build/pull-log8.sh` on testsea waits (up to 14 h) for the phone in crDroid
-recovery (`adb devices` shows `recovery`), then writes `~/ios-build/log8.bin` / `log8.txt`
-(`pull-log8.log` has the progress). Someone must put the phone into recovery by hand (hold
-Power + Volume up from the running kernel, slot b holds crDroid). Then:
-`scp testsea@testsea:ios-build/log8.txt ../out/boot23-log8.txt` and check for
-`SWEET DROP: /System/Library/xpc/launchd.plist (795217 bytes, mode 644) -> 0`,
-`Using unsecure cache` / `Cache sent to launchd successfully` and `exec SpringBoard`.
+Reading the log: the phone has no USB while XNU runs. From fastboot: `fastboot set_active b`,
+`fastboot reboot recovery` (crDroid recovery in slot b), then `adb root` (the recovery's adbd starts
+unprivileged: `blockdev: Permission denied` without it), then the last-1025-blocks `dd` of
+`userdata` (`tools/sweet-log-pull.sh`) and `tools/sweet-log.py`. **Slot b is active after this**;
+the next `wait-flash-NN.sh` sets slot a again.
 
 ### GPU
 
@@ -107,11 +105,10 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 
 ## Open items
 
-1. Confirm boot-23 from log8 (drop at exact size, launchd takes the cache, SpringBoard up).
-2. Decide how test programs reach the phone now that 0098 is gone: the drop still works for
+1. Decide how test programs reach the phone now that 0098 is gone: the drop still works for
    binaries and LaunchDaemon plists; keep `launchd.plist` edits size-safe (0099).
-3. Battery is a static fallback (100 %, external power); no RTC (date starts 31 Dec 1969).
-4. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
-5. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
+2. Battery is a static fallback (100 %, external power); no RTC (date starts 31 Dec 1969).
+3. No Wi-Fi/modem, audio, Bluetooth, sensors: topaz's `TopazModem` targets SM6225 and is not ported.
+4. GPU: clocks beyond 300 MHz need the GX rail vote; the shim's cpufreq vote (EPSS 0xfd91000 /
    0xfd92000) is on, the kernel side (`sweetcpufreq`) is off.
-6. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.
+5. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.
