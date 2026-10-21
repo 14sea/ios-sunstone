@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 21475af..af221d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -59,7 +59,6 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+-extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);  /* osfmk/arm/caches.c */
+ extern "C" uint64_t sweet_big_picks, sweet_little_picks;  /* osfmk/kern/sched_prim.c */
+ 
+ #if defined(SWEET)
+@@ -68,7 +67,6 @@ extern "C" uint64_t sweet_big_picks, sweet_little_picks;  /* osfmk/kern/sched_pr
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+-#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+@@ -127,6 +125,14 @@ enum {
+ #define SWEET_FB_DBV_MIN                4       /* DT qcom,mdss-dsi-bl-min-level */
+ #define SWEET_FB_DBV_MAX                0x7ff   /* DT qcom,mdss-dsi-bl-max-level */
+ #define SWEET_DSI0_PA                   0x05e94000ULL
++/*
++ * DSI command DMA packet page: low RAM that xnu does not own (next to the
++ * page-flip back buffers). The DMA takes a 32-bit address; xnu's RAM is the
++ * bank at 0x1_80000000, and IOBufferMemoryDescriptor's physical mask is
++ * turned into an IOMMU address-bits spec (not a limit) when a mapper exists,
++ * so a kernel buffer truncates to an XPU-protected carve-out: the DMA hangs.
++ */
++#define SWEET_DSI_CMD_PA                0xca000000ULL
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -190,8 +196,7 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* panel brightness / on-off: DCS over DSI0 (sweetdsi=0 disables) */
+ 	volatile uint8_t *fDsi;
+-	IOBufferMemoryDescriptor *fDsiBuf;
+-	uint64_t      fDsiBufPhys;
++	volatile uint8_t *fDsiCmd;    /* SWEET_DSI_CMD_PA mapped (device memory) */
+ 	IOLock       *fBlLock;
+ 	bool          fDsiOk;         /* commands complete; false after a timeout */
+ 	bool          fBlSet;         /* iOS set a level: restore it at display on */
+@@ -321,10 +326,8 @@ AppleCLCD::start(IOService *provider)
+ 	fBlLevel = SWEET_FB_DBV_MAX / 2;
+ 	if (dsi && fBlLock != NULL) {
+ 		fDsi = (volatile uint8_t *)ml_io_map(SWEET_DSI0_PA, 0x1000);
+-		fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+-		fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-		if (fDsi == NULL || fDsiBufPhys == 0) {
++		fDsiCmd = (volatile uint8_t *)ml_io_map(SWEET_DSI_CMD_PA, 0x1000);
++		if (fDsi == NULL || fDsiCmd == NULL) {
+ 			fDsi = NULL;
+ 		}
+ 	}
+@@ -785,7 +788,7 @@ AppleCLCD::dsiKick(uint32_t size, bool lpm)
+ 	d &= ~((1u << 24) | (1u << 29) | (1u << 30) | (1u << 31));
+ 	dsi_wr(fDsi, 0x03c, d);
+ 	dsi_wr(fDsi, 0x050, fifo | (1u << 20) | (1u << 16));
+-	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	dsi_wr(fDsi, 0x048, (uint32_t)SWEET_DSI_CMD_PA);
+ 	dsi_wr(fDsi, 0x04c, size & 0xffffffu);
+ 	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+@@ -812,17 +815,14 @@ AppleCLCD::dsiKick(uint32_t size, bool lpm)
+ bool
+ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ {
+-	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
++	if (fDsi == NULL || fDsiCmd == NULL || len > 60) {
+ 		return false;
+ 	}
+-	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
+ 	uint32_t size = (4 + len + 3) & ~3u;
+-	memset(p, 0xff, 64);
+-	memcpy(p, hdr, 4);
+-	if (len) {
+-		memcpy(p + 4, payload, len);
++	for (uint32_t i = 0; i < 64; i++) {
++		fDsiCmd[i] = i < 4 ? hdr[i] : (i < 4 + len ? payload[i - 4] : 0xff);
+ 	}
+-	flush_dcache64((addr64_t)(uintptr_t)p, 64, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	static bool first = true;
+ 	if (first) {
+ 		first = false;
