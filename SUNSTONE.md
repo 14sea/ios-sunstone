@@ -195,7 +195,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C (after 3, 4) | [ ] | first the hardware survey: modem region, PAS id, GLINK channels, WLFW version, firmware from `modem_a`; needs item 3b first |
+| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | survey done: `docs/wifi-survey.md` (PAS id 4 same; SMEM 0x80900000; IPCC 0x208000 instead of APCS; ICNSS at 0xc800000, apps-smmu 0xc600000 SID 0x80; modem pool must avoid the shim's 0xe0000000). Next: modem_a offset table, then 0113 |
 | 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
 | 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (0120) | C | [~] | filter done (0115); 0120 still to port |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |
