@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index af221d5..373e0c1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -220,14 +220,23 @@ public:
+ /*
+  * CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches
+  * {IOPropertyMatch: {backlight-control: true}} and requires the class to
+- * conform to AppleARMBacklight; without it there is no display module and
+- * the brightness slider is dead. It then sets "brightness-nits" here
+- * (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
++ * conform to AppleARMBacklight; then (CBDisplayModuleiOS -> Display.m
++ * DisplayCreateWithID) it reads the macOS-style IODisplayParameters
++ * {brightness = {value, min, max}} from this service (optional:
++ * new-backlight-architecture, backlight-calibration-parameters) and its
++ * brightness thread writes {brightness = N} back with
++ * IORegistryEntrySetCFProperties (___DisplaySetPhysicalBrightnessLegacyOnThread,
++ * "Device brightness %f based on max brightness of %f"). Learned from the
++ * iOS 16.7 CoreBrightness binary; boot-28 showed that without the
++ * parameters nothing is ever written.
+  */
++#define SWEET_BL_MAX                    1023    /* IODisplayParameters brightness max */
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ public:
+ 	AppleCLCD *fFB;
++	uint32_t   fValue;
++	void       publishParameters(uint32_t value);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -343,6 +352,7 @@ AppleCLCD::start(IOService *provider)
+ 			bl->setProperty("backlight-control", true);
+ 			bl->setProperty("brightness-nits", (unsigned long long)200, 32);
+ 			bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++			bl->publishParameters(SWEET_BL_MAX / 2);
+ 			if (bl->attach(this)) {
+ 				bl->registerService();
+ 				IOLog("SWEET FB: AppleARMBacklight published\n");
+@@ -923,11 +933,57 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* IODisplayParameters = { brightness = { value, min, max } }, as IODisplay publishes */
++void
++AppleARMBacklight::publishParameters(uint32_t value)
++{
++	fValue = value;
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *br = OSDictionary::withCapacity(3);
++	OSNumber *v = OSNumber::withNumber((unsigned long long)value, 32);
++	OSNumber *mn = OSNumber::withNumber(0ULL, 32);
++	OSNumber *mx = OSNumber::withNumber((unsigned long long)SWEET_BL_MAX, 32);
++	if (params && br && v && mn && mx) {
++		br->setObject("value", v);
++		br->setObject("min", mn);
++		br->setObject("max", mx);
++		params->setObject("brightness", br);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(v);
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(br);
++	OSSafeReleaseNULL(params);
++}
++
+ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	sweet_bl_log("backlight", d);
++	/* legacy backlight: {brightness = 0..SWEET_BL_MAX} (device units) */
++	OSNumber *b = d ? OSDynamicCast(OSNumber, d->getObject("brightness")) : NULL;
++	if (b != NULL && fFB != NULL) {
++		uint64_t v = b->unsigned64BitValue();
++		if (v > SWEET_BL_MAX) {
++			v = SWEET_BL_MAX;
++		}
++		publishParameters((uint32_t)v);
++		uint64_t level = (v * SWEET_FB_DBV_MAX) / SWEET_BL_MAX;
++		if (level < SWEET_FB_DBV_MIN) {
++			level = SWEET_FB_DBV_MIN;
++		}
++		IOLockLock(fFB->fLock);
++		fFB->fBlLevel = (uint32_t)level;
++		fFB->fBlSet = true;
++		bool off = fFB->fPowerOff;
++		IOLockUnlock(fFB->fLock);
++		if (!off && fFB->dsiUsable()) {
++			fFB->setPanelLevel((uint32_t)level);
++		}
++		return kIOReturnSuccess;
++	}
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
+ 	if (n != NULL && fFB != NULL) {
+ 		OSDictionary *m = OSDictionary::withCapacity(1);
