@@ -1,0 +1,122 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8db52c5..ca7c58c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" uint64_t sweet_big_picks, sweet_little_picks;  /* osfmk/kern/sched_prim.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -346,8 +347,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if ((count % 300) == 0 && fb->fStPresents != 0) {
+ 		uint64_t n = fb->fStPresents, swaps = sweet_fb_swap_count - fb->fStSwaps;
+-		IOLog("SWEET FB: 300 vsyncs: %llu swaps, %llu presents (%llu flips), avg us: present %llu clean %llu gpu %llu\n",
+-		    swaps, n, fb->fStFlips, fb->fStTotalNs / n / 1000, fb->fStCleanNs / n / 1000, fb->fStGpuNs / n / 1000);
++		static uint64_t big0, little0;
++		IOLog("SWEET FB: 300 vsyncs: %llu swaps, %llu presents (%llu flips), avg us: present %llu clean %llu gpu %llu; sched picks A78 %llu A55 %llu\n",
++		    swaps, n, fb->fStFlips, fb->fStTotalNs / n / 1000, fb->fStCleanNs / n / 1000, fb->fStGpuNs / n / 1000,
++		    sweet_big_picks - big0, sweet_little_picks - little0);
++		big0 = sweet_big_picks;
++		little0 = sweet_little_picks;
+ 		fb->fStSwaps = sweet_fb_swap_count;
+ 		fb->fStPresents = fb->fStFlips = fb->fStCleanNs = fb->fStGpuNs = fb->fStTotalNs = 0;
+ 	}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..8e6da71 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5021,6 +5021,74 @@ choose_next_pset(
+  *	The thread must be locked.  The pset must be locked,
+  *	and the resulting pset is locked on return.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sunstone: six Cortex-A55 (CPU 0-5) and two Cortex-A78 (CPU 6, 7) in one
++ * SMP cluster, so the scheduler does not know which cores are fast. UI work
++ * (CoreAnimation's render server, app main threads: priority >= 46, or
++ * realtime) goes to an idle A78 first, or preempts a lower priority thread
++ * there; lower priority threads take an idle A55 when there is one, which
++ * keeps the A78s free. boot-args sweetbig=<cpu mask> (0xc0; 0 = off),
++ * sweetbig_pri=<priority> (46).
++ */
++#include <pexpert/pexpert.h>
++
++extern uint64_t   sweet_big_picks, sweet_little_picks;   /* SweetFramebuffer stats */
++static int        sweet_big_init;
++static cpumap_t   sweet_big_mask;
++static int        sweet_big_pri;
++uint64_t          sweet_big_picks, sweet_little_picks;
++
++static processor_t
++sweet_choose_by_speed(processor_set_t pset, thread_t thread)
++{
++	if (!sweet_big_init) {
++		uint32_t mask = 0xc0, pri = 46;
++		PE_parse_boot_argn("sweetbig", &mask, sizeof(mask));
++		PE_parse_boot_argn("sweetbig_pri", &pri, sizeof(pri));
++		sweet_big_mask = mask;
++		sweet_big_pri = (int)pri;
++		sweet_big_init = 1;
++	}
++	if (sweet_big_mask == 0 || thread->bound_processor != PROCESSOR_NULL || pset->online_processor_count == 0) {
++		return PROCESSOR_NULL;
++	}
++	cpumap_t usable = pset->recommended_bitmask & pset->primary_map & ~pset->pending_AST_URGENT_cpu_mask;
++	cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & usable;
++	int cpuid;
++
++	if (thread->sched_pri >= sweet_big_pri) {
++		cpuid = lsb_first(idle & sweet_big_mask);
++		if (cpuid >= 0) {
++			sweet_big_picks++;
++			return processor_array[cpuid];
++		}
++		if (thread->sched_pri >= BASEPRI_RTQUEUES) {
++			return PROCESSOR_NULL;          /* realtime: its own search preempts */
++		}
++		cpumap_t busy = (pset->cpu_state_map[PROCESSOR_RUNNING] | pset->cpu_state_map[PROCESSOR_DISPATCHING]) &
++		    usable & sweet_big_mask & ~pset->pending_AST_PREEMPT_cpu_mask;
++		processor_t lowest = PROCESSOR_NULL;
++		for (cpuid = lsb_first(busy); cpuid >= 0; cpuid = lsb_next(busy, cpuid)) {
++			processor_t p = processor_array[cpuid];
++			if (p->current_pri < thread->sched_pri && (lowest == PROCESSOR_NULL || p->current_pri < lowest->current_pri)) {
++				lowest = p;
++			}
++		}
++		if (lowest != PROCESSOR_NULL) {
++			sweet_big_picks++;
++		}
++		return lowest;
++	}
++	cpuid = lsb_first(idle & ~sweet_big_mask);
++	if (cpuid >= 0) {
++		sweet_little_picks++;
++		return processor_array[cpuid];
++	}
++	return PROCESSOR_NULL;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ processor_t
+ choose_processor(
+ 	processor_set_t         starting_pset,
+@@ -5032,6 +5100,15 @@ choose_processor(
+ 
+ 	assert(thread->sched_pri <= MAXPRI);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		processor_t fast = sweet_choose_by_speed(pset, thread);
++		if (fast != PROCESSOR_NULL) {
++			return fast;
++		}
++	}
++#endif
++
+ 	/*
+ 	 * Prefer the hinted processor, when appropriate.
+ 	 */
