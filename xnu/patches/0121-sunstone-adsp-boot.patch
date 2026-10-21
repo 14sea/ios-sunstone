@@ -1,0 +1,318 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 430abc6..ba69468 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6191,42 +6191,75 @@ loadable(const struct elf32_phdr *p)
+ 	return p->p_type == PT_LOAD && p->p_memsz != 0 && (p->p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH;
+ }
+ 
++/*
++ * One TrustZone PAS image from modem_a (Linux qcom_mdt_load + qcom_q6v5_pas): metadata -> init_image ->
++ * mem_setup -> segments into the carveout -> auth_and_reset. Relocatable images (MDT_RELOCATABLE) go
++ * to carve + (p_paddr - lowest p_paddr), as qcom_mdt_load's mem_reloc does: the modem's own addresses
++ * already are its carveout, the ADSP's (0x53400000) are not.
++ */
++struct pas_image {
++	const char *name;                   /* "modem": fw_files table with CRCs; else image/<name>.* via fw_all */
++	uint32_t    pas_id;
++	uint64_t    carve, carve_size;
++};
++
++static int64_t
++pas_fw_size(const struct pas_image *im, const char *file)
++{
++	if (strcmp(im->name, "modem") == 0) {
++		return fw_size(file);
++	}
++	char path[48];
++	snprintf(path, sizeof(path), "image/%s", file);
++	int i = fw_all_find(path);
++	return i < 0 ? -1 : (int64_t)fw_all[i].size;
++}
++
++static int64_t
++pas_fw_read(const struct pas_image *im, const char *file, void *dst, uint64_t max)
++{
++	if (strcmp(im->name, "modem") == 0) {
++		return fw_read(file, dst, max);
++	}
++	char path[48];
++	snprintf(path, sizeof(path), "image/%s", file);
++	int i = fw_all_find(path);
++	if (i < 0 || fw_all[i].size > max || !fw_all_read(i, 0, dst, fw_all[i].size)) {
++		LOG("%s: missing or unreadable", path);
++		return -1;
++	}
++	return fw_all[i].size;
++}
++
+ static bool
+-modem_boot(void)
++pas_boot(const struct pas_image *im)
+ {
+ 	uint8_t *mdt = NULL, *meta;
+ 	int64_t mdt_size;
+ 	uint64_t meta_pa = 0, res = 0, st;
+ 	uint32_t min_a = ~0u, max_a = 0, hash = ~0u;
+ 	bool relocate = false, ok = false;
++	char mdt_name[24];
+ 
+-	struct smem_part_hdr *part = smem_partition(0, 1);
+-	LOG("SMEM apps<->modem partition %p", part);
+-	if (part == NULL) {
+-		return false;
+-	}
+-	if (smem_get(part, ITEM_SMP2P_IN, NULL) != NULL) {
+-		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
+-		return false;
+-	}
+-	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
+-	LOG("PAS id %u supported: ret=%llx res=%llx", PAS_ID_MODEM, st, res);
++	snprintf(mdt_name, sizeof(mdt_name), "%s.mdt", im->name);
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, im->pas_id, 0, 0, &res);
++	LOG("%s: PAS id %u supported: ret=%llx res=%llx", im->name, im->pas_id, st, res);
+ 	/* informational only: on topaz TZ answers res=0 here, init_image decides */
+ 
+-	mdt_size = fw_size("modem.mdt");
++	mdt_size = pas_fw_size(im, mdt_name);
+ 	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
+-		LOG("modem.mdt: size %lld", mdt_size);
++		LOG("%s: size %lld", mdt_name, mdt_size);
+ 		return false;
+ 	}
+ 	mdt = (uint8_t *)IOMalloc(mdt_size);
+-	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
++	if (mdt == NULL || pas_fw_read(im, mdt_name, mdt, mdt_size) != mdt_size) {
+ 		goto out;
+ 	}
+ 	{
+ 		struct elf32_ehdr *eh = (struct elf32_ehdr *)mdt;
+ 		if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
+ 		    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > (uint64_t)mdt_size) {
+-			LOG("modem.mdt: bad ELF header");
++			LOG("%s: bad ELF header", mdt_name);
+ 			goto out;
+ 		}
+ 		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
+@@ -6243,9 +6276,13 @@ modem_boot(void)
+ 			min_a = MIN(min_a, ph[i].p_paddr);
+ 			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+ 		}
+-		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
+-		if (hash == ~0u || min_a < MODEM_CARVEOUT || max_a > MODEM_CARVEOUT + MODEM_CARVEOUT_SIZE) {
+-			LOG("unexpected layout (carveout is %#llx+%#llx)", MODEM_CARVEOUT, MODEM_CARVEOUT_SIZE);
++		/* where the image goes: its own addresses, or relocated to the carveout */
++		uint64_t base = relocate ? im->carve : min_a;
++		int64_t reloc = (int64_t)base - (int64_t)min_a;
++		LOG("%s: phdrs=%u hash=%u region %08x..%08x relocate=%u -> %llx..%llx", im->name, eh->e_phnum, hash,
++		    min_a, max_a, relocate, base, base + (max_a - min_a));
++		if (hash == ~0u || min_a >= max_a || base < im->carve || base + (max_a - min_a) > im->carve + im->carve_size) {
++			LOG("%s: unexpected layout (carveout is %#llx+%#llx)", im->name, im->carve, im->carve_size);
+ 			goto out;
+ 		}
+ 
+@@ -6254,7 +6291,7 @@ modem_boot(void)
+ 		uint64_t meta_size = hdr + ph[hash].p_filesz;
+ 		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
+ 		if (meta == NULL) {
+-			LOG("metadata: pool allocation of %llu bytes failed", meta_size);
++			LOG("%s: metadata: pool allocation of %llu bytes failed", im->name, meta_size);
+ 			goto out;
+ 		}
+ 		memcpy(meta, mdt, hdr);
+@@ -6262,48 +6299,50 @@ modem_boot(void)
+ 			memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
+ 		} else {
+ 			/* split firmware: the hash segment is its own .bNN file (qcom_mdt_read_metadata) */
+-			char hname[16];
+-			snprintf(hname, sizeof(hname), "modem.b%02u", hash);
+-			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
+-			LOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
++			char hname[24];
++			snprintf(hname, sizeof(hname), "%s.b%02u", im->name, hash);
++			int64_t got = pas_fw_read(im, hname, meta + hdr, ph[hash].p_filesz);
++			LOG("%s: hash from %s: %lld of %u bytes", im->name, hname, got, ph[hash].p_filesz);
+ 			if (got != (int64_t)ph[hash].p_filesz) {
+ 				goto out;
+ 			}
+ 		}
+ 		mb();
+ 
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
+-		LOG("init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", st, res, scm_resumes, meta_size, meta_pa);
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), im->pas_id, meta_pa, 0, &res);
++		LOG("%s: init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", im->name, st, res, scm_resumes,
++		    meta_size, meta_pa);
+ 		if (st != 0 || res != 0) {
+ 			goto out;
+ 		}
+ 		if (relocate) {
+-			st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, PAS_ID_MODEM, min_a,
++			st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, im->pas_id, base,
+ 			    ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, &res);
+-			LOG("mem_setup: ret=%llx res=%llx", st, res);
++			LOG("%s: mem_setup %llx+%x: ret=%llx res=%llx", im->name, base, max_a - min_a, st, res);
+ 			if (st != 0 || res != 0) {
+ 				goto shutdown;
+ 			}
+ 		}
+ 
+ 		for (uint32_t i = 0; i < eh->e_phnum; i++) {
+-			char name[16];
++			char name[24];
+ 			if (!loadable(&ph[i])) {
+ 				continue;
+ 			}
+ 			/* map only while copying: TZ locks the carveout at auth_and_reset */
+-			uint64_t pa = ph[i].p_paddr & ~0x3fffull, off = ph[i].p_paddr - pa;
++			uint64_t dst_pa = (uint64_t)((int64_t)ph[i].p_paddr + reloc);
++			uint64_t pa = dst_pa & ~0x3fffull, off = dst_pa - pa;
+ 			uint64_t len = (off + ph[i].p_memsz + 0x3fff) & ~0x3fffull;
+ 			IOMemoryMap *m = map_phys(pa, len, true);
+ 			if (m == NULL) {
+-				LOG("segment %u: cannot map %08x+%x", i, ph[i].p_paddr, ph[i].p_memsz);
++				LOG("%s: segment %u: cannot map %llx+%x", im->name, i, dst_pa, ph[i].p_memsz);
+ 				goto shutdown;
+ 			}
+ 			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
+ 			int64_t got = 0;
+ 			if (ph[i].p_filesz != 0) {
+-				snprintf(name, sizeof(name), "modem.b%02u", i);
+-				got = fw_read(name, dst, ph[i].p_filesz);
++				snprintf(name, sizeof(name), "%s.b%02u", im->name, i);
++				got = pas_fw_read(im, name, dst, ph[i].p_filesz);
+ 				if (got != (int64_t)ph[i].p_filesz) {
+ 					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
+ 					m->release();
+@@ -6316,10 +6355,10 @@ modem_boot(void)
+ 			mb();
+ 			m->release();
+ 		}
+-		LOG("segments loaded");
++		LOG("%s: segments loaded", im->name);
+ 
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, PAS_ID_MODEM, 0, 0, &res);
+-		LOG("auth_and_reset: ret=%llx res=%llx resumes=%u", st, res, scm_resumes);
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, im->pas_id, 0, 0, &res);
++		LOG("%s: auth_and_reset: ret=%llx res=%llx resumes=%u", im->name, st, res, scm_resumes);
+ 		if (st != 0 || res != 0) {
+ 			goto shutdown;
+ 		}
+@@ -6327,8 +6366,8 @@ modem_boot(void)
+ 		goto out;
+ 	}
+ shutdown:
+-	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, PAS_ID_MODEM, 0, 0, &res);
+-	LOG("shutdown after failure: ret=%llx res=%llx", st, res);
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, im->pas_id, 0, 0, &res);
++	LOG("%s: shutdown after failure: ret=%llx res=%llx", im->name, st, res);
+ out:
+ 	if (mdt != NULL) {
+ 		IOFree(mdt, mdt_size);
+@@ -6336,6 +6375,76 @@ out:
+ 	return ok;
+ }
+ 
++static bool
++modem_boot(void)
++{
++	static const struct pas_image modem = { "modem", PAS_ID_MODEM, MODEM_CARVEOUT, MODEM_CARVEOUT_SIZE };
++	struct smem_part_hdr *part = smem_partition(0, 1);
++	LOG("SMEM apps<->modem partition %p", part);
++	if (part == NULL) {
++		return false;
++	}
++	if (smem_get(part, ITEM_SMP2P_IN, NULL) != NULL) {
++		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
++		return false;
++	}
++	return pas_boot(&modem);
++}
++
++/*
++ * ADSP (LPASS, sunstone qcom,lpass@a400000): PAS id 1, adsp.mdt relocatable into adsp@86700000
++ * (0x2800000), SMEM host 2: SMP2P in 443 / out 429, crash reason 423, doorbells IPCC client 3
++ * (LPASS). Step 1 (boot-arg adsp=1): boot it and watch its SMP2P "slave-kernel" READY bit; its GLINK
++ * edge (SMEM 478-480 in the apps<->adsp partition) is only logged. The proxy rails (lpi cx/mx) are
++ * not voted: what the bootloader left on has to do.
++ */
++#define ADSP_CARVEOUT           0x86700000ull
++#define ADSP_CARVEOUT_SIZE      0x02800000ull
++#define PAS_ID_ADSP             1
++#define ADSP_HOST               2
++#define ADSP_ITEM_SMP2P_IN      443
++#define ADSP_ITEM_CRASH         423
++
++static void
++adsp_boot(void)
++{
++	static const struct pas_image adsp = { "adsp", PAS_ID_ADSP, ADSP_CARVEOUT, ADSP_CARVEOUT_SIZE };
++	struct smem_part_hdr *part = smem_partition(0, ADSP_HOST);
++	uint32_t sz = 0, sk_last = ~0u;
++	LOG("adsp: SMEM apps<->adsp partition %p", part);
++	if (part == NULL) {
++		return;
++	}
++	if (smem_get(part, ADSP_ITEM_SMP2P_IN, NULL) != NULL) {
++		LOG("adsp: SMP2P item %u already exists: ADSP is not cold, not touching it", ADSP_ITEM_SMP2P_IN);
++		return;
++	}
++	if (!pas_boot(&adsp)) {
++		return;
++	}
++	for (unsigned ms = 0; ms < 15000; ms += 10) {
++		struct smp2p_hdr *in = (struct smp2p_hdr *)smem_get(part, ADSP_ITEM_SMP2P_IN, &sz);
++		volatile uint32_t *sk = (in != NULL && in->magic == SMP2P_MAGIC) ? smp2p_find(in, "slave-kernel") : NULL;
++		uint32_t v = sk != NULL ? *sk : 0;
++		if (sk != NULL && v != sk_last) {
++			LOG("adsp: t=%u ms: slave-kernel %08x%s%s", ms, v, (v & 1) ? " FATAL" : "", (v & 2) ? " READY" : "");
++			sk_last = v;
++		}
++		if (v & 1) {
++			const char *why = (const char *)smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), ADSP_ITEM_CRASH, &sz);
++			LOG("adsp: crash reason: %.*s", why != NULL ? (int)MIN(sz, 200u) : 4, why != NULL ? why : "none");
++			return;
++		}
++		if (v & 2) {
++			break;
++		}
++		IOSleep(10);
++	}
++	bool glink = smem_get(part, SMEM_GLINK_DESC, NULL) != NULL;
++	LOG("adsp: %s; GLINK descriptor in the apps<->adsp partition: %s", (sk_last != ~0u && (sk_last & 2)) ? "*** ADSP UP ***" : "no READY within 15 s",
++	    glink ? "yes (made by the ADSP)" : "no");
++}
++
+ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -6372,6 +6481,17 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	smem = (uint8_t *)smem_map->getVirtualAddress();
+ 	pool = (uint8_t *)pool_map->getVirtualAddress();
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
++	{
++		uint32_t adsp_on = 0;
++		if (PE_parse_boot_argn("adsp", &adsp_on, sizeof(adsp_on)) && adsp_on != 0) {
++			adsp_boot();
++		}
++		uint32_t modem_on = 0;
++		if (!PE_parse_boot_argn("modem", &modem_on, sizeof(modem_on)) || modem_on == 0) {
++			thread_terminate(current_thread());     /* adsp only */
++			return;
++		}
++	}
+ 	if (wifi_enabled() && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
+@@ -6655,7 +6775,10 @@ topaz_modem_init(void)
+ 	uint32_t on = 0;
+ 	thread_t thread;
+ 
+-	if (started || !PE_parse_boot_argn("modem", &on, sizeof(on)) || on == 0) {
++	uint32_t adsp_on = 0;
++	(void)PE_parse_boot_argn("modem", &on, sizeof(on));
++	(void)PE_parse_boot_argn("adsp", &adsp_on, sizeof(adsp_on));
++	if (started || (on == 0 && adsp_on == 0)) {
+ 		return;
+ 	}
+ 	started = true;
