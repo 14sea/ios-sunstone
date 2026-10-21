@@ -1,0 +1,147 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 568f831..2ad8304 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -33,6 +33,9 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal, fGauge;
+ 	int fLastMode;
++	int fTempCenti;         /* battery temperature, centidegrees C, when fTempValid */
++	bool fTempValid;
++	uint32_t fCycles;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -78,6 +81,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fTempCenti = 2500;
++	fTempValid = false;
++	fCycles = 0;
+ 	return true;
+ }
+ 
+@@ -121,19 +127,19 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(fCycles); /* SM5602 SOC_CYCLE when the gauge is read, else 0 */
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+ 	putNumber("AppleRawMaxCapacity", 5000);
+ 	putNumber("DesignCapacity", 5000);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; the gauge's external thermistor, else fixed 25 C. */
++	putNumber("Temperature", (UInt32)fTempCenti);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTempValid);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -143,7 +149,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5000, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, 5000, mv, (UInt32)ma, fCycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -215,11 +221,57 @@ SweetBattery::estimatePercent(unsigned mv)
+  * REG0B. Read-only: nothing is written to either chip; charging runs in
+  * hardware.
+  */
++/*
++ * SM5602 TEMPERATURE_EX (0x0A): thermistor reading looked up in the battery's
++ * table from the stock DT (battery0,thermal_table, 101 entries for -20..80 C,
++ * identical for battery0/1/2). sm5602_fg.c _calculate_battery_temp_ex().
++ */
++static const int16_t sweet_sm5602_temp_table[101] = {
++	 15162,  13590,  12037,  10484,   8995,   7552,   6148,   4833,
++	  3495,   2227,    982,  -2318,  -3469,  -4605,  -5680,  -6713,
++	 -7710,  -8660,  -9576, -10457, -11304, -12110, -12884, -13624,
++	-14330, -15012, -15664, -16279, -16873, -17439, -17978, -18496,
++	-18989, -19456, -19902, -20334, -20739, -21124, -21498, -21850,
++	-22189, -22508, -22818, -23106, -23387, -23652, -23903, -24143,
++	-24373, -24589, -24797, -24999, -25190, -25369, -25541, -25707,
++	-25865, -26014, -26158, -26293, -26421, -26546, -26666, -26779,
++	-26886, -26989, -27087, -27181, -27271, -27357, -27441, -27519,
++	-27595, -27668, -27738, -27804, -27867, -27926, -27983, -28037,
++	-28091, -28142, -28191, -28238, -28283, -28326, -28366, -28405,
++	-28442, -28478, -28512, -28546, -28578, -28608, -28638, -28666,
++	-28694, -28720, -28745, -28768, -28790,
++};
++
++static int
++sweet_sm5602_temp_c(uint16_t raw)
++{
++	if (raw >= 0x8001 && raw <= 0x823b) {
++		raw = 0;
++	}
++	int16_t val = (int16_t)raw;
++	if (val >= sweet_sm5602_temp_table[0]) {
++		return -20;
++	}
++	if (val <= sweet_sm5602_temp_table[100]) {
++		return 80;
++	}
++	for (int i = 0; i < 101; i++) {
++		if (val >= sweet_sm5602_temp_table[i]) {
++			int t = -20 + i;
++			if (t >= 1 && val != sweet_sm5602_temp_table[i]) {
++				t--;
++			}
++			return t;
++		}
++	}
++	return 25;
++}
++
+ bool
+ SweetBattery::pollGauge(void)
+ {
+ 	uint8_t w[2], st = 0;
+-	uint16_t soc, volt, cur, full;
++	uint16_t soc, volt, cur, full, tex = 0, cyc = 0;
+ 	if (sweet_i2c1_read(0x71, 0x05, w, 2)) {
+ 		return false;
+ 	}
+@@ -235,6 +287,10 @@ SweetBattery::pollGauge(void)
+ 	bool fullOk = sweet_i2c1_read(0x71, 0x62, w, 2) == 0;
+ 	full = fullOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+ 	bool chgOk = sweet_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
++	bool texOk = sweet_i2c1_read(0x71, 0x0a, w, 2) == 0;
++	tex = texOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
++	bool cycOk = sweet_i2c1_read(0x71, 0x0b, w, 2) == 0;
++	cyc = cycOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+ 
+ 	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
+ 	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
+@@ -250,11 +306,17 @@ SweetBattery::pollGauge(void)
+ 	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
+ 	bool charging = external && (chrg == 1 || chrg == 2);
+ 	bool done = external && chrg == 3;
++	int tempC = texOk ? sweet_sm5602_temp_c(tex) : 25;
++	fTempValid = texOk;
++	fTempCenti = tempC * 100;
++	if (cycOk) {
++		fCycles = cyc;
++	}
+ 	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
+ 	static unsigned logs;
+ 	if (logs++ % 30 == 0) {
+-		IOLog("SWEET BATTERY: gauge %u%% %umV %dmA full=%umAh soc=%#x volt=%#x cur=%#x chg=%#x external=%d charging=%d\n",
+-		    percent, mv, ma, fullMah, soc, volt, cur, st, external, charging);
++		IOLog("SWEET BATTERY: gauge %u%% %umV %dmA full=%umAh %dC cycles=%u soc=%#x volt=%#x cur=%#x tex=%#x chg=%#x external=%d charging=%d\n",
++		    percent, mv, ma, fullMah, tempC, cyc, soc, volt, cur, tex, st, external, charging);
+ 	}
+ 	return true;
+ }
