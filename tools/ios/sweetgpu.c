@@ -29,15 +29,15 @@ extern kern_return_t IOConnectCallScalarMethod(mach_port_t connection, uint32_t 
     const uint64_t *input, uint32_t inputCnt, uint64_t *output, uint32_t *outputCnt);
 
 static uint32_t
+par(uint32_t v)
+{
+	return (0x9669 >> (0xf & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
+}
+
+static uint32_t
 pkt7(uint32_t op, uint32_t cnt)
 {
-	uint32_t h = (3u << 28) | ((op & 0x7fu) << 16) | (cnt & 0x7fffu);
-	uint32_t p = h ^ (h >> 16);
-	p ^= p >> 8;
-	p ^= p >> 4;
-	p ^= p >> 2;
-	p ^= p >> 1;
-	return h | ((~p & 1u) << 15) | ((~cnt & 1u) << 31);
+	return 0x70000000u | (cnt & 0x3fffu) | (par(cnt) << 15) | ((op & 0x7fu) << 16) | (par(op) << 23);
 }
 
 static uint64_t
