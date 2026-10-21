@@ -87,6 +87,11 @@ service 0x45 at ~1.1 s, chip 0x150, firmware WLAN.HL.3.3.2.c5, bdwlan.bin, FW_RE
 mode. `wifi=1` adds: apps-smmu identity for SID 0x80 (`CB4 SMR5 ... OK`; Gunyah let us write the SMR),
 copy engines, HTC (22 endpoints), WMI READY, HTT 3.104, passive scans every 15 s on 2.4 and 5 GHz
 (scan 3: 18 networks, 61 beacons). Unchanged system: touch, display, RTC, ~3.3 ms presents.
+**Station and data path (0119, boot-39, `../out/boot39-log22.txt`)**: with `wlantest=1` and the test
+network stored by `tools/sweet-wlan-seed.sh` (iPhone hotspot "iPhone", WPA2-PSK, ch 11 -32 dBm):
+auth status 0, assoc status 0 (aid 2), 4-way handshake, `WPA2 keys installed (group key yes)` 25 ms
+after association, DHCP offer/ACK 172.20.10.6/28 from 172.20.10.1, ARP answered, 4/4 ICMP echo replies
+from the router (3-10 ms after the first). The passphrase never appears in the log or the boot-args.
 Notes: the two MSA SCM assigns (0x86500000, 2 MB) return -2/0x56 (region probably not HLOS-owned under
 Gunyah); the firmware still reaches mission mode and scans. Firmware reports MAC 00:00:..., the driver
 uses its own locally administered address. **iOS does not see any of it yet**: topaz's public tree has
@@ -168,6 +173,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0116 | RTC offset stored on UFS below the log ring (`SWEETRTC`), applied at boot, written when iOS sets the time; `tools/sweet-rtc-seed.sh` |
 | 0117 | topaz TopazModem (0113-0130) with sunstone modem_a tables (`tools/fwtable_all.py`), `sweet_ufs_read_part()` (user) |
 | 0118 | modem/WLAN on sunstone: carveout, SMEM, pool 0xd8000000, IPCC doorbells, WLAN SID 0x80, MSA, rmtfs size, trap-safe SMMU access; `modem=1`, `wifi=1` |
+| 0119 | WLAN data-path test `wlantest=1`: join from the `SWEETWLN` record, DHCP, ARP, ping; `tools/sweet-wlan-seed.sh` |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -196,7 +202,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
@@ -212,7 +218,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio done (0117/0118, boot-38: modem, WLFW, WMI, scans). Next: station join on sunstone (boot-arg test), then the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
+| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio, WPA2 join and IP data path done (0117-0119, boot-39). Next: the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
 | 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
 | 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (0120) | C | [~] | filter done (0115); 0120 still to port |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |

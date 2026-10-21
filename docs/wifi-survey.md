@@ -27,3 +27,5 @@ Everything up to the radio works with only the address changes in 0118: PAS, SMP
 QRTR (49 services), rmtfs/tftp/pd-mapper, WLFW to mission mode, apps-smmu identity for SID 0x80,
 HTC/WMI/HTT, passive scans on 2.4 and 5 GHz. Open: MSA SCM assign returns -2 (harmless so far), the
 iOS-facing layer (topaz never published one: `topaz_wlan_*` has no consumer in its tree).
+boot-39 (0119): WPA2-PSK join to an iPhone hotspot, DHCP lease 172.20.10.6/28, ARP, 4/4 pings to the
+router. The kernel radio and data path are complete; only the iOS-facing layer is missing.
