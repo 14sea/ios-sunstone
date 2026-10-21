@@ -1,0 +1,35 @@
+name: ios-tools
+
+# Our own iOS (arm64, iOS 16) test programs from tools/ios, ad-hoc signed.
+# On the phone they are installed by the kernel's SWEETDRP drop (tools/mkdrop.py).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/ios/**"
+      - ".github/workflows/ios-tools.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          for src in tools/ios/*.c; do
+            name=$(basename "$src" .c)
+            xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall \
+              -isysroot "$SDK" -o "out/$name" "$src" -framework IOKit -framework CoreFoundation
+            codesign -f -s - "out/$name"
+            file "out/$name"
+          done
+          cp tools/ios/*.plist out/
+          (cd out && shasum -a 256 * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-tools
+          path: out/
