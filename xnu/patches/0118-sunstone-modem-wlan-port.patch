@@ -1,0 +1,268 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 2d7af92..d86ef0c 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,7 @@
+ extern "C" int sweet_rtc_init(void);
+ extern "C" int sweet_rtc_read(uint32_t *secs);
+ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
++extern "C" void topaz_modem_init(void);         /* iokit/Kernel/arm/TopazModem.cpp (boot-args modem=1, wifi=1) */
+ /* bsd/dev/sweet_ufs.c: the RTC offset record below the persistent log */
+ extern "C" int sweet_rtc_store_write(uint64_t offset, uint64_t raw);
+ extern "C" void sweet_rtc_offset_from_store(uint64_t offset, uint64_t raw);
+@@ -70,6 +71,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	publishResource("IORTC");       /* StartIOKit: clock_initialize_calendar() may proceed */
+ 	sweet_busy_init();
++	topaz_modem_init();             /* its thread waits for sweet_ufs (firmware from modem_a) */
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index b6609ab..16e5de5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -1,17 +1,23 @@
+ /*
+- * topaz (SM6225): boot the modem DSP (MPSS). It runs the WCN3988 WLAN firmware, so this is
+- * Wi-Fi step 1. Port of MakrSas/topaz-woa drivers/TopazModem/ModemPas.c + Smem.c, the way
+- * Linux qcom_mdt_load() + qcom_q6v5_pas do it:
++ * Modem DSP (MPSS) boot and the WCN39xx WLAN behind it. topaz (SM6225) driver, ported to
++ * sunstone (SM4375 blair). Port of MakrSas/topaz-woa drivers/TopazModem/ModemPas.c + Smem.c,
++ * the way Linux qcom_mdt_load() + qcom_q6v5_pas do it:
+  *   TrustZone PAS init_image (.mdt metadata) -> mem_setup -> copy the .bNN segments into
+- *   the carveout (0x4AB00000, 0x6900000) -> auth_and_reset -> wait for the modem's SMP2P
+- *   "slave-kernel" READY bit (SMEM item 435) and answer its IPA power query (item 428).
++ *   the carveout -> auth_and_reset -> wait for the modem's SMP2P "slave-kernel" READY bit
++ *   (SMEM item 435) and answer its IPA power query (item 428).
+  *
+- * Boot-arg modem=1. Firmware from the root filesystem, /usr/share/firmware/topaz/modem/
+- * (stock HyperOS 2.0.208 NON-HLOS: it must match this phone's EFS partitions).
+- * Rules (WIFI_RISKS.md): buffers TZ/the modem see are below 0xF0000000 (own pool, not the
+- * GPU's 0x90000000-0xD0000000), memory shared with the modem is write-combined (Normal NC:
+- * no cache upkeep, unaligned access ok), the carveout is mapped only while copying, the
+- * modem must start cold, polling only (no interrupts), no EFS writes.
++ * sunstone (live DT 2026-10-20, fork/docs/wifi-survey.md): carveout mpss_wlan@8b800000
++ * (0x10000000, exactly modem.mdt's PT_LOAD range), SMEM smem@80900000, TCSR mutex 0x340000
++ * lock 3 (as topaz), doorbells through the IPCC at 0x208000 instead of topaz's APCS mailbox
++ * (client MPSS 2: signal 0 GLINK, signal 2 SMP2P), WLAN SMMU stream 0x80 on apps-smmu
++ * 0xc600000 (topaz 0x1a0), WLAN MSA wlan@86500000 (2 MB).
++ *
++ * Boot-args modem=1 (wifi=1 for the WLAN). Firmware read-only from the stock modem_a
++ * partition (tables from fork/tools/fwtable_all.py; it must match this phone's EFS).
++ * Rules (topaz WIFI_RISKS.md): buffers TZ/the modem see are below 0xF0000000 in an own pool
++ * that xnu does not manage, memory shared with the modem is write-combined (Normal NC: no
++ * cache upkeep, unaligned access ok), the carveout is mapped only while copying, the modem
++ * must start cold, polling only (no interrupts), no EFS writes.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -43,19 +49,29 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MDT_TYPE_HASH       (2u << 24)
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++/*
++ * Low RAM xnu does not manage (it runs from 0x1_80000000); below 0xF0000000 for TZ/the modem.
++ * sunstone's free range is 0xc5100000-0xf5bfffff minus the flip buffers (0xc8000000,
++ * 0xc9000000), the DSI command page (0xca000000), ramoops (0xd0000000 + 2 MB) and the
++ * shim's GPU area (0xe0000000 + 4 MB, topaz's pool address).
++ */
++#define MODEM_POOL_BASE     0xD8000000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+-#define SMEM_PA             0x46000000ull
++#define MODEM_CARVEOUT      0x8B800000ull       /* sunstone mpss_wlan@8b800000 */
++#define MODEM_CARVEOUT_SIZE 0x10000000ull
++#define SMEM_PA             0x80900000ull       /* sunstone smem@80900000 */
+ #define SMEM_SIZE           0x00200000u
+ #define SMEM_GLOBAL_HOST    0xFFFE
+ #define TCSR_MUTEX_PA       0x00340000ull       /* qcom,tcsr-mutex, stride 0x1000 */
+ #define SMEM_HWLOCK         3
+ #define HWLOCK_APPS_ID      1
+-#define APCS_PA             0x0F111000ull
+-#define APCS_IPC            8                   /* apcs_glb mailbox */
+-#define MPSS_SMP2P_BIT      14
++/* IPCC (qcom,ipcc at 0x208000, Linux qcom-ipcc.c): SEND_ID takes (client << 16) | signal */
++#define IPCC_PA             0x00208000ull
++#define IPCC_SEND_ID        0x0c
++#define IPCC_CLIENT_MPSS    2
++#define IPCC_SIGNAL_GLINK   0                   /* DT glink modem: mboxes = <&ipcc 2 0> */
++#define IPCC_SIGNAL_SMP2P   2                   /* DT smp2p-modem: mboxes = <&ipcc 2 2> */
+ 
+ #define ITEM_SMP2P_OUT      428                 /* apps -> modem */
+ #define ITEM_SMP2P_IN       435                 /* modem -> apps */
+@@ -81,12 +97,21 @@ struct smp2p_hdr { uint32_t magic; uint8_t version, features[3]; uint16_t local_
+ struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
+ 
+ static uint8_t *smem;                           /* write-combined */
+-static volatile uint8_t *apcs, *tcsr_mutex;     /* device */
++static volatile uint8_t *ipcc, *tcsr_mutex;     /* device */
+ static uint8_t *pool;
+ static uint64_t pool_used;
+ 
+ static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
+ 
++/* ring the modem (IPCC) */
++static inline void
++ipcc_kick(uint32_t signal)
++{
++	mb();
++	*(volatile uint32_t *)(ipcc + IPCC_SEND_ID) = (IPCC_CLIENT_MPSS << 16) | signal;
++	mb();
++}
++
+ /* ---------------------------------------------------------------- mappings */
+ 
+ /* Large or RAM regions: an IOMemoryDescriptor mapping (ml_io_map space is small). */
+@@ -392,9 +417,7 @@ smem_alloc(struct smem_part_hdr *p, uint16_t item, uint32_t size)
+ static void
+ smp2p_kick(void)
+ {
+-	mb();
+-	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << MPSS_SMP2P_BIT;
+-	mb();
++	ipcc_kick(IPCC_SIGNAL_SMP2P);
+ }
+ 
+ static struct smp2p_hdr *
+@@ -466,14 +489,13 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
+ 
+ /*
+  * After READY the modem talks GLINK through two SMEM FIFOs (items 478 descriptor, 479 our TX,
+- * 480 its TX), doorbell APCS bit 12. One channel, "IPCRTR", carries QRTR. Port of
++ * 480 its TX), doorbell IPCC (MPSS, signal 0). One channel, "IPCRTR", carries QRTR. Port of
+  * topaz-woa drivers/TopazModem/Glink.c, polled from the watch thread (no interrupts).
+  */
+ #define SMEM_GLINK_DESC     478
+ #define SMEM_GLINK_FIFO_TX  479
+ #define SMEM_GLINK_FIFO_RX  480
+ #define GLINK_TX_SIZE       0x4000u
+-#define GLINK_IRQ_BIT       12
+ #define GLINK_FEATURES      1                   /* INTENT_REUSE */
+ 
+ #define CMD_VERSION         0
+@@ -603,9 +625,7 @@ tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
+ 	}
+ 	mb();
+ 	g_desc[1] = head;
+-	mb();
+-	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << GLINK_IRQ_BIT;
+-	mb();
++	ipcc_kick(IPCC_SIGNAL_GLINK);
+ 	g_tx_msgs++;
+ 	return true;
+ }
+@@ -937,8 +957,7 @@ rx_one(void)
+ 		break;
+ 	case CMD_READ_NOTIF:
+ 		rx_advance(8);
+-		*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << GLINK_IRQ_BIT;
+-		mb();
++		ipcc_kick(IPCC_SIGNAL_GLINK);
+ 		break;
+ 	case CMD_TX_DATA:
+ 	case CMD_TX_DATA_CONT: {
+@@ -2936,7 +2955,7 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
+ }
+ 
+ /* rmtfs */
+-#define RMTFS_BUF_SIZE      0x300000            /* qcom,rmtfs_sharedmem size */
++#define RMTFS_BUF_SIZE      0x280000            /* sunstone qcom,rmtfs_sharedmem size */
+ #define VMID_HLOS           3
+ #define VMID_MSS_MSA        15
+ #define VMID_NAV            0x2B
+@@ -3110,8 +3129,8 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+-#define WLFW_MSA_BASE       0x51900000u         /* DTB wlan_msa_region, inside "PIL Reserved" */
+-#define WLFW_MSA_SIZE       0x00100000u
++#define WLFW_MSA_BASE       0x86500000u         /* sunstone wlan@86500000 (icnss qcom,wlan-msa-fixed-region) */
++#define WLFW_MSA_SIZE       0x00200000u
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define VMID_WLAN           0x18
+@@ -3516,7 +3535,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 
+ /*
+  * After WLAN_MODE mission (port of topaz-woa wlanprobe.c, ce.c, htc.c, wmi.c, scan.c):
+- *  - apps SMMU: the WLAN stream 0x1A0 gets an identity context bank (SCTLR.M=0); a global
++ *  - apps SMMU: the WLAN stream (0x80 on sunstone, 0x1A0 on topaz) gets an identity context bank (SCTLR.M=0); a global
+  *    bypass S2CR is turned into a fault by this SMMU. Done before the modem boots.
+  *  - copy engines at 0xC800000+0x240000, polled; rings and buffers from our pool (Normal NC).
+  *  - HTC: READY on ep0, connect HTT_DATA and WMI_CONTROL, SETUP_COMPLETE_EX.
+@@ -3524,8 +3543,8 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+  *    each BSS seen is logged once, its BSSID masked.
+  */
+ #define SMMU_PA             0x0C600000ull
+-#define SMMU_SIZE           0x00080000u
+-#define WLAN_SID            0x1A0
++#define SMMU_SIZE           0x00100000u         /* apps-smmu@0c600000 reg size */
++#define WLAN_SID            0x80                /* icnss: iommus = <&apps_smmu 0x80 0x1> */
+ #define WLAN_SID_MASK       0x1
+ #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
+ #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
+@@ -3543,8 +3562,24 @@ wifi_enabled(void)
+ 	return wifi_on > 0;
+ }
+ 
+-static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+-static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(b + o) = v; }
++/*
++ * Plain 32-bit LDR/STR with a register address: the hypervisor (Gunyah) traps and emulates SMMU
++ * accesses on sunstone and a writeback/pair access has no valid syndrome (ISV=0): it would hang
++ * (found on the GPU SMMU, SweetGPU.cpp). The copy engines get the same, harmlessly.
++ */
++static inline uint32_t
++r32(volatile uint8_t *b, uint32_t o)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(b + o) : "memory");
++	return v;
++}
++static inline void
++w32(volatile uint8_t *b, uint32_t o, uint32_t v)
++{
++	mb();
++	__asm__ volatile ("str %w0, [%1]" : : "rZ"(v), "r"(b + o) : "memory");
++}
+ 
+ static bool
+ smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+@@ -6208,8 +6243,8 @@ modem_boot(void)
+ 			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+ 		}
+ 		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
+-		if (hash == ~0u || min_a < 0x4AB00000u || max_a > 0x4AB00000u + 0x6900000u) {
+-			LOG("unexpected layout (carveout is 0x4ab00000+0x6900000)");
++		if (hash == ~0u || min_a < MODEM_CARVEOUT || max_a > MODEM_CARVEOUT + MODEM_CARVEOUT_SIZE) {
++			LOG("unexpected layout (carveout is %#llx+%#llx)", MODEM_CARVEOUT, MODEM_CARVEOUT_SIZE);
+ 			goto out;
+ 		}
+ 
+@@ -6326,9 +6361,9 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	smem_map = map_phys(SMEM_PA, SMEM_SIZE, true);
+ 	pool_map = map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true);
+-	apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
++	ipcc = (volatile uint8_t *)ml_io_map(IPCC_PA, 0x1000);
+ 	tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, 0x4000);
+-	if (smem_map == NULL || pool_map == NULL || apcs == NULL || tcsr_mutex == NULL) {
++	if (smem_map == NULL || pool_map == NULL || ipcc == NULL || tcsr_mutex == NULL) {
+ 		LOG("mappings failed");
+ 		thread_terminate(current_thread());
+ 		return;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 920df87..c247e7b 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -9,6 +9,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ # SWEET device-tree platform (empty translation unit on other boards)
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
++iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
