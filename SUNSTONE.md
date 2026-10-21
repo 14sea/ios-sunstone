@@ -77,6 +77,21 @@ waited up to 30 s for IORTC before `clock_initialize_calendar()` on every boot (
 16:00:51 = 51 s after the epoch); that wait is gone. If iOS sets the time, the kernel logs the new offset
 to bake. Note: testsea's clock runs ~1 min 50 s ahead of this host (visible in every chain log).
 
+### Modem and WLAN radio (0117/0118, boot-37/38, `../out/boot37-log20.txt`, `../out/boot38-log21.txt`)
+
+topaz's TopazModem with this phone's modem_a tables (0117, user) and the sunstone addresses/IPCC doorbells
+(0118) works on the first boot. `modem=1`: PAS init/mem_setup/auth `ret=0`, SMP2P READY at 52 ms, GLINK
+over SMEM with IPCC (client MPSS, signal 0/2), QRTR with 49 modem services (nas, wds, uim, dms, ipa, ...),
+rmtfs from modemst1/2 (read-only, writes not kept), tftp from modem_a (modem_pr, wlanmdsp.mbn), WLFW
+service 0x45 at ~1.1 s, chip 0x150, firmware WLAN.HL.3.3.2.c5, bdwlan.bin, FW_READY at ~3.5 s, mission
+mode. `wifi=1` adds: apps-smmu identity for SID 0x80 (`CB4 SMR5 ... OK`; Gunyah let us write the SMR),
+copy engines, HTC (22 endpoints), WMI READY, HTT 3.104, passive scans every 15 s on 2.4 and 5 GHz
+(scan 3: 18 networks, 61 beacons). Unchanged system: touch, display, RTC, ~3.3 ms presents.
+Notes: the two MSA SCM assigns (0x86500000, 2 MB) return -2/0x56 (region probably not HLOS-owned under
+Gunyah); the firmware still reaches mission mode and scans. Firmware reports MAC 00:00:..., the driver
+uses its own locally administered address. **iOS does not see any of it yet**: topaz's public tree has
+no consumer of the `topaz_wlan_*` C API (no ifnet, no IO80211/Apple80211 layer for wifid).
+
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
 `tools/mkdrop.py` packs files (optionally a merged `launchd.plist` with one extra job) into a
@@ -151,6 +166,8 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0111 | SweetSurface for CoreAnimation's GL renderer (topaz 0131-0139), empty `IOAcceleratorES`, BOFromSurface/CopyToSurface (user) |
 | 0115 | debug aids: `sweetcons=WORDS` console filter, `sweetbusy=N`, no IOKit-daemon busy hold (topaz 0112/0127/0128) |
 | 0116 | RTC offset stored on UFS below the log ring (`SWEETRTC`), applied at boot, written when iOS sets the time; `tools/sweet-rtc-seed.sh` |
+| 0117 | topaz TopazModem (0113-0130) with sunstone modem_a tables (`tools/fwtable_all.py`), `sweet_ufs_read_part()` (user) |
+| 0118 | modem/WLAN on sunstone: carveout, SMEM, pool 0xd8000000, IPCC doorbells, WLAN SID 0x80, MSA, rmtfs size, trap-safe SMMU access; `modem=1`, `wifi=1` |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -179,7 +196,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
@@ -195,7 +212,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | survey done: `docs/wifi-survey.md` (PAS id 4 same; SMEM 0x80900000; IPCC 0x208000 instead of APCS; ICNSS at 0xc800000, apps-smmu 0xc600000 SID 0x80; modem pool must avoid the shim's 0xe0000000). Next: modem_a offset table, then 0113 |
+| 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio done (0117/0118, boot-38: modem, WLFW, WMI, scans). Next: station join on sunstone (boot-arg test), then the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
 | 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
 | 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (0120) | C | [~] | filter done (0115); 0120 still to port |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |

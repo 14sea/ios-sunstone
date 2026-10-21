@@ -20,3 +20,10 @@ Plan (TODO item 1): (1) build the modem_a offset table on the host; (2) 0113+011
 constants and a new low-RAM pool; (3) IPCC send/receive in place of APCS in 0118; (4) 0121 rmtfs/pd-mapper
 unchanged; (5) 0122-0130 WLAN with SID 0x80 and the MSA region. Expect several boots per stage; the
 persistent log is the only feedback, so keep `sweetcons=` filters handy (0115).
+
+## Result (boot-37/38, 2026-10-21 evening)
+
+Everything up to the radio works with only the address changes in 0118: PAS, SMP2P, GLINK over IPCC,
+QRTR (49 services), rmtfs/tftp/pd-mapper, WLFW to mission mode, apps-smmu identity for SID 0x80,
+HTC/WMI/HTT, passive scans on 2.4 and 5 GHz. Open: MSA SCM assign returns -2 (harmless so far), the
+iOS-facing layer (topaz never published one: `topaz_wlan_*` has no consumer in its tree).
