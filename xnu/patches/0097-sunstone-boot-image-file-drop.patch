@@ -1,0 +1,127 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..af8160f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/sweet_drop.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_drop.c b/bsd/dev/sweet_drop.c
+new file mode 100644
+index 0000000..55013bd
+--- /dev/null
++++ b/bsd/dev/sweet_drop.c
+@@ -0,0 +1,92 @@
++/*
++ * sunstone: install files carried by the boot image into the root volume,
++ * right before launchd starts (bsdinit_task). This is how our own iOS test
++ * programs and their LaunchDaemon plists reach the phone without rewriting
++ * the 100 GB userdata root each time.
++ *
++ * The archive is the payload's ramdisk (mkpayload.py --ramdisk; it lands in
++ * kernel static memory and /chosen/memory-map "RAMDisk" = <phys, size>):
++ *   "SWEETDRP", u32 version = 1, u32 count,
++ *   count x { char path[128]; u32 mode; u32 size; u32 offset; u32 pad }
++ * offsets from the archive start. Existing files are replaced; the parent
++ * directories must exist. Each file is logged ("SWEET DROP: ...").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/kauth.h>
++#include <pexpert/device_tree.h>
++#include <machine/machine_routines.h>
++
++void sweet_drop_files(void);
++
++struct sweet_drop_ent {
++	char     path[128];
++	uint32_t mode, size, offset, pad;
++};
++
++static int
++sweet_drop_one(const char *path, uint32_t mode, const void *data, uint32_t size)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int err;
++
++	err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, (int)(mode & 07777), 0, &vp, ctx);
++	if (err != 0) {
++		return err;
++	}
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)size, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
++	if (err == 0) {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, (mode_t)(mode & 07777));
++		err = vnode_setattr(vp, &va, ctx);
++	}
++	(void)vnode_close(vp, FWRITE, ctx);
++	return err;
++}
++
++void
++sweet_drop_files(void)
++{
++	DTEntry map = NULL;
++	uintptr_t const *rd = NULL;
++	unsigned int len = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &map) != kSuccess ||
++	    SecureDTGetProperty(map, "RAMDisk", (void const **)&rd, &len) != kSuccess ||
++	    len < 2 * sizeof(uintptr_t) || rd[1] < 12) {
++		return;
++	}
++	const uint8_t *a = (const uint8_t *)ml_static_ptovirt(rd[0]);
++	uint64_t total = rd[1];
++	if (a == NULL || memcmp(a, "SWEETDRP", 8) != 0) {
++		return;
++	}
++	uint32_t version, count;
++	memcpy(&version, a + 8, 4);
++	memcpy(&count, a + 12, 4);
++	if (version != 1 || count > 64 || 16 + (uint64_t)count * sizeof(struct sweet_drop_ent) > total) {
++		printf("SWEET DROP: bad archive (version %u, %u files)\n", version, count);
++		return;
++	}
++	const struct sweet_drop_ent *e = (const struct sweet_drop_ent *)(a + 16);
++	for (uint32_t i = 0; i < count; i++) {
++		char path[128];
++		memcpy(path, e[i].path, sizeof(path));
++		path[sizeof(path) - 1] = 0;
++		if ((uint64_t)e[i].offset + e[i].size > total || path[0] != '/') {
++			printf("SWEET DROP: %s: outside the archive\n", path);
++			continue;
++		}
++		int err = sweet_drop_one(path, e[i].mode, a + e[i].offset, e[i].size);
++		printf("SWEET DROP: %s (%u bytes, mode %o) -> %d\n", path, e[i].size, e[i].mode, err);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..d42a22f 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1098,6 +1098,12 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* sunstone: files carried by the boot image (bsd/dev/sweet_drop.c) */
++	extern void sweet_drop_files(void);
++	sweet_drop_files();
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
