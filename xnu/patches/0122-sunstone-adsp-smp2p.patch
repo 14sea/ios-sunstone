@@ -1,0 +1,109 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index ba69468..6463747 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6403,7 +6403,80 @@ modem_boot(void)
+ #define PAS_ID_ADSP             1
+ #define ADSP_HOST               2
+ #define ADSP_ITEM_SMP2P_IN      443
++#define ADSP_ITEM_SMP2P_OUT     429             /* DT smp2p-adsp: qcom,smem = <443 429> */
+ #define ADSP_ITEM_CRASH         423
++#define IPCC_CLIENT_LPASS       3
++
++static void
++adsp_kick(void)
++{
++	mb();
++	*(volatile uint32_t *)(ipcc + IPCC_SEND_ID) = (IPCC_CLIENT_LPASS << 16) | IPCC_SIGNAL_SMP2P;
++	mb();
++}
++
++/* our outbound SMP2P item towards the ADSP, as Linux's smp2p driver makes it at probe */
++static struct smp2p_hdr *
++adsp_smp2p_out(struct smem_part_hdr *part)
++{
++	struct smp2p_hdr *o = (struct smp2p_hdr *)smem_alloc(part, ADSP_ITEM_SMP2P_OUT,
++	    sizeof(struct smp2p_hdr) + SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry));
++	if (o == NULL || o->version != 0) {
++		return o;
++	}
++	o->magic = SMP2P_MAGIC;
++	o->local_pid = 0;
++	o->remote_pid = ADSP_HOST;
++	o->total = SMP2P_MAX_ENTRY;
++	o->valid = 0;
++	o->features[0] = 1;                         /* SSR_ACK */
++	struct smp2p_entry *e = (struct smp2p_entry *)(o + 1);
++	static const char *names[] = { "master-kernel", "sleepstate" };
++	for (unsigned i = 0; i < 2; i++) {
++		bzero(e[i].name, sizeof(e[i].name));
++		strlcpy(e[i].name, names[i], sizeof(e[i].name));
++		e[i].value = 0;
++	}
++	o->valid = 2;
++	mb();
++	o->version = 1;                             /* validates the item */
++	adsp_kick();
++	return o;
++}
++
++/* what is in the apps<->adsp SMEM partition, and the ADSP's SMP2P item */
++static void
++adsp_dump(struct smem_part_hdr *part, const char *when)
++{
++	char line[256];
++	unsigned n = 0;
++	if (part == NULL || memcmp(part->magic, "$PRT", 4) != 0 || part->free_uncached > part->size) {
++		return;
++	}
++	uint8_t *e = (uint8_t *)part + sizeof(*part), *end = (uint8_t *)part + part->free_uncached;
++	line[0] = 0;
++	while (e + sizeof(struct smem_priv_entry) <= end) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)e;
++		if (h->canary != 0xA5A5) {
++			break;
++		}
++		n += snprintf(line + n, n < sizeof(line) ? sizeof(line) - n : 0, " %u(%u)", h->item, h->size - h->pad_data);
++		e += sizeof(*h) + h->pad_hdr + h->size;
++	}
++	LOG("adsp: %s: SMEM items:%s", when, line);
++	uint32_t sz = 0;
++	struct smp2p_hdr *in = (struct smp2p_hdr *)smem_get(part, ADSP_ITEM_SMP2P_IN, &sz);
++	if (in == NULL) {
++		LOG("adsp: %s: no SMP2P item %u", when, ADSP_ITEM_SMP2P_IN);
++		return;
++	}
++	LOG("adsp: %s: SMP2P in magic %08x v%u pids %u->%u total %u valid %u flags %x", when, in->magic, in->version,
++	    in->local_pid, in->remote_pid, in->total, in->valid, in->flags);
++	struct smp2p_entry *x = (struct smp2p_entry *)(in + 1);
++	for (uint32_t i = 0; i < in->valid && i < SMP2P_MAX_ENTRY; i++) {
++		LOG("adsp:   entry %u '%.16s' = %08x", i, x[i].name, x[i].value);
++	}
++}
+ 
+ static void
+ adsp_boot(void)
+@@ -6419,10 +6492,15 @@ adsp_boot(void)
+ 		LOG("adsp: SMP2P item %u already exists: ADSP is not cold, not touching it", ADSP_ITEM_SMP2P_IN);
+ 		return;
+ 	}
++	struct smp2p_hdr *out = adsp_smp2p_out(part);
++	LOG("adsp: our SMP2P item %u %s", ADSP_ITEM_SMP2P_OUT, out != NULL ? "made" : "NOT made");
+ 	if (!pas_boot(&adsp)) {
+ 		return;
+ 	}
+ 	for (unsigned ms = 0; ms < 15000; ms += 10) {
++		if (ms == 1000 || ms == 5000) {
++			adsp_dump(part, ms == 1000 ? "1 s" : "5 s");
++		}
+ 		struct smp2p_hdr *in = (struct smp2p_hdr *)smem_get(part, ADSP_ITEM_SMP2P_IN, &sz);
+ 		volatile uint32_t *sk = (in != NULL && in->magic == SMP2P_MAGIC) ? smp2p_find(in, "slave-kernel") : NULL;
+ 		uint32_t v = sk != NULL ? *sk : 0;
+@@ -6440,6 +6518,7 @@ adsp_boot(void)
+ 		}
+ 		IOSleep(10);
+ 	}
++	adsp_dump(part, "end");
+ 	bool glink = smem_get(part, SMEM_GLINK_DESC, NULL) != NULL;
+ 	LOG("adsp: %s; GLINK descriptor in the apps<->adsp partition: %s", (sk_last != ~0u && (sk_last & 2)) ? "*** ADSP UP ***" : "no READY within 15 s",
+ 	    glink ? "yes (made by the ADSP)" : "no");
