@@ -145,7 +145,18 @@ an apps-side `sns_registry` interface (not served), and the sensors register onl
 (12 s with stat-only json). Persist stays untouched (all writes refused). Decision: keep 0135/0136
 as a mechanism but do **not** put the json into the drop; stat-only lets the PD use the stored
 registry. A likely trigger is a config selector that differs from Android's (e.g. the missing
-Huaqin `pcba_config`). Next: lux to CoreBrightness (ALS HID events) for auto-brightness.
+Huaqin `pcba_config`).
+
+boot-52 (0137, `../out/boot52-log35.txt`, now in `xnu/patches-unused/`): a `SweetHIDALS` service
+(AppleVendor 0xff00/4, `kIOHIDEventTypeAmbientLightSensor` with level, illuminance, raw ch0;
+copyEvent answers the last report) fed from the SEE stream. backboardd's event system opens it and
+CoreBrightness configures it (`ALSLPannelValues`, `ReportInterval`, `BatchInterval`,
+`PreserveTimestamp`), lux events reach one client (~98 lux). But: (1) backboardd aborted once,
+`Assertion failed: (animationCurve_), function ValueAtTime, file EDRBrightnessAnimation.cpp, line 70`
+(libEDR: notify callback -> EDRServerStartService -> EDRGetDisplayHeadroom -> EDRGetDisplayMaxLuminance
+-> animation with no curve); (2) brightness stayed at 330 regardless of lux, copyEvent was never
+called, and Settings shows no Auto-Brightness switch. Reverted to the 0136 state (user's decision,
+2026-10-22); auto-brightness is deferred (TODO 7).
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -269,7 +280,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; local checks pass, boot pending |
 | 0135 | drop: memory-only entries (`SWEET_DROP_MEM`, `mkdrop.py ... :mem` / `--mem-dir`), `sweet_drop_find()`; up to 256 entries |
 | 0136 | apps_std: files the drop keeps in memory; tried with the 53 vendor sensor json on boot-51: the PD then rebuilds the registry (40 s), so the json stay out of the drop |
-| 0137 | `SweetHIDALS`: ambient light HID service (AppleVendor 0xff00/4) for CoreBrightness, events from the SEE ambient_light stream (level, illuminance, raw), copyEvent answers the last report, logs the properties CoreBrightness sets |
+| 0137 | ambient light HID service for CoreBrightness, **unused** (`xnu/patches-unused/`): boot-52 crashed backboardd once in libEDR, auto-brightness stayed off (TODO 7) |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -322,7 +333,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote) | U | [~] | boot-48: 400 MHz RPM ACKs/selftest/recovery; 0133 fixes flips init race, 0134 adds reliable completion evidence; 400 MHz final PASS and 600 MHz pending, default 300 |
-| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [~] | ALS works in the kernel (boot-46): ADSP boot (0121/0122), GLINK edge (0123/0127), SEE client (0124), FastRPC listener serving the persist registry (0126-0129, 0132), lux on-change reports. Left: serve the vendor json contents (startup time), then lux to CoreBrightness as ALS HID events
+| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] deferred | The kernel side works (boot-46..52): lux on-change reports from the ADSP. The iOS side was tried in boot-52 (0137, parked in `xnu/patches-unused/`) and reverted: see "ADSP and sensors". To find out next: what makes Settings/CoreBrightness offer auto-brightness (MobileGestalt `ambient-light-sensor`, possibly cached; CoreBrightness `AutoBrightnessAvailable`) and where libEDR's brightness animation curve comes from (model/platform/OLED tables or an `IOMobileFramebufferGetBlock` block from the framebuffer, i.e. SweetFramebuffer, user's area). Needs disassembly of CoreBrightness/libEDR (dyld cache symbolizer in the session scratchpad, capstone not installed yet) |
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 

@@ -19,7 +19,14 @@ SUNSTONE.md (GPU). Default stays 300 MHz.
 stat-only (no drop at all) is the good state. boot-51's drop also restored the plain sweetgpu job
 on the root (boot-47..50 had left `--wedge --protect`); boot-51 sweetgpu `PASS`, 1 recovery.
 Later boots need no `DROP=`.
-Next for sensors: lux to CoreBrightness (ALS HID events).
+
+**Auto-brightness deferred (2026-10-22, user's decision):** boot-52 tried 0137 (ALS HID service for
+CoreBrightness). backboardd opened it and CoreBrightness configured it, but libEDR aborted
+backboardd once (`animationCurve_` assertion, EDRBrightnessAnimation.cpp:70), brightness never
+followed lux and Settings has no Auto-Brightness switch. 0137 moved to `xnu/patches-unused/`,
+work/xnu reverted (`ee82c2a`); the phone is back on the 0136 kernel (CI 39751361470). Details and
+the open questions are in SUNSTONE.md TODO 7.
+Next for sensors: auto-brightness, deferred (see below).
 
 ## sunstone GPU handoff (2026-10-22, boot-48 follow-up)
 
