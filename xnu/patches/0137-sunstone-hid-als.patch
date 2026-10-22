@@ -1,0 +1,204 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index afefc7b..5d466ea 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -194,6 +194,7 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+  * whether the phone's partition is that image.
+  */
+ extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++extern "C" void sweet_hid_als(uint32_t lux_milli, uint32_t raw);   /* hid/SweetHID.cpp: CoreBrightness */
+ 
+ static char fw_part[32] = "modem_a";
+ /* modem.mdt: 36 program headers
+@@ -6553,6 +6554,9 @@ sns_sensor_event(const uint8_t *p, uint32_t n)
+ 	}
+ 	sns_lux_milli = f2milli(data[0]);
+ 	sns_als_events++;
++	if (sns_lux_milli >= 0) {
++		sweet_hid_als((uint32_t)sns_lux_milli, nd > 1 && f2milli(data[1]) > 0 ? (uint32_t)(f2milli(data[1]) / 1000) : 0);
++	}
+ 	if (sns_als_events <= 20 || sns_als_events % 50 == 0) {
+ 		LOG("t=%u ms: sns: *** lux %s *** (data[1] %s, %u values, status %llu, event %u)", g_ms,
+ 		    milli_str(sns_lux_milli, a, sizeof(a)), milli_str(nd > 1 ? f2milli(data[1]) : 0, b, sizeof(b)), nd, status, sns_als_events);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..04622b8 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,15 +11,21 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDALS      the ambient light sensor, for CoreBrightness' auto-brightness
+  *
+- * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * Hardware drivers feed them through the C entry points sweet_hid_key(),
++ * sweet_hid_touch() and sweet_hid_als(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSSymbol.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+@@ -375,8 +381,37 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++/*
++ * Ambient light sensor: AppleVendor page 0xff00, usage 4, the pair Apple's ALS services
++ * publish. CoreBrightness (CBALSService, CBALSNodeiOS in backboardd) opens it, takes the
++ * kIOHIDEventTypeAmbientLightSensor events and also polls with IOHIDServiceClientCopyEvent
++ * (copyALSEvent, "Failed to copy kIOHIDEventTypeAmbientLightSensor event"): copyEvent()
++ * answers with the last report. Fed from the ADSP's SEE ambient_light stream (TopazModem).
++ */
++#define kHIDPage_AppleVendorSweet               0xff00
++#define kHIDUsage_AppleVendor_AmbientLightSweet 0x0004
++class SweetHIDALS : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDALS);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOHIDEvent *copyEvent(IOHIDEventType type, IOHIDEvent *matching, IOOptionBits options) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void report(uint32_t lux_milli, uint32_t raw);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_AppleVendorSweet; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_AppleVendor_AmbientLightSweet; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual UInt32 getReportInterval() APPLE_KEXT_OVERRIDE { return 100000; }	/* us: SEE reports ~10 Hz */
++private:
++	IOLock *fLock;
++	IOHIDEvent *fLast;
++	uint32_t fReports, fCopies, fPropsLogged;
++};
++OSDefineMetaClassAndStructors(SweetHIDALS, IOHIDEventService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDALS *gSweetALS;
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -538,6 +573,99 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	collection->release();
+ }
+ 
++bool
++SweetHIDALS::start(IOService *provider)
++{
++	fLock = IOLockAlloc();
++	if (!fLock || !IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetALS = this;
++	registerService();
++	IOLog("SWEET HID: ambient light sensor registered (page 0x%x usage 0x%x)\n",
++	    kHIDPage_AppleVendorSweet, kHIDUsage_AppleVendor_AmbientLightSweet);
++	return true;
++}
++
++void
++SweetHIDALS::report(uint32_t lux_milli, uint32_t raw)
++{
++	uint32_t lux = (lux_milli + 500) / 1000;
++	IOHIDEvent *event = IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), lux, raw, 0, 0, 0);
++
++	if (!event) {
++		return;
++	}
++	event->setDoubleValue(kIOHIDEventFieldAmbientLightSensorIlluminance, (IOHIDDouble)lux_milli / 1000.0, 0);
++	IOLockLock(fLock);
++	IOHIDEvent *old = fLast;
++	fLast = event;
++	event->retain();
++	uint32_t n = ++fReports;
++	IOLockUnlock(fLock);
++	OSSafeReleaseNULL(old);
++	if (n <= 3 || n % 100 == 0) {
++		IOLog("SWEET HID: als report %u: %u lux (raw %u, %u clients, %u copies)\n", n, lux, raw,
++		    _clients ? _clients->getCount() : 0, fCopies);
++	}
++	dispatchEvent(event);
++	event->release();
++}
++
++IOHIDEvent *
++SweetHIDALS::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, IOOptionBits options __unused)
++{
++	IOHIDEvent *event = NULL;
++
++	if (type != kIOHIDEventTypeAmbientLightSensor && type != kIOHIDEventTypeNULL) {
++		return NULL;
++	}
++	IOLockLock(fLock);
++	if (fLast) {
++		event = fLast;
++		event->retain();
++	}
++	uint32_t n = ++fCopies;
++	IOLockUnlock(fLock);
++	if (n <= 3 || n % 100 == 0) {
++		IOLog("SWEET HID: als copyEvent %u (type %u) -> %s\n", n, (unsigned)type, event ? "last report" : "none yet");
++	}
++	return event;
++}
++
++/* CoreBrightness configures the service (setALSServiceProperty:forKey:): log what it sends */
++IOReturn
++SweetHIDALS::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	for (OSSymbol *key; it && (key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL;) {
++		if (fPropsLogged >= 40) {
++			break;
++		}
++		fPropsLogged++;
++		OSNumber *num = OSDynamicCast(OSNumber, dict->getObject(key));
++		OSBoolean *b = OSDynamicCast(OSBoolean, dict->getObject(key));
++		IOLog("SWEET HID: als property %s = %s%llu\n", key->getCStringNoCopy(),
++		    b ? (b->getValue() ? "true " : "false ") : "", num ? num->unsigned64BitValue() : 0);
++	}
++	OSSafeReleaseNULL(it);
++	return kIOReturnSuccess;
++}
++
++/* the ambient light from the ADSP's SEE stream: lux in thousandths, the sensor's raw count */
++extern "C" void
++sweet_hid_als(uint32_t lux_milli, uint32_t raw)
++{
++	if (gSweetALS) {
++		gSweetALS->report(lux_milli, raw);
++	}
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 97dcf20..4f0e458 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDALS;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDALS;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetGPUDevice;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetGPUDevice;"

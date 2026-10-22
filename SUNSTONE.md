@@ -269,6 +269,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; local checks pass, boot pending |
 | 0135 | drop: memory-only entries (`SWEET_DROP_MEM`, `mkdrop.py ... :mem` / `--mem-dir`), `sweet_drop_find()`; up to 256 entries |
 | 0136 | apps_std: files the drop keeps in memory; tried with the 53 vendor sensor json on boot-51: the PD then rebuilds the registry (40 s), so the json stay out of the drop |
+| 0137 | `SweetHIDALS`: ambient light HID service (AppleVendor 0xff00/4) for CoreBrightness, events from the SEE ambient_light stream (level, illuminance, raw), copyEvent answers the last report, logs the properties CoreBrightness sets |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
