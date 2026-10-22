@@ -1,6 +1,43 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## sunstone GPU handoff (2026-10-22, review follow-up)
+## sunstone GPU handoff (2026-10-22, boot-48 follow-up)
+
+Code commit: `834e51c` (fork, 0133/0134), matching XNU `2967215`.
+
+Boot-47 (`../out/boot47-log30.txt`) at 300 MHz has all 13 SWEETGPU lines,
+including the three successful post-failure canaries and `PASS (0 failures)`;
+page flips were on. Boot-48 (`../out/boot48-log31.txt`) at 400 MHz has all six
+MX/CX/GX RPM ACKs (GX vlvl 0xc0), RCG readback and 2D selftest success, three
+attempt-0 recoveries, and ongoing GPU presentation (frame 1000 average 2682 us).
+The user reports stable UI/ALS. No SWEETGPU stdout was captured at 400 MHz, so
+the final canary/overall test PASS there remains unproven; 600 MHz is untested.
+
+Confirmed init race: boot-48 logs page flips off at line 77, before the first
+RPM vote at 85. SweetGPUDevice startup owned gpu_init while framebuffer's
+sweet_gpu_ready read its temporary -1 state and permanently disabled flips.
+Patch 0133 adds a separate init IOLock around the entire init/cached-result
+lookup; concurrent callers now wait. It cannot use the ring lock, which clock
+initialization takes internally. The two-thread host regression pauses clock
+initialization and verifies that framebuffer waits; failed handoff is covered too.
+
+Patch 0134 adds selector 8 ReportTest [BO handle, failure count, flags], once
+per client. Kernel reads the final canary at BO+0x100 before free, checks the
+expected marker for the selected tests and stores a completion result. IOLog
+emits `SWEET GPU: sweetgpu result PASS/FAIL` with canary, MHz and resets.
+Params 8..13 retain result (0 absent/1 PASS/2 FAIL), user failure count,
+kernel-observed marker, expected marker, flags and report count, even after
+GPU fallback. Missing completion remains unknown. Rebuild ios-tools too.
+
+Validation: complete GPU patch reconstruction matches work/xnu; UBSan host
+suite (including concurrency and the actual report-selector body) passed.
+SweetGPU.cpp and SweetGPUDevice.cpp compiled with real CI 39733814183 headers/
+generated files and arm64 flags; sweetgpu.c syntax check passed. No new full
+kernel link, CI dispatch, boot or flash in this follow-up. Next: 400 MHz boot
+with 0133/0134, require flips on/increasing and kernel result PASS, flags 3,
+canary 0xc0ffee45; then sustained UI and 600 MHz validation. Default stays 300.
+See [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md).
+
+## Earlier GPU review follow-up (2026-10-22, before boot-47/48)
 
 Latest correction: `7e9f53c` (fork, 0131), matching XNU `1888049`.
 Earlier review fixes: `d594f7f` (fork, 0130), matching XNU `f8dc8b9`.

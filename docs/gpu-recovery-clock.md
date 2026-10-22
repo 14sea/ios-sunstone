@@ -1,13 +1,21 @@
-# sunstone GPU recovery and fixed clocks (0125, 0130, 0131)
+# sunstone GPU recovery and fixed clocks (0125, 0130, 0131, 0133, 0134)
 
-2026-10-22. Implemented and checked locally; **not yet built as a full kernel or booted**.
+2026-10-22. Recovery and 400 MHz have device evidence; the latest init-race and
+test-report fixes (0133/0134) have passed local checks and await a full build/boot.
+Latest code: fork `834e51c`, matching XNU `2967215`.
 Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
 Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):
 firmware FIFO takeover, feature negotiation, the recovery budget and zap retry.
 0131 (`7e9f53c` in fork, XNU `1888049`) restores the normal a6xx secure-mode
 restart; SCM stays a fallback only.
-The last device evidence remains boot-36 (`../out/boot36-log19.txt`). The default
-clock stays at the shim's 300 MHz. No partitions were flashed for this change.
+Boot-48 (`../out/boot48-log31.txt`) records all six RPM ACKs, GX level `0xc0`,
+400 MHz RCG readback and a passing 2D selftest. All three deliberate failures
+recovered on attempt 0; GPU display copies continued (frame 1000 averaged 2682 us).
+The user reports a stable system and ambient light sensing. However, page flips
+were disabled by the init race below, and all sweetgpu stdout was absent, so the
+final post-recovery canary and overall PASS at 400 MHz remain unproven. 600 MHz
+still lacks device evidence. The default clock stays at the shim's 300 MHz.
+No partitions were flashed during this local follow-up.
 
 ## CP_PROTECT audit
 
@@ -17,7 +25,9 @@ at `0x11c00`. The old handoff's “three ranges” TODO was stale. No range was 
 The host check can compare the complete table with a supplied Linux catalog;
 the device test `sweetgpu --protect` additionally attempts a hardware-protected
 `CP_REG_TO_MEM` read of `CP_RB_BASE` through an IB. That test must fail the
-submission and increment the successful recovery count; it has not run yet.
+submission and increment the successful recovery count. Boot-47 at 300 MHz has
+the full test stdout; boot-48 at 400 MHz records the protection fault and recovery
+but lacks the final user-space result.
 
 Reference: [Linux a6xx_catalog.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_catalog.c).
 
@@ -67,8 +77,9 @@ memory, so closing an IOSurface cannot unwire storage still owned by that DMA.
 
 The reset path does not collapse CX/GX or reset the whole GCC GPU block. References:
 [Linux a6xx_gpu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
-local `../shim/gpu.c` (`hw_init`, `cp_start`, `blit2d_setup`). The reset and zap
-behavior still need confirmation on the phone.
+local `../shim/gpu.c` (`hw_init`, `cp_start`, `blit2d_setup`). Boot-48 confirms
+attempt-0 recovery at 400 MHz without SCM resume. The optional SCM fallback has
+only simulated-hardware coverage.
 
 ## Clocks above 300 MHz
 
@@ -117,9 +128,52 @@ identity), `../research/linux-msm/gpucc-sm6375.c`,
 
 ## Validation and next device session
 
+### Concurrent initialization (0133)
+
+SweetGPUDevice::start and framebuffer startup both call `sweet_gpu_ready()`.
+RPM negotiation made initialization long enough for framebuffer startup to read
+the temporary `gpu_state=-1` and permanently disable page flips. Boot-48 logs
+`page flips off` before even the first RPM vote. A separate lazily published
+IOLock now covers the whole initialization and cached-result lookup; concurrent
+callers wait for the owner to finish. This cannot use the ring lock because clock
+initialization takes that lock itself. Later runtime failures still return false.
+The host test pauses the owner during clock initialization, starts a framebuffer
+caller on a second thread and checks that both return success after release. It
+also checks that both observe a failed handoff, without retrying it.
+
+### Completion record (0134)
+
+The updated sweetgpu calls selector 8 `ReportTest [bo_handle, failures, flags]`
+before freeing its BO. Each client may report once. The kernel invalidates its
+CPU cache view, reads the actual word at BO offset `0x100`, and compares it with
+`0xc0ffee43` (base tests), `0xc0ffee44` (wedge), or `0xc0ffee45` (protect).
+PASS requires both zero reported user-test failures and a matching kernel-read
+canary. Flags bit 0 means wedge and bit 1 means protect. This is a diagnostic
+completion report, with the assertion count supplied by the test program.
+
+The single kernel summary starts `SWEET GPU: sweetgpu result PASS` or `FAIL`
+and includes flags, canary/expected values, MHz, reset count and report count.
+GetParam also retains the last report for the rest of the boot:
+
+| Param | Value |
+| --- | --- |
+| 8 | result: 0 no completed report, 1 PASS, 2 FAIL |
+| 9 | reported assertion failures |
+| 10 | kernel-read canary |
+| 11 | expected canary |
+| 12 | test flags |
+| 13 | completed report count |
+
+These parameters remain readable after GPU fallback and do not trigger GPU
+initialization. A missing completion report is unknown, never a PASS. The kernel
+and ios-tools must both include this update. The host tests execute the actual
+selector body, including malformed arguments/BOs, duplicate-report rejection,
+canary mismatch, all flag combinations and result retention with GPU disabled.
+
 `python3 tests/check-gpu.py` applies the GPU files from the complete patch series
 in a temporary directory and executes their actual C++ with IOKit/MMIO substitutes
-and UBSan. Tests cover handoff initialization, recovery order, stalled/faulted IBs,
+and UBSan. Tests cover handoff initialization and its concurrency race, completion
+reporting, recovery order, stalled/faulted IBs,
 next-submission success, failed bus drain/restart, pinned BO lifetime, the
 three-failure cutoff and real-work reset of that budget, normal secure-mode
 restart with SCM unsupported, fallback-only zap resume and bounded interrupted sessions, 400/600 MHz with firmware-era FIFO indices and
@@ -128,8 +182,8 @@ malformed/stale/error/missing ACKs, FIFO wrap and 2D fallback. `--source-root ..
 `--catalog ../research/linux-msm/a6xx_catalog.c` compares all 32 protection words.
 `--clang PATH --resource-dir PATH` adds a Mach-O compile with declaration stubs.
 
-Local results: all host checks passed. Additionally, the changed `SweetGPU.cpp`
-and `SweetFramebuffer.cpp` compiled to an arm64 Mach-O object using the **real XNU headers and generated
+Local results: all host checks passed. Additionally, the latest changed `SweetGPU.cpp`
+and `SweetGPUDevice.cpp` compiled to arm64 Mach-O objects using the **real XNU headers and generated
 build files** from successful CI **39733814183**, buildtree artifact **12405779477**,
 and that run's compile flags (Ubuntu clang 17, xnu-cc.py compatibility definitions).
 This is a translation-unit check, not a complete kernel link or device test.
@@ -143,13 +197,12 @@ mapped BO; `--protect` exercises the protection fault described above.
 
 Next steps:
 
-1. Build the full kernel and ios-tools from the commit containing 0125.
-2. First test at the default 300 MHz: run `sweetgpu --wedge --protect`. Require
-   `PASS`, increasing recovery counters, a successful post-failure write, and
-   continuing framebuffer presents in the persistent log.
-3. Repeat with `sweetgpu_mhz=400`, then `600`. Require six RPM ACKs, RCG/selftest
-   success, the expected MHz parameter, successful fault/wedge recovery, and
-   stable UI presentation over a sustained run. Check real clock/rail behavior
-   and temperature on the device before changing the default.
-4. Record exact kernel commit, CI run, boot image/hash and device log. Until then,
-   recovery and high clocks are **implemented, awaiting hardware validation**.
+1. Build the full kernel with 0133/0134 and rebuild ios-tools.
+2. Repeat boot-48 at `sweetgpu_mhz=400`, running `sweetgpu --wedge --protect`.
+   Require page flips enabled and increasing flip counts, six RPM ACKs,
+   RCG/selftest success, all three recoveries and the kernel `sweetgpu result PASS`
+   with flags 3 and canary `0xc0ffee45`. Retained params must show result 1 and
+   at least one completed report even if stdout is lost.
+3. Check sustained UI presentation, then repeat at 600 MHz. Check real clock/rail
+   behavior and temperature before changing the default.
+4. Record exact kernel commit, CI run, boot image/hash and device log.
