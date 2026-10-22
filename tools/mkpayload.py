@@ -27,6 +27,7 @@ ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
 """
 import argparse, os, struct, sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -141,7 +142,10 @@ def adt_dram(adt_blob):
 
 
 def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
-    buf = bytearray(open(kernel_path, 'rb').read())
+    cl = cmdline.encode('utf-8')
+    if b'\0' in cl or len(cl) >= BOOT_LINE_LENGTH:
+        raise ValueError(f'boot arguments must fit in {BOOT_LINE_LENGTH - 1} UTF-8 bytes without NULs')
+    buf = bytearray(Path(kernel_path).read_bytes())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
     segs = [s for s in m['segs'] if s['vmsize']]
@@ -153,13 +157,13 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
-    adt_blob = open(adt_path, 'rb').read()
+    adt_blob = Path(adt_path).read_bytes()
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
     ramdisk = None
     if ramdisk_path:
-        image = open(ramdisk_path, 'rb').read()
+        image = Path(ramdisk_path).read_bytes()
         rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
         rd_va = kernel_end
         kernel_end = rd_va + rd_size
@@ -183,7 +187,6 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
-    cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)

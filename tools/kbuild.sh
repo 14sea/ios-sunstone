@@ -47,5 +47,7 @@ gpufw=""
 [ -f out/gpu-fw.blob ] && gpufw=out/gpu-fw.blob
 for v in "$@"; do
   label=${v%%=*}; extra=${v#*=}
-  CMDLINE="$base $extra" GPUFW=$gpufw tools/mkboot.sh "$k/kernel.development.sweet" "out/boot-$name-$label.img" | tail -2
+  # Keep the packer's failure status: a pipeline ending in tail would hide it in sh.
+  packed=$(CMDLINE="$base $extra" GPUFW=$gpufw tools/mkboot.sh "$k/kernel.development.sweet" "out/boot-$name-$label.img")
+  printf '%s\n' "$packed" | tail -2
 done

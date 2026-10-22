@@ -49,6 +49,8 @@ for name, first, num in parts:
             left = sectors * 512
             while left:
                 chunk = f.read(min(left, 64 << 20))
+                if not chunk:
+                    sys.exit(f'truncated super image while extracting {want}: {left} bytes missing')
                 o.write(chunk)
                 left -= len(chunk)
     print(f'{want} -> {out}')

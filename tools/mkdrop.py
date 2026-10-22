@@ -23,6 +23,8 @@ MEM = 0x80000000                                # bsd/dev/sweet_drop.c SWEET_DRO
 
 
 def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
     out, args = sys.argv[1], sys.argv[2:]
     files = []
     if args[:1] == ['--launchd']:
@@ -52,9 +54,15 @@ def main():
     hdr = 16 + ENT.size * len(files)
     off = (hdr + 63) & ~63
     table, data = b'', b''
+    destinations = set()
     for path, mode, blob in files:
-        assert path.startswith('/') and len(path) < 128, path
-        table += ENT.pack(path.encode(), mode, len(blob), off + len(data), 0)
+        encoded = path.encode('utf-8')
+        if not path.startswith('/') or b'\0' in encoded or len(encoded) >= 128:
+            sys.exit(f'invalid destination (must be absolute and fit in 127 UTF-8 bytes): {path!r}')
+        if path in destinations:
+            sys.exit(f'duplicate destination: {path}')
+        destinations.add(path)
+        table += ENT.pack(encoded, mode, len(blob), off + len(data), 0)
         data += blob + b'\0' * (-len(blob) & 63)
         print(f'  {path} {len(blob)} bytes mode {mode:o}')
     blob = b'SWEETDRP' + struct.pack('<II', 1, len(files)) + table
@@ -63,4 +71,5 @@ def main():
     print(f'{out}: {len(blob)} bytes')
 
 
-main()
+if __name__ == '__main__':
+    main()
