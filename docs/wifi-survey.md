@@ -1,5 +1,8 @@
 # Wi-Fi / modem hardware survey for sunstone (2026-10-21) vs topaz's TopazModem (0113-0130)
 
+Status: implemented as patches 0117-0119 (modem and WLAN firmware, WPA2 join, DHCP, ping; boot-37..39).
+The table below is the survey as written before the port.
+
 Sources: live DT (`out/dt/sunstone-live.dts`), vendor dump (`fw/vendor`), phone partitions (recovery adb),
 Linux `drivers/mailbox/qcom-ipcc.c` (`research/modem/`), topaz patches 0113/0115/0118/0123.
 

@@ -4,12 +4,18 @@ Bring-up of this XNU port on the Redmi Note 12 5G **sunstone** (SM4375 "blair",
 6x Cortex-A55 + 2x Cortex-A78, 8 GB, Adreno 619), starting from ios-topaz.
 Read this first; `NOTES.md` is sweet's history, `README.md` the user-facing summary.
 
-## Status 2026-10-21 (latest)
+## Status 2026-10-22 (latest)
 
 **The phone boots the iPhone X iOS 16.7.16 userland to SpringBoard on all 8 cores,
 with touch, keys, a real battery gauge (with temperature and cycle count), DCS panel off/on, a working
 brightness slider, the real date and time, GPU-assisted display, an SMMU-isolated GPU user client and the root
 read-write in `userdata`.**
+Since 2026-10-22 also in the kernel (not yet handed to iOS): the modem and WLAN firmware, a WPA2 join
+with DHCP and ping (boot-39), the ADSP sensors PD with ambient light, proximity, accelerometer,
+gyroscope and magnetometer (boot-46 on, sections below), and GPU recovery plus opt-in 400/600 MHz
+(boot-47..50, "GPU"). The everyday image of boot-53 (CI 39751361470, patches up to 0136, `adsp=1`)
+is what the phone runs now.
+
 Verified from the persistent log of boot-21 (`../out/boot21-log6.txt`):
 
 - `SWEET CPU: 8/8 CPUs initialized`, PSCI CPU_ON for MPIDR 0x100-0x700.
@@ -77,7 +83,7 @@ this phone, until the battery is pulled; `mkboot.sh` default) in get/setUTCTimeO
 `2026-10-21 08:22:12` (device time zone PST), i.e. the right time within seconds. Side effect: StartIOKit
 waited up to 30 s for IORTC before `clock_initialize_calendar()` on every boot (launchd's first stamp was
 16:00:51 = 51 s after the epoch); that wait is gone. If iOS sets the time, the kernel logs the new offset
-to bake. Note: testsea's clock runs ~1 min 50 s ahead of this host (visible in every chain log).
+to bake. Note: the test host's clock ran ~1 min 50 s ahead of the build host (visible in every chain log).
 
 ### Modem and WLAN radio (0117/0118, boot-37/38, `../out/boot37-log20.txt`, `../out/boot38-log21.txt`)
 
@@ -173,11 +179,13 @@ the files into the root right before launchd (`SWEET DROP: path (bytes, mode) ->
 **`../out/boot22-log7.txt` is byte-identical to `boot21-log6.txt`**: boot-22 died before the log
 ring was flushed, so the pull returned boot-21's log again. Treat log7 as a duplicate.
 
-Reading the log: the phone has no USB while XNU runs. On testsea `~/ios-build/pull-log.sh N` waits
-for the phone in fastboot (user: Power + Volume down), does `fastboot set_active b` + `reboot recovery`
-(crDroid recovery in slot b), `adb root` (the recovery's adbd starts unprivileged), then the
-last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log.py`). Copy to
-`../out/bootNN-logN.txt`. **Slot b is active after this**; the next `wait-flash-NN.sh` sets slot a again.
+Reading the log: the phone has no USB while XNU runs. On the test host `pull-log.sh N`
+(`../tools-host/`) waits for the phone in fastboot (Power + Volume down) or in the recovery (Power +
+Volume up), does `fastboot set_active b` + `reboot recovery` (crDroid recovery in slot b), `adb root`
+(the recovery's adbd starts unprivileged), then the last-1025-blocks `dd` of `userdata` into
+`logN.bin`/`logN.txt` (`tools/sweet-log.py`) and leaves the phone in fastboot with slot a active.
+Copy to `../out/bootNN-logN.txt`. `tools/sweet-log-pull.sh` is the same read for a phone that is
+already in the recovery.
 
 ### GPU
 
@@ -268,7 +276,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0122 | ADSP: our outbound SMP2P item 429 first (READY comes only then), SMEM/SMP2P dumps |
 | 0123 | GLINK/QRTR state per edge (`struct glink_edge`), replies routed by QRTR node; ADSP edge (IPCC client 3) served after READY, its channels, services and unserved requests logged |
 | 0124 | SEE sensor client on the ADSP (QMI 400): SUID lookups, ambient light attributes and on-change enable, lux in the log |
-| 0125 | GPU CP reset after wedge/fault, DMA quarantine, RPM-backed 400/600 MHz; boot-47 PASS at 300, boot-48 400 MHz selftest/recovery, final PASS pending |
+| 0125 | GPU CP reset after wedge/fault, DMA quarantine, RPM-backed 400/600 MHz; boot-47 PASS at 300, boot-49/50 PASS at 400/600 (user) |
 | 0126 | read-only ext4 on a UFS partition (`SweetExt4`: extents, linear directories), first user the persist sensor registry |
 | 0127 | GLINK channels per edge; DSP clients (`TopazDSP.h`): a driver gets its own channel on the ADSP edge, plus SMEM items and SMMU identity |
 | 0128 | FastRPC to the ADSP sensors PD (`SweetFastRPC`): attach, default listener, `adsp_listener_next2` loop, reverse calls (remotectl, apps_mem); payloads in 0xda000000 via SMMU stream 0xa3 |
@@ -276,8 +284,8 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0130 | GPU: AP-only FIFO-index reset, feature negotiation, three-failure cutoff, conditional zap-resume retry; RPM path works in boot-48 |
 | 0131 | Correct a6xx restart: SET_SECURE_MODE 0 on attempt 0 without SCM; all three boot-48 recoveries succeed on attempt 0 |
 | 0132 | FastRPC: retry the sensors PD attach every 500 ms (40 tries), one root PD attach probe after 5 failures (boot-46: ALS, proximity, accel, gyro, mag up) |
-| 0133 | Serialize complete GPU initialization so framebuffer waits through RPM and does not permanently disable flips; host regression/compile pass, boot pending |
-| 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; local checks pass, boot pending |
+| 0133 | Serialize complete GPU initialization so framebuffer waits through RPM and does not permanently disable flips; boot-49/50: page flips on at 400/600 MHz |
+| 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; boot-49/50: kernel `PASS`, canary c0ffee45 |
 | 0135 | drop: memory-only entries (`SWEET_DROP_MEM`, `mkdrop.py ... :mem` / `--mem-dir`), `sweet_drop_find()`; up to 256 entries |
 | 0136 | apps_std: files the drop keeps in memory; tried with the 53 vendor sensor json on boot-51: the PD then rebuilds the registry (40 s), so the json stay out of the drop |
 | 0137 | ambient light HID service for CoreBrightness, **unused** (`xnu/patches-unused/`): boot-52 crashed backboardd once in libEDR, auto-brightness stayed off (TODO 7) |
@@ -287,39 +295,45 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 
 - `tools/mkadt.py --highmem`: sunstone ADT (GICD 0xf200000, GICR 0xf240000, splash 0x85200000,
   UFS 0x4804000, RAM 0x1_80000000 + 4 GiB, eight CPU nodes, iPhone X `/product`).
-- `../mkboot.sh KERNEL OUT.img` (`CMDLINE=`, `DROP=`, `GPUFW=../out/gpu-fw.blob`): ADT -> payload
-  -> shim boot image v3. `../gpu-build.sh ../fw/gpu` builds the GPU firmware blob (`a630_sqe.fw`,
-  `a615_zap.*` from the vendor partition, `tools-testsea/lpextract.py`).
+- `tools/mkboot.sh KERNEL OUT.img` (`CMDLINE=`, `DROP=`, `GPUFW=out/gpu-fw.blob`): ADT -> payload
+  -> shim boot image v3. `tools/gpu-build.sh FWDIR` builds the GPU firmware blob (`a630_sqe.fw`,
+  `a615_zap.*` from the vendor partition, `tools/lpextract.py`). The workspace keeps its own copies
+  (`../mkboot.sh`, `../shim/`): `shim/` here is synced from there (2026-10-22, byte-identical images
+  apart from the ADT's random seed).
 - sunstone ABL has **no `fastboot boot`**: the image is flashed to `boot_a` (slot a); crDroid and
   its recovery stay in slot b. Root: `ios16-root.simg` (16 GiB HFS+) flashed to `userdata`.
 - Kernel CI: `gh workflow run xnu.yml --ref sunstone`, artifact `xnu-kernel` -> `xnu/outNN/`.
   iOS test programs: workflow `ios-tools` (push to sunstone touching `tools/ios/`).
-- Test host **testsea** (`ssh testsea@testsea`): `~/Documents/sunstone-crdroid/platform-tools`,
-  images in `~/Documents/sunstone-crdroid/ios-shim/`, `~/ios-build/wait-flash-NN.sh` one-shot
-  fastboot flashers, `~/ios-build/logN.txt` pulled logs. `../tools-testsea/chain-bootNN.sh` is the
-  full CI -> download -> pack -> stage -> flash chain (its last `cat` can run before the watcher
-  flashes; `exit=1` there does not mean the flash failed, check `wait-flash-NN.log`).
-- Current boot args (boot-23): `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
+- Test host: a Linux PC with `fastboot`/`adb` next to the phone. Images are staged there and a one-shot
+  watcher flashes `boot_a` the moment the phone shows up in fastboot; logs are pulled from the slot-b
+  recovery (`tools/sweet-log-pull.sh`). The host-specific scripts live outside the repo
+  (`../tools-host/`: `chain-boot.sh` = CI -> download -> pack -> stage -> flash, `pull-log.sh`,
+  `precheck.sh`).
+- Current boot args (boot-53): `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
   unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1
   launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1
-  sweetsample=SpringBoard,backboardd`.
+  sweetsample=SpringBoard,backboardd adsp=1`; GPU firmware blob from `tools/gpu-build.sh`, no drop.
 
 ## Local images (`../out/`)
 
 `xnu-ios-boot-NN-*.img`: 01/02 first boots, 03 sampler, 04 cpus=1, 05 kbt, 06 kpcb, 07 irq,
 08 pan, 09 gui (first SpringBoard), 10 ubt, 11 input (touch/keys), 12 touch, 13 home,
 14 gpu, 15 gpu60, 16 cpufreq, 17 cpu60, 18 flip, 19 clean, 20 bigcore, 21 drop, 22/22b gpuuc
-(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping), 40 battery (capacities, sign check), 41 adsp (runs, no READY), 42 adsp2 (READY). `gpu-g*.img` are shim-only GPU tests.
+(failed, see above), 23 restore, 24 battery, 25 dsi (DMA hung), 26 dsi2 (diagnostics), 27 dsi3 (works), 28 sweetbl (no slider), 29 bl (slider works), 30 (built, not flashed: precheck stopped on a WIP edit), 31 bl2 (0106+0107, good), 32 rtc (good), 33 (CI failed), 34 rtcstore (stored offset works), 35 gpu (test packets were TYPE3), 36 gpu2 (all five GPU tests pass), 37 modem (modem + WLAN firmware up), 38 wifi (WMI/HTT, scans), 39 wlantest (WPA2 join, DHCP, ping), 40 battery (capacities, sign check), 41 adsp (runs, no READY), 42 adsp2 (READY), 43 adspglink (GLINK edge, SEE service), 44 see (0 sensors),
+45 fastrpc (attach too early), 46 frpcretry (sensors up), 47 gpusens (GPU recovery at 300), 48 gpu400
+(flips off: init race), 49 gpu400b (PASS), 50 gpu600 (PASS), 51 snsjson (json from the drop: slower),
+52 als (ALS HID service, libEDR abort; parked), 53 revert (the everyday image). `gpu-g*.img` are shim-only GPU tests.
 
 ## Build pre-check
 
-Someone else edits the GPU code in parallel (work/xnu `SweetGPU.cpp/.h`: per-client SMMU stage-1 page
-tables, WIP on 2026-10-21 afternoon). `../tools-testsea/precheck.sh` hashes the shim sources, build
-scripts, tools and patches and shows uncommitted state; the chain scripts (boot-30 on) run it before
-packing and stop (rc 2) on a change to anything that enters the build. Uncommitted work in `work/xnu`
-is only reported (a kernel is built from `fork/xnu/patches`). `precheck.sh --stamp` after review.
+The user and Claude work on the same sources in parallel (GPU: user; modem, ADSP, sensors: Claude).
+`../tools-host/precheck.sh` hashes the shim sources, build scripts, tools and patches and shows
+uncommitted state; the chain script runs it before packing and stops (rc 2) on a change to anything
+that enters the build. Uncommitted work in `work/xnu` is only reported (a kernel is built from
+`fork/xnu/patches`). `precheck.sh --stamp` after review; never stamp someone else's untracked work
+(`PRECHECK_SKIP=1` when it is provably not in the image).
 
-## TODO (2026-10-21, after the gap review against ios-sweet and ios-topaz)
+## TODO (since 2026-10-21, after the gap review against ios-sweet and ios-topaz; updated 2026-10-22)
 
 Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 
@@ -332,8 +346,8 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [x] | 0111 |
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
-| 6 | GPU clock above 300 MHz (GX rail vote) | U | [~] | boot-48: 400 MHz RPM ACKs/selftest/recovery; 0133 fixes flips init race, 0134 adds reliable completion evidence; 400 MHz final PASS and 600 MHz pending, default 300 |
-| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] deferred | The kernel side works (boot-46..52): lux on-change reports from the ADSP. The iOS side was tried in boot-52 (0137, parked in `xnu/patches-unused/`) and reverted: see "ADSP and sensors". To find out next: what makes Settings/CoreBrightness offer auto-brightness (MobileGestalt `ambient-light-sensor`, possibly cached; CoreBrightness `AutoBrightnessAvailable`) and where libEDR's brightness animation curve comes from (model/platform/OLED tables or an `IOMobileFramebufferGetBlock` block from the framebuffer, i.e. SweetFramebuffer, user's area). Needs disassembly of CoreBrightness/libEDR (dyld cache symbolizer in the session scratchpad, capstone not installed yet) |
+| 6 | GPU clock above 300 MHz (GX rail vote) | U | [x] | 0125/0130/0131/0133/0134: opt-in `sweetgpu_mhz=400/600`, RPM ACKs + 2D selftest; boot-49 (400) and boot-50 (600) PASS with page flips on. Default stays 300 (no thermal governor, no DDR vote) |
+| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] deferred | The kernel side works (boot-46..52): lux on-change reports from the ADSP. The iOS side was tried in boot-52 (0137, parked in `xnu/patches-unused/`) and reverted: see "ADSP and sensors". To find out next: what makes Settings/CoreBrightness offer auto-brightness (MobileGestalt `ambient-light-sensor`, possibly cached; CoreBrightness `AutoBrightnessAvailable`) and where libEDR's brightness animation curve comes from (model/platform/OLED tables or an `IOMobileFramebufferGetBlock` block from the framebuffer, i.e. SweetFramebuffer, user's area). Needs disassembly of CoreBrightness/libEDR: blacktop `ipsw` is in the workspace (`../tools/ipsw`: `ipsw dyld a2s`, `ipsw dyld disass` on the SystemOS cryptex's shared cache) |
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 
@@ -346,12 +360,12 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
    hypervisor); harmless so far. The WLAN MAC is the driver's fixed locally administered address
    (persist/wlan_mac.bin is not read).
 3. Test credentials for `wlantest=1` sit on userdata (`tools/sweet-wlan-seed.sh --clear` wipes them).
-4. GPU: boot-47 passes recovery/canaries at 300 MHz; boot-48 confirms 400 MHz RPM/selftest and
-   attempt-0 recovery. Build/boot 0133/0134 to verify flips stay on and capture the final 400 MHz
-   kernel result, then validate 600 MHz; see
-   [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md). Default remains 300 MHz.
+4. GPU: recovery and opt-in 400/600 MHz validated (boot-47..50, see "GPU"); still unproven: the real
+   GPU clock (CORE_MHZ is RCG readback plus selftest), long runs at 600 MHz (no thermal governor), DDR
+   bandwidth votes. Default remains 300 MHz.
 5. CPU frequency: only the shim's one-time EPSS vote; the kernel side stays off (`sweetcpufreq=0`).
 6. Recurring crashes, all pre-existing: driverkitd sig 9 every boot; PosterBoard now and then; Settings
    (Preferences) when it draws app icons through CoreImage's GL path (no GL renderer yet).
-7. No audio, Bluetooth, cellular data, camera, sensors (no auto-brightness), GPS, SEP.
+7. No audio, Bluetooth, cellular data, camera, GPS, SEP. Sensors and WLAN work in the kernel only
+   (no auto-brightness, no network interface in iOS).
 8. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.

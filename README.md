@@ -9,8 +9,11 @@ kernel, xnu-8796, on Qualcomm phones) to the Xiaomi **Redmi Note 12 5G** (`sunst
 8 GB). On top of the kernel runs the **unmodified iOS 16.7.16 (20H392) userland of the
 iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
-As of **2026-10-21** the phone boots to the **iOS home screen on all eight cores**, with
-**touch, the power/volume keys, a real battery gauge, panel power control, the brightness slider and the real time**. Frames are composed by CoreAnimation on the CPU and
+As of **2026-10-22** the phone boots to the **iOS home screen on all eight cores**, with
+**touch, the power/volume keys, a real battery gauge, panel power control, the brightness slider and the real time**.
+Inside the kernel (not yet visible to iOS) the modem and WLAN firmware run, a WPA2 join with DHCP and ping
+works, and the ADSP sensor hub reports the ambient light, proximity, accelerometer, gyroscope and
+magnetometer. Frames are composed by CoreAnimation on the CPU and
 copied to the panel by the Adreno 2D engine, page-flipped at 60 Hz by the display
 controller; UI threads are steered to the two A78 cores. Our own iOS programs reach the
 phone through the boot image (a small archive the kernel installs into the root before
@@ -36,22 +39,26 @@ original engineering log.
 | Storage | UFS host driver (`0x4804000`); the iOS root is a journaled HFS+ volume in `userdata`, read/write, with a GPT watchdog |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
 | Display | `SweetSurface` IOSurface + `AppleCLCD` (1125×2436 canvas on the 1080×2400 panel). Full-screen frames are blitted by the GPU into two back buffers and the MDP VIG0 pipe flips at vsync; other frames fall back to the CPU |
-| GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. User-space access through `SweetGPUDevice` with a per-process SMMU page table, validated command streams and CP_PROTECT (`tools/ios/sweetgpu` test). No CoreAnimation rendering on the GPU yet |
+| GPU | Adreno 619 brought up by the shim (clocks, zap through TrustZone, SQE, ring at 300 MHz) and handed to the kernel's `SweetGPU` for 2D blits. User-space access through `SweetGPUDevice` with a per-process SMMU page table, validated command streams and CP_PROTECT (`tools/ios/sweetgpu` test); CP reset after a hang or fault; optional 400/600 MHz with RPM rail votes (validated on the phone, default 300). No CoreAnimation rendering on the GPU yet |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings |
 | Touch and keys | FocalTech FT5452 over a GPIO bit-banged I2C (TrustZone owns the QUP serial engine), power and volume keys from the PMICs |
 | Battery | SM5602 fuel gauge and SC8989X (bq25890-map) charger read over QUP I2C every 10 s: percentage, voltage, current, temperature, cycle count, charger state |
 | Panel | DCS 0x28/0x29 over DSI0 at display off/on (the AMOLED really switches off); brightness slider through an `AppleARMBacklight` service with `IODisplayParameters` (what iOS 16.7 CoreBrightness expects), DCS 0x51 to the panel |
 | Debug | Persistent console log at the end of `userdata`, kernel/user stack sampler, boot-image file drop (`tools/mkdrop.py`) for test programs and launchd jobs |
-| Clock | PMK8350 RTC over SPMI plus a per-phone offset boot-arg (`sweetrtcoff`); the date is right from the first boot |
+| Clock | PMK8350 RTC over SPMI plus the offset to UTC, kept on `userdata` and updated when iOS sets the time (`tools/sweet-rtc-seed.sh` seeds it) |
+| Modem and WLAN (kernel only) | Modem DSP booted through TrustZone PAS, GLINK/QRTR, the WCN39xx WLAN firmware; scan, WPA2-PSK join, DHCP and ping from a kernel test (`modem=1 wifi=1 wlantest=1`). iOS has no network interface for it yet |
+| ADSP and sensors (kernel only) | ADSP booted through PAS (`adsp=1`); an in-kernel FastRPC listener serves the sensor registry from `persist`, then the SEE sensor hub registers ambient light, proximity, accelerometer, gyroscope and magnetometer; lux reports in the log. Not handed to iOS (no auto-brightness yet) |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 
 ## What does not work (yet)
 
-- **No Wi-Fi, cellular, Bluetooth, audio, camera, sensors, GPS, SEP.** topaz's `TopazModem`
-  targets the SM6225 and is not ported. `bluetoothd` and `fairplayd.H2` relaunch constantly.
+- **No Wi-Fi or sensors in iOS**: both work in the kernel only. iOS needs a network interface plus the
+  IO80211 control interface `wifid` expects, and the sensors as HID services (an attempt for the
+  ambient light sensor crashed backboardd's libEDR once and is parked in `xnu/patches-unused/`).
+- **No cellular, Bluetooth, audio, camera, GPS, SEP.** `bluetoothd` and `fairplayd.H2` relaunch constantly.
 - **No GPU rendering yet**: CoreAnimation draws in software, the GPU copies frames; the isolated user
   client (0109-0111) is the base for a Mesa/GL path.
-- The RTC offset to UTC is a boot-arg (Android keeps it in `persist`); it changes only when the battery is pulled. No auto-brightness (no ambient light sensor).
+- **No CPU frequency control in the kernel** (one fixed vote from the shim).
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
 ## How sunstone differs from topaz
@@ -122,11 +129,14 @@ Needs `aarch64-linux-gnu-gcc`. GPU firmware (`a630_sqe.fw`, `a615_zap.mdt/.b00-.
 from the phone's `vendor` partition.
 
 ```sh
-python3 tools/mkadt.py out/sunstone.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet out/sunstone.adt out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1'
-shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
+tools/gpu-build.sh FWDIR                                  # -> out/gpu-fw.blob (FWDIR: the files above)
+GPUFW=out/gpu-fw.blob tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
 ```
+
+`tools/mkboot.sh` runs `tools/mkadt.py --highmem` (the ADT gets a fresh random seed each time),
+`tools/mkpayload.py` with the everyday boot args below (`CMDLINE=` overrides them, `DROP=` adds a
+`tools/mkdrop.py` archive) and `shim/build.sh`. `vendor_a` is a logical partition in `super`:
+`tools/lpextract.py super.raw vendor_a vendor_a.img`, then copy the firmware out of it.
 
 | Boot-arg | Effect |
 | --- | --- |
@@ -134,7 +144,9 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 | `cpus=8` | All eight cores; `cpus=1` is the safe fallback |
 | `sweetfb_noconsole=1`, `sweetfb_hz=60` | Stop drawing kernel text after the first iOS frame; vsync rate |
 | `sweetgpu=0`, `sweetfb_flip=0` | CPU frame copies / no page flips |
-| `sweetgpu_mhz=400` / `600` | Opt-in fixed GPU clock (0125, awaiting device validation); RPM ACKs and 2D selftest required, default 300 MHz |
+| `sweetgpu_mhz=400` / `600` | Opt-in fixed GPU clock (0125-0134, validated on boot-49/50); RPM ACKs and a 2D selftest required, default 300 MHz |
+| `adsp=1` | Boot the ADSP: GLINK edge, FastRPC listener for the sensors PD, SEE sensor client |
+| `modem=1 wifi=1`, `wlantest=1` | Boot the modem and the WLAN radio; kernel WPA2/DHCP/ping test with credentials from `tools/sweet-wlan-seed.sh` |
 | `sweetbig=0xc0`, `sweetbig_pri=46` | Which cores count as big, and from which priority threads prefer them |
 | `sweetbattery=0`, `sweetdsi=0`, `sweetbl=0` | Static battery; no DSI commands (CPU fade at display off); no backlight service (slider dead) |
 | `sweetrtcoff=N` | Seconds to add to the PMIC RTC counter to get UTC; normally not needed, the kernel keeps it on `userdata` (`tools/sweet-rtc-seed.sh`) |
@@ -146,7 +158,7 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 
 ```sh
 fastboot -S 512M flash userdata ios16-root.simg   # ~5 minutes
-fastboot flash boot_a shim/out/shim-boot.img
+fastboot flash boot_a out/boot.img
 fastboot set_active a
 fastboot reboot
 ```
@@ -160,26 +172,32 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 
 1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~, ~~battery gauge~~: done.
 2. ~~Panel off/on, DCS brightness, brightness slider, RTC~~: done.
-3. **Wi-Fi/modem**: port `TopazModem` to the SM4375 modem subsystem.
-4. **GPU**: optional RPM-backed 400/600 MHz and CP reset after hangs are implemented in 0125,
-   awaiting full build/device validation; default 300 MHz. [GPU validation notes](docs/gpu-recovery-clock.md).
-5. CPU frequency control in the kernel (today a fixed vote from the shim), audio, Bluetooth.
+3. ~~Modem and WLAN in the kernel~~, ~~ADSP sensors in the kernel~~, ~~GPU recovery and 400/600 MHz~~
+   ([GPU notes](docs/gpu-recovery-clock.md)): done.
+4. **Into iOS**: a network interface for the WLAN (`wifid`), the ambient light sensor for auto-brightness.
+5. CPU frequency control in the kernel, audio (the ADSP path is up), Bluetooth.
 
 ## Repository layout
 
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm): boot image v3, CPU/GIC/MMU checks, EPSS vote, Adreno 619 bring-up, payload loader |
-| `xnu/patches/` | XNU patch series applied in order by CI: sweet 0001–0079, topaz build patches 0080–0082, sunstone 0083–0099 |
+| `xnu/patches/` | XNU patch series applied in order by CI: sweet 0001–0079, topaz build patches 0080–0082, sunstone 0083–0136 |
 | `xnu/patches-topaz/` | topaz's SM6225 hardware drivers, kept for reference, not built |
-| `xnu/patches-unused/` | withdrawn patches (0098 GPU user client) |
+| `xnu/patches-unused/` | withdrawn patches (0098 GPU user client, 0137 ambient light HID service) |
+| `tools/mkboot.sh`, `tools/gpu-build.sh` | Kernel -> ADT -> payload -> shim boot image; GPU firmware blob for the shim |
+| `tools/mkbootimg_v3.py`, `tools/lpextract.py` | Boot image v3/v4 packer (used by `shim/build.sh`); logical partitions out of `super` (vendor firmware) |
+| `tools/fwtable_all.py`, `tools/sweet-wlan-seed.sh`, `tools/sweet-rtc-seed.sh` | Modem firmware offset tables; WLAN test credentials and RTC offset on `userdata` |
+| `tests/` | Host tests of the GPU code (`tests/check-gpu.py`) |
+| `docs/` | GPU recovery/clock notes, Wi-Fi hardware survey |
 | `.github/workflows/xnu.yml`, `ios-tools.yml` | Kernel CI build; iOS test programs (`tools/ios`) |
 | `tools/mkadt.py` | Apple Device Tree for sunstone and the iPhone X identity |
 | `tools/mkpayload.py`, `tools/mkdrop.py` | Kernel + ADT + boot-args payload; SWEETDRP file drop archive |
 | `tools/mkiosroot.sh`, `tools/sweet-root-tweaks.py` | Build and adjust the HFS+ iOS root |
 | `tools/sweet-log-pull.sh`, `sweet-log.py`, `sweet-crash.py` | Read the persistent log, symbolicate crashes |
 | `tools/qemu-sweet.py` | Run the payload on QEMU virt for early-boot debugging |
-| `SUNSTONE.md` | Status, patch list, boot flow, open items |
+| `SUNSTONE.md`, `NOTES.md` | Status, patch list, boot flow, TODO and open items; agent handoff (sunstone on top, sweet's log below) |
+| `RECOVERY.md` | Back to stock / recovery runbook for sunstone |
 
 Not in git: partition backups, live device trees, Apple firmware and root images, build trees.
 
@@ -201,8 +219,14 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0102–0106 | DSI0 DCS commands: panel off/on, brightness; command packet in low RAM; `AppleARMBacklight` with `IODisplayParameters` for the slider |
 | 0107 | Cache sync of executable pages above 4 GiB (`pmap_sync_page_attributes_phys` truncated the address) |
 | 0109–0111 | GPU user client with per-process SMMU page tables, validated IBs, CP_PROTECT; IOSurface pieces for the GL renderer |
-| 0115–0116 | Console word filter, busy-service lister, IOKit quiesce; RTC offset stored on UFS |
 | 0108 | RTC from the PMK8350 PMIC, `IORTC` resource (removes a 30 s wait at boot) |
+| 0115–0116 | Console word filter, busy-service lister, IOKit quiesce; RTC offset stored on UFS |
+| 0117–0119 | topaz's `TopazModem` on sunstone: modem PAS boot, SMEM/IPCC/GLINK/QRTR, rmtfs/tftp/pd-mapper, WLAN (WCN39xx) firmware, scan, WPA2 join, DHCP/ARP/ping test; read-only UFS partition reads |
+| 0120 | Battery remaining/full capacity, time remaining |
+| 0121–0124 | ADSP boot through PAS, its SMP2P and GLINK edge, SEE sensor client (QMI/protobuf) |
+| 0125, 0130, 0131, 0133, 0134 | GPU CP recovery, DMA quarantine, optional 400/600 MHz with RPM votes and a 2D selftest, init serialization, kernel-recorded test results |
+| 0126–0129, 0132 | Read-only ext4 (`persist`), GLINK clients, in-kernel FastRPC listener and apps_std file service for the ADSP sensors PD; attach retry |
+| 0135–0136 | Memory-only entries in the boot-image drop, served to the ADSP by apps_std |
 
 ## Key hardware facts (sunstone)
 
@@ -214,6 +238,9 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 - Battery bus qupv3_se7 (`0x4c84000`, GPIO27/28): SM5602 gauge `0x71`, SC8989X charger `0x6a` (IRQ GPIO53, EN GPIO18).
 - DSI0 controller `0x5e94000` (v2.4), PHY `0x5e94400`; panel `xiaomi m17` DSC video 120 Hz, DCS brightness DBV 4..0x7ff MSB first. DMA addresses are 32-bit: packets must sit below 4 GiB.
 - GPU Adreno 619 (`a619_holi`): GPU `0x5900000`, SMMU `0x5940000`, GPU CC `0x5990000`, zap PAS 13.
+- SMEM `0x80900000`, IPCC `0x208000` (doorbells: modem client 2, ADSP client 3), RPM message RAM `0x45f0000`.
+- Modem PAS 4 (carve-out `0x8b800000` + 256 MiB, firmware on `modem_a`), WLAN SMMU stream `0x80`; ADSP PAS 1
+  (`0x86700000` + 40 MiB), FastRPC context bank SMMU stream `0xa3`.
 
 ## Credits
 

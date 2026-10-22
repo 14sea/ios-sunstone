@@ -1,7 +1,9 @@
 # sunstone GPU recovery and fixed clocks (0125, 0130, 0131, 0133, 0134)
 
-2026-10-22. Recovery and 400 MHz have device evidence; the latest init-race and
-test-report fixes (0133/0134) have passed local checks and await a full build/boot.
+2026-10-22. Validated on the phone: boot-47 (300 MHz), boot-49 (400 MHz) and boot-50
+(600 MHz) pass `sweetgpu --wedge --protect` with three attempt-0 recoveries, page flips on
+and a kernel-recorded `PASS` (canary 0xc0ffee45) on boot-49/50; results table in SUNSTONE.md
+("GPU"). The sections below describe the implementation and the tests as written before.
 Latest code: fork `834e51c`, matching XNU `2967215`.
 Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
 Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):

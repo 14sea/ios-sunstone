@@ -1,16 +1,18 @@
-# Working on ios-sweet
+# Working on ios-sunstone
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
-  after each milestone and before stopping. Record commits, CI run IDs, exact
-  build/boot results and unfinished work. Distinguish observations from guesses.
-- Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.
-  Local single-file cross-compiles are useful before spending a CI run.
-- Device bring-up uses temporary `fastboot boot` images. Preserve the Android
-  installation and partition backups. The user approved (2026-10-15) using
-  internal UFS for iOS and said Android may be deleted: the iOS root goes
-  into the existing `userdata` partition (no GPT changes). Keep bootloaders,
-  recovery, modem, persist and the backups intact, and confirm each
-  destructive step with the user before running it.
-- Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+- Read `SUNSTONE.md` (status, patch list, TODO, open items) and the top of `NOTES.md` (the active
+  handoff) before starting. The rest of `NOTES.md` is ios-sweet's history.
+- The user and agents work in parallel: the GPU code (`SweetGPU*`, `shim/gpu.c`) is the user's;
+  modem, WLAN, ADSP and sensors are the agent's. Review and report in the other's area, do not take
+  it over. Take the next free patch number (look at untracked files too) and commit only your own
+  paths.
+- Update the handoff at the top of `NOTES.md` after each milestone and before stopping: commits, CI
+  run IDs, boot numbers, exact results, unfinished work. Distinguish observations from guesses.
+- Kernel builds run on GitHub Actions (`xnu.yml`, dispatched with `gh`); the build is
+  `-Weverything -Werror`. Test code on the host first where possible (see `tests/`).
+- sunstone's ABL has no `fastboot boot`: test images are flashed to `boot_a` (slot a); the Android ROM
+  and its recovery stay in slot b. The phone has no USB while XNU runs; logs come from the slot-b
+  recovery (`RECOVERY.md`). Keep bootloaders, recovery, modem, persist and the backups intact, and
+  confirm each destructive step with the user before running it.
+- Keep device dumps, serial numbers, personal paths and host names, vendor firmware/configs and
+  downloaded Apple artifacts out of git.

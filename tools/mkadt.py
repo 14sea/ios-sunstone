@@ -186,7 +186,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
         # No "wlan" node yet: launchd starts wifid only when it exists, and
-        # sunstone has no Wi-Fi driver (topaz patches 0113-0130 not ported).
+        # the kernel's WLAN (TopazModem, 0117-0119) has no iOS network interface.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),

@@ -20,7 +20,9 @@ Env: XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
 import concurrent.futures as cf, os, re, shlex, subprocess, sys
 from collections import Counter
 
-CI_DXB = '/Users/runner/work/ios-sweet/ios-sweet/dxb'
+# where the GitHub runner checked out darwin-xnu-build: /Users/runner/work/REPO/REPO/dxb
+# (detected from the log in main(); this default is for a fork named ios-sunstone)
+CI_DXB = '/Users/runner/work/ios-sunstone/ios-sunstone/dxb'
 CI_SDK_PLATFORM = re.compile(r'/Applications/Xcode[^ ]*?\.sdk/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
 CLANG = os.path.expanduser('~/swift/usr/bin/clang')
 DROP = {'-c', '-g', '-MD', '-MMD'}
@@ -120,7 +122,11 @@ def run(item, bt, cdirs):
 
 
 def main():
+    global CI_DXB
     log, bt = sys.argv[1], os.path.abspath(sys.argv[2])
+    m = re.search(r'/Users/runner/work/([^/\s]+)/\1/dxb', open(log, errors='replace').read())
+    if m:
+        CI_DXB = m.group(0)
     per_file = '--per-file' in sys.argv
     filters = [a for a in sys.argv[3:] if a != '--per-file']
     cmds = commands(log)
