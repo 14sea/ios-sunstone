@@ -1,5 +1,29 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## sunstone handoff (2026-10-22, after boot-50; read first)
+
+**Sensors (Claude):** the ADSP sensors PD runs from the in-kernel FastRPC listener (0126-0129,
+0132). boot-46/47/49/50: attach accepted on the 2nd try (~505 ms), the PD reads the persist
+registry, ALS (ams TMD3702), proximity, accel, gyro and mag register at ~12 s, lux on-change
+reports follow (470-520 lux indoors). Remaining failures are the 53 vendor json configs
+(stat only) and Huaqin's `pcba_config`.
+
+**GPU (user's code, validated on the device):** boot-47 (300), boot-49 (400), boot-50 (600 MHz):
+six RPM ACKs where voted, 2D selftest, three attempt-0 recoveries under `sweetgpu --wedge
+--protect`, kernel-recorded `PASS` with canary c0ffee45 (boot-49/50), page flips on. Table in
+SUNSTONE.md (GPU). Default stays 300 MHz.
+
+**In flight:** 0135/0136 serve the vendor json from memory-only drop entries. The drop is built
+locally (never committed: it carries vendor files):
+
+    python3 fork/tools/mkdrop.py out/drop-sns51.bin --launchd out/launchd-root.plist \
+        fork/tools/ios/sweetgpu.plist out/ios-tools-49/sweetgpu:/usr/libexec/sweetgpu:755 \
+        --mem-dir fw/vendor/etc/sensors/config:/vendor/etc/sensors/config
+
+It also restores the plain sweetgpu job (boot-47..50 left `--wedge --protect` on the root).
+Every later boot image needs this drop (`DROP=`) or the json fall back to stat-only.
+Next for sensors: lux to CoreBrightness (ALS HID events).
+
 ## sunstone GPU handoff (2026-10-22, boot-48 follow-up)
 
 Code commit: `834e51c` (fork, 0133/0134), matching XNU `2967215`.

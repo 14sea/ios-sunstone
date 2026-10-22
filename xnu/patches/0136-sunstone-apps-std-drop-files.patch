@@ -1,0 +1,114 @@
+diff --git a/iokit/Kernel/arm/SweetAppsStd.cpp b/iokit/Kernel/arm/SweetAppsStd.cpp
+index f708c58..4392bf0 100644
+--- a/iokit/Kernel/arm/SweetAppsStd.cpp
++++ b/iokit/Kernel/arm/SweetAppsStd.cpp
+@@ -8,10 +8,12 @@
+  *   /mnt/vendor/persist/..., /persist/...   the persist partition, ext4 (SweetExt4)
+  *   /vendor/etc/sensors/sns_reg_config      persist /sensors/registry/sns_reg_config (the same
+  *                                           614 bytes as the vendor copy, checked 2026-10-22)
+- *   /vendor/etc/sensors/config/ *.json      stat and readdir only, from a table made from the
+- *                                           stock vendor_a (EROFS+LZ4, not readable here); the
+- *                                           registry records exactly these 53 files at mtime
+- *                                           1230768000, so the PD has no reason to re-parse them
++ *   /vendor/etc/sensors/config/ *.json      readdir and stat from a table made from the stock
++ *                                           vendor_a (EROFS+LZ4, not readable here; the registry
++ *                                           records exactly these 53 files at mtime 1230768000),
++ *                                           contents from the boot image's drop when it carries
++ *                                           them (memory-only entries, bsd/dev/sweet_drop.c)
++ *   any other path the drop keeps in memory  that file, read-only
+  *   /sys/devices/soc0/...                   socinfo from SMEM item 137, as Linux socinfo.c prints it
+  * "/system" in front of "/vendor" is accepted. Nothing can be written.
+  */
+@@ -34,13 +36,16 @@
+ #define S_IFDIR_                0040000u
+ #define S_IFREG_                0100000u
+ 
+-enum { SRC_EXT4 = 1, SRC_CFG, SRC_SOC };
++enum { SRC_EXT4 = 1, SRC_CFG, SRC_SOC, SRC_MEM };
++
++extern "C" bool sweet_drop_find(const char *path, const void **data, uint32_t *size);
+ 
+ struct node {
+ 	int src;
+ 	bool dir;
+ 	uint32_t ino;                                   /* SRC_EXT4 */
+ 	int index;                                      /* SRC_CFG / SRC_SOC file, -1 for their directory */
++	const uint8_t *mem;                             /* SRC_MEM, and SRC_CFG files the drop carries */
+ 	uint64_t size;
+ 	uint32_t mode, mtime;
+ };
+@@ -122,7 +127,7 @@ static struct {
+ 	struct afd fd[FD_MAX];
+ 	uint8_t prim[264];
+ 	uint8_t data[0xA000];
+-	unsigned opens, open_fails, reads, writes_refused;
++	unsigned opens, open_fails, reads, writes_refused, mem_opens;
+ 	uint64_t bytes;
+ } a;
+ 
+@@ -222,6 +227,9 @@ resolve(const char *path, struct node *n)
+ 	if (strncmp(path, "/system/vendor/", 15) == 0) {
+ 		path += 7;
+ 	}
++	const void *mem = NULL;
++	uint32_t mem_size = 0;
++	bool in_drop = sweet_drop_find(path, &mem, &mem_size);
+ 	bool on_persist = starts(path, "/mnt/vendor/persist", &rest) || starts(path, "/persist", &rest);
+ 	if (!on_persist && strcmp(path, "/vendor/etc/sensors/sns_reg_config") == 0) {
+ 		rest = "/sensors/registry/sns_reg_config";
+@@ -257,9 +265,19 @@ resolve(const char *path, struct node *n)
+ 			return AEE_ENOSUCH;
+ 		}
+ 		n->dir = n->index < 0;
+-		n->size = n->dir ? 4096 : cfg_files[n->index].size;
++		n->size = n->dir ? 4096 : in_drop ? mem_size : cfg_files[n->index].size;
+ 		n->mode = n->dir ? S_IFDIR_ | 0755 : S_IFREG_ | 0644;
+ 		n->mtime = CFG_MTIME;
++		n->mem = in_drop ? (const uint8_t *)mem : NULL;
++		return AEE_SUCCESS;
++	}
++	if (in_drop) {
++		n->src = SRC_MEM;
++		n->index = -1;
++		n->size = mem_size;
++		n->mode = S_IFREG_ | 0444;
++		n->mtime = strncmp(path, "/vendor/", 8) == 0 ? CFG_MTIME : 0;
++		n->mem = (const uint8_t *)mem;
+ 		return AEE_SUCCESS;
+ 	}
+ 	if (starts(path, "/sys/devices/soc0", &rest)) {
+@@ -331,8 +349,11 @@ do_open(const char *path, const char *mode, uint32_t *h, bool want_dir)
+ 	if (r == AEE_SUCCESS && n.dir != want_dir) {
+ 		r = AEE_EBADPARM;
+ 	}
+-	if (r == AEE_SUCCESS && n.src == SRC_CFG && !n.dir) {
+-		r = AEE_EUNSUPPORTED;                       /* no EROFS reader: stat only */
++	if (r == AEE_SUCCESS && n.src == SRC_CFG && !n.dir && n.mem == NULL) {
++		r = AEE_EUNSUPPORTED;                       /* not in this boot's drop: stat only */
++	}
++	if (r == AEE_SUCCESS && n.mem != NULL) {
++		a.mem_opens++;
+ 	}
+ 	if (r == AEE_SUCCESS) {
+ 		r = fd_new(&n, h);
+@@ -367,6 +388,9 @@ m_read(const struct sweet_frpc_buf *in, struct sweet_frpc_buf *out)
+ 		if (sweet_ext4_read(&a.persist, d->n.ino, d->pos, a.data, want, &got) != 0) {
+ 			return AEE_EFAILED;
+ 		}
++	} else if (d->n.mem != NULL) {
++		got = d->pos < d->n.size ? (uint32_t)MIN((uint64_t)want, d->n.size - d->pos) : 0;
++		memcpy(a.data, d->n.mem + d->pos, got);
+ 	} else if (d->n.src == SRC_SOC) {
+ 		const char *s = a.soc[d->n.index];
+ 		uint32_t len = (uint32_t)strlen(s);
+@@ -593,8 +617,8 @@ apps_std_summary(void)
+ 	for (unsigned i = 0; i < FD_MAX; i++) {
+ 		open += a.fd[i].used;
+ 	}
+-	LOG("%u opens (%u failed), %u reads, %llu bytes, %u write opens refused, %u descriptors open",
+-	    a.opens, a.open_fails, a.reads, a.bytes, a.writes_refused, open);
++	LOG("%u opens (%u failed, %u from the drop), %u reads, %llu bytes, %u write opens refused, %u descriptors open",
++	    a.opens, a.open_fails, a.mem_opens, a.reads, a.bytes, a.writes_refused, open);
+ }
+ 
+ /* C linkage and external from the declaration in SweetFastRPC.h */

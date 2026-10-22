@@ -5,14 +5,21 @@ mkpayload.py --ramdisk (mkboot.sh: DROP=archive).
 
   mkdrop.py OUT SRC:DEST[:MODE] ...          MODE octal, default 0755
   mkdrop.py OUT --launchd BASE.plist JOB.plist [SRC:DEST[:MODE] ...]
+  ... --mem-dir DIR:DESTDIR                  every file of DIR as DESTDIR/name, "mem"
+
+MODE "mem" (and --mem-dir) marks an entry SWEET_DROP_MEM: the kernel does not
+install it but keeps it for sweet_drop_find(), e.g. the vendor sensor configs
+SweetAppsStd serves to the ADSP. They come from the local fw/ dump: build such
+drops locally, never commit them.
 
 --launchd merges JOB.plist (one launchd job dictionary) into BASE.plist, a
 copy of the root's /System/Library/xpc/launchd.plist (what launchd reads
 when booted with launchd_unsecure_cache=1), and installs the result there.
 """
-import plistlib, struct, sys
+import os, plistlib, struct, sys
 
 ENT = struct.Struct('<128sIIII')
+MEM = 0x80000000                                # bsd/dev/sweet_drop.c SWEET_DROP_MEM
 
 
 def main():
@@ -26,10 +33,22 @@ def main():
         plist['LaunchDaemons'][key] = job
         files.append(('/System/Library/xpc/launchd.plist', 0o644, plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)))
         print(f'launchd.plist: + {job["Label"]} ({len(plist["LaunchDaemons"])} jobs)')
-    for a in args:
+    while args:
+        a = args.pop(0)
+        if a == '--mem-dir':
+            src, dest = args.pop(0).split(':')
+            for name in sorted(os.listdir(src)):
+                if os.path.isfile(os.path.join(src, name)):
+                    files.append((dest.rstrip('/') + '/' + name, MEM | 0o444,
+                                  open(os.path.join(src, name), 'rb').read()))
+            continue
         parts = a.split(':')
-        mode = int(parts[2], 8) if len(parts) > 2 else 0o755
+        if len(parts) > 2 and parts[2] == 'mem':
+            mode = MEM | 0o444
+        else:
+            mode = int(parts[2], 8) if len(parts) > 2 else 0o755
         files.append((parts[1], mode, open(parts[0], 'rb').read()))
+    assert len(files) <= 256, 'bsd/dev/sweet_drop.c takes at most 256 entries'
     hdr = 16 + ENT.size * len(files)
     off = (hdr + 63) & ~63
     table, data = b'', b''

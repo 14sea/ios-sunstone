@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/sweet_drop.c b/bsd/dev/sweet_drop.c
+index 3ae11c3..dd0a9db 100644
+--- a/bsd/dev/sweet_drop.c
++++ b/bsd/dev/sweet_drop.c
+@@ -10,6 +10,12 @@
+  *   count x { char path[128]; u32 mode; u32 size; u32 offset; u32 pad }
+  * offsets from the archive start. Existing files are replaced; the parent
+  * directories must exist. Each file is logged ("SWEET DROP: ...").
++ *
++ * An entry whose mode has SWEET_DROP_MEM set is not written anywhere: it stays in
++ * the archive for the kernel to read with sweet_drop_find() (the RAMDisk range is
++ * registered as /dev/md0 and never freed). First user: the vendor sensor configs
++ * the ADSP reads through FastRPC (iokit/Kernel/arm/SweetAppsStd.cpp), which live
++ * on the EROFS vendor partition the kernel cannot read.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -24,8 +30,13 @@
+ #include <sys/kauth.h>
+ #include <pexpert/device_tree.h>
+ #include <machine/machine_routines.h>
++#include <stdbool.h>
+ 
+ void sweet_drop_files(void);
++bool sweet_drop_find(const char *path, const void **data, uint32_t *size);
++
++#define SWEET_DROP_MEM          0x80000000u     /* kept in memory, not installed */
++#define SWEET_DROP_MAX          256u
+ 
+ struct sweet_drop_ent {
+ 	char     path[128];
+@@ -68,28 +79,42 @@ sweet_drop_one(const char *path, uint32_t mode, const void *data, uint32_t size)
+ 	return err;
+ }
+ 
+-void
+-sweet_drop_files(void)
++/* the archive and its entry table, NULL without a valid one */
++static const uint8_t *
++sweet_drop_archive(uint64_t *total, uint32_t *count)
+ {
+ 	DTEntry map = NULL;
+ 	uintptr_t const *rd = NULL;
+ 	unsigned int len = 0;
++	uint32_t version;
+ 
+ 	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &map) != kSuccess ||
+ 	    SecureDTGetProperty(map, "RAMDisk", (void const **)&rd, &len) != kSuccess ||
+-	    len < 2 * sizeof(uintptr_t) || rd[1] < 12) {
+-		return;
++	    len < 2 * sizeof(uintptr_t) || rd[1] < 16) {
++		return NULL;
+ 	}
+ 	const uint8_t *a = (const uint8_t *)ml_static_ptovirt(rd[0]);
+-	uint64_t total = rd[1];
+ 	if (a == NULL || memcmp(a, "SWEETDRP", 8) != 0) {
+-		return;
++		return NULL;
+ 	}
+-	uint32_t version, count;
+ 	memcpy(&version, a + 8, 4);
+-	memcpy(&count, a + 12, 4);
+-	if (version != 1 || count > 64 || 16 + (uint64_t)count * sizeof(struct sweet_drop_ent) > total) {
+-		printf("SWEET DROP: bad archive (version %u, %u files)\n", version, count);
++	memcpy(count, a + 12, 4);
++	*total = rd[1];
++	if (version != 1 || *count > SWEET_DROP_MAX || 16 + (uint64_t)*count * sizeof(struct sweet_drop_ent) > *total) {
++		printf("SWEET DROP: bad archive (version %u, %u files)\n", version, *count);
++		return NULL;
++	}
++	return a;
++}
++
++void
++sweet_drop_files(void)
++{
++	uint64_t total = 0;
++	uint32_t count = 0, kept = 0;
++	const uint8_t *a = sweet_drop_archive(&total, &count);
++
++	if (a == NULL) {
+ 		return;
+ 	}
+ 	const struct sweet_drop_ent *e = (const struct sweet_drop_ent *)(a + 16);
+@@ -101,8 +126,38 @@ sweet_drop_files(void)
+ 			printf("SWEET DROP: %s: outside the archive\n", path);
+ 			continue;
+ 		}
++		if (e[i].mode & SWEET_DROP_MEM) {
++			kept++;
++			continue;
++		}
+ 		int err = sweet_drop_one(path, e[i].mode, a + e[i].offset, e[i].size);
+ 		printf("SWEET DROP: %s (%u bytes, mode %o) -> %d\n", path, e[i].size, e[i].mode, err);
+ 	}
++	if (kept != 0) {
++		printf("SWEET DROP: %u files kept in memory for the kernel\n", kept);
++	}
++}
++
++/* a SWEET_DROP_MEM entry by its full path; the data stays valid for the whole boot */
++bool
++sweet_drop_find(const char *path, const void **data, uint32_t *size)
++{
++	uint64_t total = 0;
++	uint32_t count = 0;
++	const uint8_t *a = sweet_drop_archive(&total, &count);
++
++	if (a == NULL) {
++		return false;
++	}
++	const struct sweet_drop_ent *e = (const struct sweet_drop_ent *)(a + 16);
++	for (uint32_t i = 0; i < count; i++) {
++		if ((e[i].mode & SWEET_DROP_MEM) != 0 && (uint64_t)e[i].offset + e[i].size <= total &&
++		    strncmp(e[i].path, path, sizeof(e[i].path)) == 0) {
++			*data = a + e[i].offset;
++			*size = e[i].size;
++			return true;
++		}
++	}
++	return false;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

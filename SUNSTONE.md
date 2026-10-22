@@ -184,11 +184,25 @@ last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log
   third consecutive workload failure (restart probes do not reset the budget); one conditional SCM
   zap-resume retry after a failed restart fence. **0131** restores unconditional SET_SECURE_MODE 0
   on attempt 0 with no SCM call (Linux a6xx); SCM remains fallback-only. Host tests and real-header
-  arm64 compile pass. **Device evidence:** boot-47 at 300 MHz passes all sweetgpu tests;
-  boot-48 at 400 MHz has six RPM ACKs, 2D selftest success, three attempt-0 recoveries and
-  continuing GPU copies. Missing stdout leaves the final 400 MHz canary/PASS unproven.
-  **0133/0134 (local checks pass, boot pending)** fix the init race that disabled page flips
-  during RPM negotiation and add a kernel-read canary/result record plus IOLog summary.
+  arm64 compile pass. **0133** serializes the one-time GPU init (a separate lock, not `gpu_lock`),
+  **0134** records the sweetgpu result in the kernel (selector 8 reads the BO canary; params 8-13,
+  `SWEET GPU: sweetgpu result ...` IOLog).
+
+  **Device validation (2026-10-22, `sweetgpu --wedge --protect`, unmapped-IOVA test included):**
+
+  | Boot | Kernel (CI) | Clock | RPM | Recoveries | Result | Page flips | Avg frame (1000) | Battery |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 47 (`../out/boot47-log30.txt`) | 39744314474 (0125-0132) | 300 | - | 3/3 attempt 0 | `SWEETGPU: PASS` (stdout) | on | 2.70 ms | 24-26 C |
+  | 48 (`../out/boot48-log31.txt`) | same | 400 | 6/6 ack, GX 0xc0 | 3/3 attempt 0 | stdout lost | **off** (init race) | 2.68 ms | - |
+  | 49 (`../out/boot49-log32.txt`) | 39748355088 (+0133/0134) | 400 | 6/6 ack, GX 0xc0 | 3/3 attempt 0 | kernel `PASS`, canary c0ffee45 | on | 2.69 ms | 26-28 C |
+  | 50 (`../out/boot50-log33.txt`) | same | 600 | 6/6 ack, GX 0x100 | 3/3 attempt 0 | kernel `PASS`, canary c0ffee45 | on | 2.49 ms | 27-29 C |
+
+  Every recovery restarted at attempt 0 (SET_SECURE_MODE 0, no SCM zap resume); no `gpu_off`, no
+  quarantined VM; wedge leaves rbbm 0x800005, the CP_PROTECT read of 0x800 sets prot 0x700800. The
+  RPM link takeover works after the bootloader (AP indices reset as Linux does). Not yet shown:
+  the real GPU clock (CORE_MHZ is RCG readback plus selftest), long runs at 600 MHz (no thermal
+  governor; battery temperature is not the GPU's), DDR bandwidth votes. The 2D copy load gains
+  only ~8% at 600 MHz. Default stays 300 MHz; `sweetgpu_mhz` stays opt-in.
   Details and test procedure: [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md).
   0111 adds the topaz 0131-0139 IOSurface pieces (values, bulk attachments, client memory wrapping,
   detach/release protocol) and the empty `IOAcceleratorES`.
@@ -245,6 +259,8 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0132 | FastRPC: retry the sensors PD attach every 500 ms (40 tries), one root PD attach probe after 5 failures (boot-46: ALS, proximity, accel, gyro, mag up) |
 | 0133 | Serialize complete GPU initialization so framebuffer waits through RPM and does not permanently disable flips; host regression/compile pass, boot pending |
 | 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; local checks pass, boot pending |
+| 0135 | drop: memory-only entries (`SWEET_DROP_MEM`, `mkdrop.py ... :mem` / `--mem-dir`), `sweet_drop_find()`; up to 256 entries |
+| 0136 | apps_std: files the drop keeps in memory, first the 53 vendor sensor json configs (EROFS vendor, never committed) |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
