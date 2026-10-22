@@ -189,6 +189,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0120 | battery: RMC (0x84) as AppleRawCurrentCapacity, BAT_CAP as Max/NominalChargeCapacity, TimeRemaining/AvgTimeToEmpty/Full, log on charger changes |
 | 0121 | generic PAS loader with qcom_mdt_load relocation; ADSP boot (`adsp=1`, PAS 1, adsp@86700000) |
 | 0122 | ADSP: our outbound SMP2P item 429 first (READY comes only then), SMEM/SMP2P dumps |
+| 0123 | GLINK/QRTR state per edge (`struct glink_edge`), replies routed by QRTR node; ADSP edge (IPCC client 3) served after READY, its channels, services and unserved requests logged |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
