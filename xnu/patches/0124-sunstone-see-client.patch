@@ -1,0 +1,517 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d83d2ed..2f20459 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -479,6 +479,7 @@ struct glink_edge;
+ static void svc_announce(struct glink_edge *e);
+ static void svc_summary(void);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
++static void sns_arrive(uint32_t node, uint32_t port);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+ static void radio_poll(unsigned ms);
+@@ -533,6 +534,7 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
+ #define QRTR_TYPE_DEL_CLIENT 6
+ #define QRTR_TYPE_RESUME_TX 7
+ #define QMI_SVC_WLFW        0x45
++#define QMI_SVC_SNS         400                 /* ADSP sensor client service (SEE) */
+ 
+ struct glink_msg { uint16_t cmd, p1; uint32_t p2; } __attribute__((packed));
+ struct glink_data_hdr { struct glink_msg m; uint32_t chunk, left; } __attribute__((packed));
+@@ -806,6 +808,11 @@ svc_name(uint32_t svc)
+ 	case 0x03: return "nas";
+ 	case 0x0B: return "uim";
+ 	case 0x1A: return "wda";
++	case 0x0F: return "test";
++	case 0x18: return "tmd";
++	case 0x33: return "coresight";
++	case 0x301: return "slimbus";
++	case QMI_SVC_SNS: return "sensors";
+ 	default:   return "";
+ 	}
+ }
+@@ -852,6 +859,9 @@ qrtr_rx(struct glink_edge *e, const uint8_t *p, uint32_t len)
+ 		if (c->a == QMI_SVC_WLFW) {
+ 			LOG("t=%u ms: %s: *** WLFW service 0x45 up: inst %x node %u port %x ***", g_ms, e->name, c->b, c->c, c->d);
+ 			wlfw_arrive(c->c, c->d);
++		} else if (c->a == QMI_SVC_SNS) {
++			LOG("t=%u ms: %s: service %x:%x port %x %s", g_ms, e->name, c->a, c->b, c->d, svc_name(c->a));
++			sns_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: %s: service %x:%x port %x %s", g_ms, e->name, c->a, c->b, c->d, svc_name(c->a));
+ 		}
+@@ -6093,6 +6103,450 @@ svc_announce(struct glink_edge *e)
+ 	LOG("t=%u ms: %s: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms, e->name);
+ }
+ 
++/* ---------------------------------------------------------------- sensors: SEE client (ADSP) */
++
++/*
++ * The ADSP's sensor framework (SEE) serves QMI service 400, sns_client_api_v01: request 0x20 carries
++ * a protobuf sns_client_request_msg in TLV 1 (u16 length + bytes); reports come back as indications
++ * 0x21 (0x22 jumbo) with a protobuf sns_client_event_msg in TLV 2. Messages as in Qualcomm's
++ * sns_client.proto / sns_suid.proto / sns_std*.proto (the ones libssc uses). Step 1: SUID lookups for
++ * a few data types, attributes of the ambient light sensor, on-change enable, lux in the log.
++ */
++#define PORT_SNS            0x4005              /* our QMI client port towards the sensor service */
++#define SNS_REQ             0x20
++#define SNS_IND             0x21
++#define SNS_IND_JUMBO       0x22
++#define SNS_MSG_ATTR_REQ    1
++#define SNS_MSG_ATTR_EVENT  128
++#define SNS_MSG_SUID_REQ    512
++#define SNS_MSG_ON_CHANGE   514
++#define SNS_MSG_SUID_EVENT  768
++#define SNS_MSG_SENSOR_EVENT 1025
++#define SNS_PROC_APSS       1
++#define SNS_NO_WAKEUP       1
++
++static uint32_t sns_node, sns_port;
++static uint16_t sns_txn = 1;
++static uint64_t sns_als[2];
++static bool sns_als_found;
++static unsigned sns_events, sns_inds, sns_resps, sns_als_events, sns_types;
++static volatile int64_t sns_lux_milli = -1;     /* last lux x 1000, -1: none yet */
++static const uint64_t sns_lookup_suid[2] = { 0xababababababababull, 0xababababababababull };
++
++/* protobuf writer / reader, just what these messages need */
++struct pbw { uint8_t *b; uint32_t n, max; };
++struct pbr { const uint8_t *p, *end; };
++
++static void
++pb_raw(struct pbw *w, const void *p, uint32_t n)
++{
++	if (w->n + n <= w->max) {
++		memcpy(w->b + w->n, p, n);
++	}
++	w->n += n;                                  /* past max: the caller sees the overflow */
++}
++static void
++pb_varint(struct pbw *w, uint64_t v)
++{
++	do {
++		uint8_t c = (uint8_t)(v & 0x7f);
++		v >>= 7;
++		if (v != 0) {
++			c |= 0x80;
++		}
++		pb_raw(w, &c, 1);
++	} while (v != 0);
++}
++static void pb_key(struct pbw *w, uint32_t field, uint32_t wt) { pb_varint(w, (uint64_t)field << 3 | wt); }
++static void pb_u64(struct pbw *w, uint32_t field, uint64_t v) { pb_key(w, field, 1); pb_raw(w, &v, 8); }
++static void pb_u32(struct pbw *w, uint32_t field, uint32_t v) { pb_key(w, field, 5); pb_raw(w, &v, 4); }
++static void pb_vint(struct pbw *w, uint32_t field, uint64_t v) { pb_key(w, field, 0); pb_varint(w, v); }
++static void
++pb_bytes(struct pbw *w, uint32_t field, const void *p, uint32_t n)
++{
++	pb_key(w, field, 2);
++	pb_varint(w, n);
++	pb_raw(w, p, n);
++}
++
++static bool
++pb_rvarint(struct pbr *r, uint64_t *v)
++{
++	*v = 0;
++	for (unsigned s = 0; s < 64 && r->p < r->end; s += 7) {
++		uint8_t c = *r->p++;
++		*v |= (uint64_t)(c & 0x7f) << s;
++		if ((c & 0x80) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* next field: number and wire type; varint/fixed values in *v, length-delimited ones in *d, *dl */
++static bool
++pb_next(struct pbr *r, uint32_t *field, uint32_t *wt, uint64_t *v, const uint8_t **d, uint32_t *dl)
++{
++	uint64_t k, l;
++	uint32_t x;
++	if (r->p >= r->end || !pb_rvarint(r, &k)) {
++		return false;
++	}
++	*field = (uint32_t)(k >> 3);
++	*wt = (uint32_t)(k & 7);
++	*v = 0;
++	*d = NULL;
++	*dl = 0;
++	switch (*wt) {
++	case 0:
++		return pb_rvarint(r, v);
++	case 1:
++		if (r->end - r->p < 8) {
++			return false;
++		}
++		memcpy(v, r->p, 8);
++		r->p += 8;
++		return true;
++	case 5:
++		if (r->end - r->p < 4) {
++			return false;
++		}
++		memcpy(&x, r->p, 4);
++		*v = x;
++		r->p += 4;
++		return true;
++	case 2:
++		if (!pb_rvarint(r, &l) || l > (uint64_t)(r->end - r->p)) {
++			return false;
++		}
++		*d = r->p;
++		*dl = (uint32_t)l;
++		r->p += l;
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* sns_std_suid { fixed64 suid_low = 1; fixed64 suid_high = 2; } */
++static void
++pb_suid(const uint8_t *d, uint32_t n, uint64_t out[2])
++{
++	struct pbr r = { d, d + n };
++	uint32_t f, wt, dl;
++	uint64_t v;
++	const uint8_t *x;
++	while (pb_next(&r, &f, &wt, &v, &x, &dl)) {
++		if ((f == 1 || f == 2) && wt == 1) {
++			out[f - 1] = v;
++		}
++	}
++}
++
++/* IEEE single -> value x 1000 without the FPU (the kernel does not use it) */
++static int64_t
++f2milli(uint32_t f)
++{
++	uint32_t be = (f >> 23) & 0xff;
++	if (be == 0) {
++		return 0;
++	}
++	int sh = (int)be - 127 - 23;
++	uint64_t v = ((uint64_t)((f & 0x7fffff) | 0x800000)) * 1000;
++	if (sh >= 0) {
++		v = sh > 20 ? (1ull << 62) : v << sh;
++	} else {
++		v = -sh >= 63 ? 0 : v >> -sh;
++	}
++	return (f >> 31) ? -(int64_t)v : (int64_t)v;
++}
++
++static const char *
++milli_str(int64_t m, char *buf, size_t n)
++{
++	uint64_t a = m < 0 ? (uint64_t)-m : (uint64_t)m;
++	snprintf(buf, n, "%s%llu.%03llu", m < 0 ? "-" : "", a / 1000, a % 1000);
++	return buf;
++}
++
++/* one sns_client_request_msg { suid = 1; fixed32 msg_id = 2; susp_config = 3; sns_std_request = 4 } */
++static void
++sns_send(const uint64_t suid[2], uint32_t msg_id, const void *payload, uint32_t plen)
++{
++	uint8_t s[24], susp[8], std[300], req[400], m[12 + 400];
++	struct pbw ws = { s, 0, sizeof(s) }, wp = { susp, 0, sizeof(susp) }, wr = { std, 0, sizeof(std) }, wq = { req, 0, sizeof(req) };
++
++	pb_u64(&ws, 1, suid[0]);
++	pb_u64(&ws, 2, suid[1]);
++	pb_vint(&wp, 1, SNS_PROC_APSS);             /* client_proc_type */
++	pb_vint(&wp, 2, SNS_NO_WAKEUP);             /* delivery_type */
++	if (plen != 0) {
++		pb_bytes(&wr, 2, payload, plen);        /* sns_std_request.payload */
++	}
++	if (wr.n > wr.max) {
++		LOG("sns: request %u too big", msg_id);
++		return;
++	}
++	pb_bytes(&wq, 1, s, ws.n);
++	pb_u32(&wq, 2, msg_id);
++	pb_bytes(&wq, 3, susp, wp.n);
++	pb_bytes(&wq, 4, std, wr.n);
++	if (wq.n > wq.max) {
++		LOG("sns: request %u too big", msg_id);
++		return;
++	}
++	uint16_t txn = sns_txn++, mid = SNS_REQ, tl = (uint16_t)(2 + wq.n), pl = (uint16_t)wq.n, ml = (uint16_t)(3 + tl);
++	m[0] = QMI_REQ;
++	memcpy(m + 1, &txn, 2);
++	memcpy(m + 3, &mid, 2);
++	memcpy(m + 5, &ml, 2);
++	m[7] = 0x01;                                /* TLV 1: payload, u16 count + bytes */
++	memcpy(m + 8, &tl, 2);
++	memcpy(m + 10, &pl, 2);
++	memcpy(m + 12, req, wq.n);
++	qrtr_send(QRTR_TYPE_DATA, PORT_SNS, sns_node, sns_port, m, 12 + wq.n);
++}
++
++/* sns_suid_req { string data_type = 1; bool register_updates = 2; bool default_only = 3; } */
++static void
++sns_lookup(const char *type)
++{
++	uint8_t p[64];
++	struct pbw w = { p, 0, sizeof(p) };
++	pb_bytes(&w, 1, type, (uint32_t)strlen(type));
++	pb_vint(&w, 2, 1);
++	pb_vint(&w, 3, 1);
++	sns_send(sns_lookup_suid, SNS_MSG_SUID_REQ, p, w.n);
++}
++
++static void
++sns_arrive(uint32_t node, uint32_t port)
++{
++	static const char *types[] = { "ambient_light", "proximity", "accel", "gyro", "mag", "pressure" };
++	if (sns_node == node && sns_port == port) {
++		return;
++	}
++	sns_node = node;
++	sns_port = port;
++	LOG("t=%u ms: sns: sensor service 400 on node %u port %x: SUID lookups", g_ms, node, port);
++	for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
++		sns_lookup(types[i]);
++	}
++}
++
++/* sns_suid_event { string data_type = 1; repeated sns_std_suid suid = 2; } */
++static void
++sns_suid_event(const uint8_t *p, uint32_t n)
++{
++	struct pbr r = { p, p + n };
++	uint32_t f, wt, dl, cnt = 0;
++	uint64_t v, first[2] = {};
++	const uint8_t *d;
++	char type[33] = {};
++
++	while (pb_next(&r, &f, &wt, &v, &d, &dl)) {
++		if (f == 1 && wt == 2) {
++			memcpy(type, d, MIN(dl, 32u));
++		} else if (f == 2 && wt == 2) {
++			uint64_t s[2] = {};
++			pb_suid(d, dl, s);
++			if (cnt++ == 0) {
++				first[0] = s[0];
++				first[1] = s[1];
++			}
++			LOG("t=%u ms: sns:   \"%s\" suid %016llx%016llx", g_ms, type, s[1], s[0]);
++		}
++	}
++	sns_types++;
++	LOG("t=%u ms: sns: \"%s\": %u sensor(s)", g_ms, type, cnt);
++	if (strcmp(type, "ambient_light") == 0 && cnt != 0 && !sns_als_found) {
++		sns_als[0] = first[0];
++		sns_als[1] = first[1];
++		sns_als_found = true;
++		sns_send(sns_als, SNS_MSG_ATTR_REQ, NULL, 0);
++		sns_send(sns_als, SNS_MSG_ON_CHANGE, NULL, 0);
++		LOG("t=%u ms: sns: ambient light: attributes asked, on-change enable sent", g_ms);
++	}
++}
++
++/*
++ * sns_std_attr_event { repeated sns_std_attr attributes = 1; } sns_std_attr { int32 attr_id = 1;
++ * sns_std_attr_value value = 2; } value { repeated data values = 1; } data { oneof subtype = 1,
++ * string str = 2, float flt = 3, sint64 sint = 4, bool boolean = 5 }: the first value of each.
++ */
++static void
++sns_attr_event(const uint8_t *p, uint32_t n)
++{
++	struct pbr r = { p, p + n };
++	uint32_t f, wt, dl;
++	uint64_t v;
++	const uint8_t *d;
++	unsigned count = 0;
++
++	while (pb_next(&r, &f, &wt, &v, &d, &dl) && count < 40) {
++		if (f != 1 || wt != 2) {
++			continue;
++		}
++		struct pbr a = { d, d + dl };
++		uint32_t af, awt, adl, id = ~0u, nvals = 0;
++		uint64_t av;
++		const uint8_t *ad;
++		char txt[64] = "(none)";
++		while (pb_next(&a, &af, &awt, &av, &ad, &adl)) {
++			if (af == 1 && awt == 0) {
++				id = (uint32_t)av;
++			} else if (af == 2 && awt == 2) {
++				struct pbr vl = { ad, ad + adl };
++				uint32_t vf, vwt, vdl;
++				uint64_t vv;
++				const uint8_t *vd;
++				while (pb_next(&vl, &vf, &vwt, &vv, &vd, &vdl)) {
++					if (vf != 1 || vwt != 2 || nvals++ != 0) {
++						continue;
++					}
++					struct pbr x = { vd, vd + vdl };
++					uint32_t xf, xwt, xdl;
++					uint64_t xv;
++					const uint8_t *xd;
++					char num[32];
++					while (pb_next(&x, &xf, &xwt, &xv, &xd, &xdl)) {
++						if (xf == 2 && xwt == 2) {
++							snprintf(txt, sizeof(txt), "\"%.*s\"", (int)MIN(xdl, 56u), xd);
++						} else if (xf == 3 && xwt == 5) {
++							snprintf(txt, sizeof(txt), "%s", milli_str(f2milli((uint32_t)xv), num, sizeof(num)));
++						} else if (xf == 4 && xwt == 0) {
++							int64_t sv = (int64_t)(xv >> 1) ^ -(int64_t)(xv & 1);
++							snprintf(txt, sizeof(txt), "%lld", sv);
++						} else if (xf == 5 && xwt == 0) {
++							snprintf(txt, sizeof(txt), "%s", xv ? "true" : "false");
++						} else if (xf == 1) {
++							snprintf(txt, sizeof(txt), "(nested)");
++						}
++					}
++				}
++			}
++		}
++		LOG("t=%u ms: sns:   attr %u = %s%s", g_ms, id, txt, nvals > 1 ? " ..." : "");
++		count++;
++	}
++	LOG("t=%u ms: sns: ambient light: %u attributes", g_ms, count);
++}
++
++/* sns_std_sensor_event { repeated float data = 1; sns_std_sensor_sample_status status = 2; } */
++static void
++sns_sensor_event(const uint8_t *p, uint32_t n)
++{
++	struct pbr r = { p, p + n };
++	uint32_t f, wt, dl, nd = 0, data[4] = {};
++	uint64_t v, status = 0;
++	const uint8_t *d;
++	char a[32], b[32];
++
++	while (pb_next(&r, &f, &wt, &v, &d, &dl)) {
++		if (f == 1 && wt == 5 && nd < 4) {
++			data[nd++] = (uint32_t)v;
++		} else if (f == 1 && wt == 2) {         /* packed */
++			for (uint32_t o = 0; o + 4 <= dl && nd < 4; o += 4) {
++				memcpy(&data[nd++], d + o, 4);
++			}
++		} else if (f == 2 && wt == 0) {
++			status = v;
++		}
++	}
++	if (nd == 0) {
++		return;
++	}
++	sns_lux_milli = f2milli(data[0]);
++	sns_als_events++;
++	if (sns_als_events <= 20 || sns_als_events % 50 == 0) {
++		LOG("t=%u ms: sns: *** lux %s *** (data[1] %s, %u values, status %llu, event %u)", g_ms,
++		    milli_str(sns_lux_milli, a, sizeof(a)), milli_str(nd > 1 ? f2milli(data[1]) : 0, b, sizeof(b)), nd, status, sns_als_events);
++	}
++}
++
++static void
++sns_event(const uint64_t suid[2], uint32_t id, const uint8_t *p, uint32_t n)
++{
++	sns_events++;
++	if (id == SNS_MSG_SUID_EVENT) {
++		sns_suid_event(p, n);
++	} else if (id == SNS_MSG_ATTR_EVENT) {
++		sns_attr_event(p, n);
++	} else if (id == SNS_MSG_SENSOR_EVENT && suid[0] == sns_als[0] && suid[1] == sns_als[1]) {
++		sns_sensor_event(p, n);
++	} else if (sns_events < 64) {
++		LOG("t=%u ms: sns: event %u from %016llx%016llx, %u bytes", g_ms, id, suid[1], suid[0], n);
++	}
++}
++
++/* sns_client_event_msg { sns_std_suid suid = 1; repeated event events = 2 { fixed32 msg_id = 1;
++ * fixed64 timestamp = 2; bytes payload = 3; } } */
++static void
++sns_event_msg(const uint8_t *p, uint32_t n)
++{
++	struct pbr r = { p, p + n };
++	uint32_t f, wt, dl;
++	uint64_t v, suid[2] = {};
++	const uint8_t *d;
++
++	while (pb_next(&r, &f, &wt, &v, &d, &dl)) {
++		if (f == 1 && wt == 2) {
++			pb_suid(d, dl, suid);
++		} else if (f == 2 && wt == 2) {
++			struct pbr ev = { d, d + dl };
++			uint32_t ef, ewt, edl, id = 0, pn = 0;
++			uint64_t evv;
++			const uint8_t *ed, *pp = NULL;
++			while (pb_next(&ev, &ef, &ewt, &evv, &ed, &edl)) {
++				if (ef == 1) {
++					id = (uint32_t)evv;
++				} else if (ef == 3 && ewt == 2) {
++					pp = ed;
++					pn = edl;
++				}
++			}
++			sns_event(suid, id, pp, pn);
++		}
++	}
++}
++
++static void
++sns_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg, tl = 0;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	if (d[0] == QMI_RESP) {
++		uint16_t err;
++		bool ok = w_result(d, len, &err);
++		const uint8_t *t = qm_find(d, len, 0x10, &tl);
++		uint64_t id = 0;
++		uint32_t res = 0;
++		if (t != NULL && tl >= 8) {
++			memcpy(&id, t, 8);
++		}
++		t = qm_find(d, len, 0x11, &tl);
++		if (t != NULL && tl >= 4) {
++			memcpy(&res, t, 4);
++		}
++		if (sns_resps++ < 16 || !ok) {
++			LOG("t=%u ms: sns: response %x %s (error %u), client %llx result %u", g_ms, msg, ok ? "ok" : "FAILED", err, id, res);
++		}
++		return;
++	}
++	const uint8_t *pl = qm_find(d, len, 0x02, &tl);
++	if (d[0] != QMI_IND || (msg != SNS_IND && msg != SNS_IND_JUMBO) || pl == NULL || tl < 2) {
++		LOG("t=%u ms: sns: unexpected type %u msg %x, %u bytes", g_ms, d[0], msg, len);
++		return;
++	}
++	uint16_t n;
++	memcpy(&n, pl, 2);
++	sns_inds++;
++	sns_event_msg(pl + 2, MIN((uint32_t)n, (uint32_t)tl - 2));
++}
++
+ static bool
+ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
+ {
+@@ -6106,6 +6560,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		wlfw_rx(data, len);
+ 		return true;
+ 	}
++	if (dst_port == PORT_SNS) {
++		sns_rx(data, len);
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -6132,6 +6590,12 @@ svc_summary(void)
+ 	LOG("WLFW: %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
+ 	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
+ 	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
++	if (sns_node != 0 || sns_port != 0) {
++		char lux[32];
++		LOG("sensors: %u indications, %u events, %u lookups answered; ambient light %s, %u reports, last lux %s",
++		    sns_inds, sns_events, sns_types, sns_als_found ? "found" : "not found", sns_als_events,
++		    sns_lux_milli < 0 ? "none" : milli_str(sns_lux_milli, lux, sizeof(lux)));
++	}
+ }
+ 
+ /*
