@@ -1,5 +1,24 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## sunstone GPU handoff (2026-10-22)
+
+Local code commit: `a86ccf0` (fork); matching XNU source commit: `cfbc46f`.
+No push, new CI dispatch, device boot or flash in this session.
+
+Patch 0125 implements CP recovery (halt/drain before SMMU bypass, full RBBM reset,
+ring/protection/2D restore, DMA quarantine on failed drain) and opt-in
+`sweetgpu_mhz=400|600` with exact RPM ACKs for sunstone's separate GX `rwgx:0`
+plus MX/CX, RCG readback and 2D selftest. Default remains 300 MHz. The CP_PROTECT
+“three ranges” TODO was stale: all 32 entries already match Linux a630.
+
+Host UBSan checks and full GPU patch-series reconstruction passed. Changed
+SweetGPU.cpp and SweetFramebuffer.cpp compiled to arm64 Mach-O against the real headers/build files of
+CI 39733814183 (artifact 12405779477); no new full kernel build or device boot.
+The updated `tools/ios/sweetgpu` has `--wedge`/`--protect` and post-failure checks.
+See [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md) for implementation,
+validation limits and the exact next device tests. No flashing performed.
+Unrelated TopazModem.cpp work in work/xnu was left intact.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

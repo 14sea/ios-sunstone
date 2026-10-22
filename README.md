@@ -134,6 +134,7 @@ shim/build.sh out/payload.bin [out/gpu-fw.blob]     # -> shim/out/shim-boot.img
 | `cpus=8` | All eight cores; `cpus=1` is the safe fallback |
 | `sweetfb_noconsole=1`, `sweetfb_hz=60` | Stop drawing kernel text after the first iOS frame; vsync rate |
 | `sweetgpu=0`, `sweetfb_flip=0` | CPU frame copies / no page flips |
+| `sweetgpu_mhz=400` / `600` | Opt-in fixed GPU clock (0125, awaiting device validation); RPM ACKs and 2D selftest required, default 300 MHz |
 | `sweetbig=0xc0`, `sweetbig_pri=46` | Which cores count as big, and from which priority threads prefer them |
 | `sweetbattery=0`, `sweetdsi=0`, `sweetbl=0` | Static battery; no DSI commands (CPU fade at display off); no backlight service (slider dead) |
 | `sweetrtcoff=N` | Seconds to add to the PMIC RTC counter to get UTC; normally not needed, the kernel keeps it on `userdata` (`tools/sweet-rtc-seed.sh`) |
@@ -160,7 +161,8 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 1. ~~Boot, 8 cores, UFS root~~, ~~display~~, ~~touch and keys~~, ~~GPU 2D presents~~, ~~battery gauge~~: done.
 2. ~~Panel off/on, DCS brightness, brightness slider, RTC~~: done.
 3. **Wi-Fi/modem**: port `TopazModem` to the SM4375 modem subsystem.
-4. **GPU** clocks above 300 MHz (GX rail vote) and a safe path to GPU rendering.
+4. **GPU**: optional RPM-backed 400/600 MHz and CP reset after hangs are implemented in 0125,
+   awaiting full build/device validation; default 300 MHz. [GPU validation notes](docs/gpu-recovery-clock.md).
 5. CPU frequency control in the kernel (today a fixed vote from the shim), audio, Bluetooth.
 
 ## Repository layout

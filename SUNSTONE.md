@@ -160,7 +160,12 @@ last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log
   `Submit valid IB -> 0x0`, `word@+0x100=0xc0ffee42` (CP_MEM_WRITE through the client page table),
   privileged opcode rejected (0xe00002e2), unmapped IOVA -> `SMMU fault (asid 2): fsr 0x402 far
   0x10200000 syn 0x12` and kIOReturnVMError while display copies kept running (26 stats lines after).
-  Open: CP_PROTECT table vs the Linux catalog a630 list (3 ranges), CP reset after a wedge, GPU clock.
+  **0125 (2026-10-22, local validation only)**: all 32 CP_PROTECT entries already match Linux a630;
+  the “3 ranges” note was stale. CP recovery now halts/drains before bypass, resets and rebuilds the
+  ring/protection/2D state, and pins a VM/BOs if the bus cannot drain. Optional `sweetgpu_mhz=400|600`
+  requires MX/CX/GX RPM ACKs and a 2D selftest; default remains 300 MHz. Patch-series/host tests and
+  a real-header arm64 translation-unit compile passed; full kernel link and device tests pending.
+  Details and test procedure: [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md).
   0111 adds the topaz 0131-0139 IOSurface pieces (values, bulk attachments, client memory wrapping,
   detach/release protocol) and the empty `IOAcceleratorES`.
 
@@ -206,6 +211,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0122 | ADSP: our outbound SMP2P item 429 first (READY comes only then), SMEM/SMP2P dumps |
 | 0123 | GLINK/QRTR state per edge (`struct glink_edge`), replies routed by QRTR node; ADSP edge (IPCC client 3) served after READY, its channels, services and unserved requests logged |
 | 0124 | SEE sensor client on the ADSP (QMI 400): SUID lookups, ambient light attributes and on-change enable, lux in the log |
+| 0125 | GPU CP reset after wedge/fault (drain before bypass), DMA quarantine, optional RPM-backed 400/600 MHz with 2D selftest; local checks pass, device pending |
 | 0126 | read-only ext4 on a UFS partition (`SweetExt4`: extents, linear directories), first user the persist sensor registry |
 | 0127 | GLINK channels per edge; DSP clients (`TopazDSP.h`): a driver gets its own channel on the ADSP edge, plus SMEM items and SMMU identity |
 | 0128 | FastRPC to the ADSP sensors PD (`SweetFastRPC`): attach, default listener, `adsp_listener_next2` loop, reverse calls (remotectl, apps_mem); payloads in 0xda000000 via SMMU stream 0xa3 |
@@ -255,13 +261,13 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio, WPA2 join and IP data path done (0117-0119, boot-39). Next: the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
-| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. Left: CP_PROTECT table = catalog a630, CP reset after a wedge |
+| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111, boot-36 passes the five sweetgpu tests. CP_PROTECT matches all 32 catalog entries; 0125 implements reset, device validation pending |
 | 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (topaz 0120) | C | [~] | filter done (0115); topaz 0120 touches SweetFramebuffer.cpp (user's area) |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |
 | 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [x] | 0111 |
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
-| 6 | GPU clock above 300 MHz (GX rail vote, topaz-woa `TopazRpm`) | - | [ ] | after item 2 |
+| 6 | GPU clock above 300 MHz (GX rail vote) | U | [~] | 0125: opt-in 400/600 MHz, RPM ACKs + 2D selftest; default 300, full build/device pending |
 | 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] | survey 2026-10-21: the ALS (ams TMD2725/TMD2755 at 0x39, SSC I2C bus 2, IRQ 98 per the vendor/persist sensor registry) hangs off the sensor hub in the ADSP; no AP-side I2C/QUP reaches it. Needs ADSP boot (PAS 1, adsp.mdt relocatable into adsp@86700000 0x2800000), the lpass GLINK edge (IPCC client 3), the sensor PD and its FastRPC file access (sscrpcd), then the SEE QMI/protobuf client (cf. postmarketOS libssc). Shares the ADSP work with item 5 |
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
@@ -275,8 +281,9 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
    hypervisor); harmless so far. The WLAN MAC is the driver's fixed locally administered address
    (persist/wlan_mac.bin is not read).
 3. Test credentials for `wlantest=1` sit on userdata (`tools/sweet-wlan-seed.sh --clear` wipes them).
-4. GPU (user): clocks above 300 MHz need the GX rail vote; CP_PROTECT table vs the Linux catalog's a630
-   list; CP reset after a wedge (a bad IB can still turn the GPU path off until reboot).
+4. GPU: 0125 implements CP recovery and optional RPM-backed 400/600 MHz; CP_PROTECT already matches
+   Linux a630. Full kernel link and real wedge/protection/high-frequency boots remain to validate; see
+   [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md). Default remains 300 MHz.
 5. CPU frequency: only the shim's one-time EPSS vote; the kernel side stays off (`sweetcpufreq=0`).
 6. Recurring crashes, all pre-existing: driverkitd sig 9 every boot; PosterBoard now and then; Settings
    (Preferences) when it draws app icons through CoreImage's GL path (no GL renderer yet).
