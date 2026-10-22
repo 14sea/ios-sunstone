@@ -2,22 +2,25 @@
 
 2026-10-22. Validated on the phone: boot-47 (300 MHz), boot-49 (400 MHz) and boot-50
 (600 MHz) pass `sweetgpu --wedge --protect` with three attempt-0 recoveries, page flips on
-and a kernel-recorded `PASS` (canary 0xc0ffee45) on boot-49/50; results table in SUNSTONE.md
-("GPU"). The sections below describe the implementation and the tests as written before.
+and a kernel-recorded `PASS` (canary 0xc0ffee45) on boot-49/50; full results table in
+[SUNSTONE.md](../SUNSTONE.md#gpu).
 Latest code: fork `834e51c`, matching XNU `2967215`.
 Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
 Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):
 firmware FIFO takeover, feature negotiation, the recovery budget and zap retry.
 0131 (`7e9f53c` in fork, XNU `1888049`) restores the normal a6xx secure-mode
 restart; SCM stays a fallback only.
-Boot-48 (`../out/boot48-log31.txt`) records all six RPM ACKs, GX level `0xc0`,
+Boot-48 (workspace `../../out/boot48-log31.txt`) records all six RPM ACKs, GX level `0xc0`,
 400 MHz RCG readback and a passing 2D selftest. All three deliberate failures
 recovered on attempt 0; GPU display copies continued (frame 1000 averaged 2682 us).
-The user reports a stable system and ambient light sensing. However, page flips
-were disabled by the init race below, and all sweetgpu stdout was absent, so the
-final post-recovery canary and overall PASS at 400 MHz remain unproven. 600 MHz
-still lacks device evidence. The default clock stays at the shim's 300 MHz.
-No partitions were flashed during this local follow-up.
+Page flips were disabled by the init race below and all sweetgpu stdout was absent.
+The later boot-49/50 results resolve both gaps: flips stay on and kernel reports
+confirm the final canary and overall PASS at 400/600 MHz. Both use kernel CI
+39748355088, SHA-256 prefix `2aa6629f4cc98a94`; local logs are
+`../../out/boot49-log32.txt` and `../../out/boot50-log33.txt` (not committed).
+The default clock stays at the shim's 300 MHz. The current follow-ups are real
+clock measurement, long-run thermal behavior, DDR votes and GPU rendering
+([SUNSTONE.md](../SUNSTONE.md), TODO 6b/6c).
 
 ## CP_PROTECT audit
 
@@ -29,7 +32,8 @@ the device test `sweetgpu --protect` additionally attempts a hardware-protected
 `CP_REG_TO_MEM` read of `CP_RB_BASE` through an IB. That test must fail the
 submission and increment the successful recovery count. Boot-47 at 300 MHz has
 the full test stdout; boot-48 at 400 MHz records the protection fault and recovery
-but lacks the final user-space result.
+but lacks the final user-space result. Boot-49/50 subsequently confirm the complete
+test with kernel-recorded PASS at 400/600 MHz.
 
 Reference: [Linux a6xx_catalog.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_catalog.c).
 
@@ -79,8 +83,8 @@ memory, so closing an IOSurface cannot unwire storage still owned by that DMA.
 
 The reset path does not collapse CX/GX or reset the whole GCC GPU block. References:
 [Linux a6xx_gpu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
-local `../shim/gpu.c` (`hw_init`, `cp_start`, `blit2d_setup`). Boot-48 confirms
-attempt-0 recovery at 400 MHz without SCM resume. The optional SCM fallback has
+local `../shim/gpu.c` (`hw_init`, `cp_start`, `blit2d_setup`). Boot-49/50 confirm
+attempt-0 recovery at 400/600 MHz without SCM resume. The optional SCM fallback has
 only simulated-hardware coverage.
 
 ## Clocks above 300 MHz
@@ -121,14 +125,14 @@ and the same selftest. A failed RCG rollback disables GPU access without further
 GPU MMIO. `CORE_MHZ` reports the selected divider plus selftest result, not an
 independently measured clock frequency.
 
-Evidence: workspace `../out/dt/sunstone-live.dts` (not committed: contains device
-identity), `../research/linux-msm/gpucc-sm6375.c`,
+Evidence: workspace `../../out/dt/sunstone-live.dts` (not committed: contains device
+identity), `../../research/linux-msm/gpucc-sm6375.c`,
 [Linux rpmpd.c](https://github.com/torvalds/linux/blob/master/drivers/pmdomain/qcom/rpmpd.c),
 [GLINK RPM transport](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_rpm.c),
 [RPM message format](https://github.com/torvalds/linux/blob/master/drivers/soc/qcom/smd-rpm.c),
 [TopazRpm reference](https://github.com/MakrSas/topaz-woa/blob/main/drivers/TopazRpm/driver.c).
 
-## Validation and next device session
+## Validation
 
 ### Concurrent initialization (0133)
 
@@ -197,15 +201,14 @@ the recovery budget between independent tests; three deliberate failures in a ro
 would now correctly disable the GPU. Opt-in `--wedge` submits an impossible `CP_WAIT_REG_MEM` on a
 mapped BO; `--protect` exercises the protection fault described above.
 
-Next steps (status 2026-10-22: 1, 2 and 4 done with boot-49, 600 MHz passed on boot-50; the real
-clock, temperature and DDR votes of step 3 are open as SUNSTONE.md TODO 6b):
+For future kernel regressions, run `sweetgpu --wedge --protect` at 300/400/600 MHz
+with matching ios-tools. Require page flips enabled and increasing flip counts,
+six RPM ACKs for 400/600, RCG/selftest success, all three recoveries and kernel
+`sweetgpu result PASS` with flags 3 and canary `0xc0ffee45`. Retained params must
+show result 1 and at least one report even if stdout is lost. Record the kernel
+commit, CI run, boot image/hash and device log for each run.
 
-1. Build the full kernel with 0133/0134 and rebuild ios-tools.
-2. Repeat boot-48 at `sweetgpu_mhz=400`, running `sweetgpu --wedge --protect`.
-   Require page flips enabled and increasing flip counts, six RPM ACKs,
-   RCG/selftest success, all three recoveries and the kernel `sweetgpu result PASS`
-   with flags 3 and canary `0xc0ffee45`. Retained params must show result 1 and
-   at least one completed report even if stdout is lost.
-3. Check sustained UI presentation, then repeat at 600 MHz. Check real clock/rail
-   behavior and temperature before changing the default.
-4. Record exact kernel commit, CI run, boot image/hash and device log.
+Remaining hardware work: measure the actual clock and rails, check sustained
+600 MHz temperature beyond the battery gauge, and assess DDR bandwidth voting
+before changing the default. CoreAnimation still renders on the CPU; GPU rendering
+is a separate open item.

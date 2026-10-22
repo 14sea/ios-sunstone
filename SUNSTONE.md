@@ -370,3 +370,6 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 7. No audio, Bluetooth, cellular data, camera, GPS, SEP. Sensors and WLAN work in the kernel only
    (no auto-brightness, no network interface in iOS).
 8. Shim warnings: `gpu.c` g2a/g2b/g2c are unused test stages, harmless.
+9. CPU/system suspend and resume are not implemented: SweetCPU::quiesceCPU, haltCPU and
+   initCPU(false) panic. Eight-core initial startup and panel off/on are verified; these do
+   not establish suspend/resume or CPU hotplug support.

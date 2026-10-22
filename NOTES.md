@@ -5,7 +5,36 @@ The first sections are the active sunstone (Redmi Note 12 5G, SM4375) handoff. E
 [ios-sweet](https://github.com/dipa-studio/ios-sweet) (Redmi Note 10 Pro, SM7150), kept as history;
 its local paths are shown as `<sweet-work>/`, `<sweet-ipsw>/` and `<photos>/`.
 
-## sunstone handoff (2026-10-22, after boot-50; read first)
+## Project audit follow-up (2026-10-22; read first)
+
+Tool fixes and repeatable checks committed as `7309401` (fork).
+
+Audited baseline fork `92d3681`, XNU `ee82c2a`; both were clean. Complete replay
+of the 132 active patches matches all 169 affected source files. GPU UBSan suite
+and Linux CP_PROTECT comparison pass. Repository script/plist syntax, local doc
+targets and both workflow YAMLs checked; isolated committed-shim ARM64 build
+produces boot-image v3/v4 (only known unused g2* warnings). Boot-49/50 logs confirm
+400/600 MHz kernel PASS and flips on; the boot-53 chain records flashing/reboot,
+but no boot-53 kernel-log pull is present locally.
+
+Fixed five tooling issues: lpextract EOF hang; mkdrop UTF-8 path truncation and
+duplicate destinations; silently truncated/NUL-containing payload boot arguments;
+incomplete SWEETLOG decoding; kbuild's pipeline hiding packer failures. Ten offline
+tool tests pass. `tests/check-project.py --source-root ../work/xnu` makes the full
+patch/script/doc-target consistency check repeatable. Updated mkpayload reproduces
+boot-53's payload byte-for-byte with its embedded ADT; `out/sunstone.adt` is a mutable
+build output and currently differs from that embedded tree.
+
+Docs now use Snapdragon 4 Gen 1 for SM4375, remove obsolete GPU pending-result
+claims from the current GPU notes, and record the CPU driver's unsupported
+suspend/resume/hotplug paths (they panic; panel off/on remains supported).
+Workspace-only changes: README explains legacy mkboot defaults; tools-host's
+lpextract copy has the same EOF fix. No kernel/shim source changes, new full XNU
+link, CI dispatch, remote-host command or device write/flash in this audit.
+See [docs/project-audit-2026-10-22.md](docs/project-audit-2026-10-22.md) for scope,
+commands, hashes, verification limits and remaining work.
+
+## sunstone handoff (2026-10-22, after boot-50)
 
 **Sensors (Claude):** the ADSP sensors PD runs from the in-kernel FastRPC listener (0126-0129,
 0132). boot-46/47/49/50: attach accepted on the 2nd try (~505 ms), the PD reads the persist

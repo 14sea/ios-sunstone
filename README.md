@@ -5,7 +5,7 @@
 This is a port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of
 [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet): Apple's open-source XNU
 kernel, xnu-8796, on Qualcomm phones) to the Xiaomi **Redmi Note 12 5G** (`sunstone`, Qualcomm
-**SM4375 "blair"** / Snapdragon 4 Gen 2 class: 6x Cortex-A55 + 2x Cortex-A78, Adreno 619,
+**SM4375 "blair"** / [Snapdragon 4 Gen 1](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/Snapdragon-4-Gen-1-Product-Brief.pdf): 6x Cortex-A55 + 2x Cortex-A78, Adreno 619,
 8 GB). On top of the kernel runs the **unmodified iOS 16.7.16 (20H392) userland of the
 iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
@@ -59,6 +59,8 @@ original engineering log.
 - **No GPU rendering yet**: CoreAnimation draws in software, the GPU copies frames; the isolated user
   client (0109-0111) is the base for a Mesa/GL path.
 - **No CPU frequency control in the kernel** (one fixed vote from the shim).
+- **No system suspend/resume or CPU hotplug**: the CPU driver implements initial startup;
+  its quiesce, halt and resume paths still panic. Panel off/on does work.
 - **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
 
 ## How sunstone differs from topaz
@@ -200,6 +202,22 @@ Volume up for the slot-b recovery, from which `tools/sweet-log-pull.sh` reads th
 | `RECOVERY.md` | Back to stock / recovery runbook for sunstone |
 
 Not in git: partition backups, live device trees, Apple firmware and root images, build trees.
+
+## Local checks
+
+From the repository root, without a phone or downloaded firmware:
+
+```sh
+python3 tests/check-project.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 tests/check-gpu.py
+```
+
+The project check validates script/plist syntax, local Markdown links and active patch syntax.
+With an existing patched XNU checkout and CI-staged providers,
+`python3 tests/check-project.py --source-root ../work/xnu` also replays the complete series and
+compares every affected source file. GPU tests require g++ with UBSan; they simulate hardware.
+The [project audit](docs/project-audit-2026-10-22.md) records results and remaining limits.
 
 ## sunstone kernel patches
 
