@@ -1,0 +1,148 @@
+diff --git a/iokit/Kernel/arm/SweetFastRPC.cpp b/iokit/Kernel/arm/SweetFastRPC.cpp
+index 930118f..fbf2e6f 100644
+--- a/iokit/Kernel/arm/SweetFastRPC.cpp
++++ b/iokit/Kernel/arm/SweetFastRPC.cpp
+@@ -45,7 +45,10 @@
+ #define FRPC_LISTENER           3               /* adsp_listener */
+ #define FRPC_RMID_INIT_ATTACH   0
+ #define FRPC_RMID_INIT_MMAP     4
++#define ROOT_PD                 0
+ #define SENSORS_PD              2
++#define FRPC_ATTACH_TRIES       40              /* every 500 ms: the PD comes up after the channel (boot-45) */
++#define FRPC_PROBE_AFTER        5               /* then one root PD attach, to tell transport from PD state */
+ #define FRPC_CLIENT_ID          1               /* Linux: session index + 1 */
+ #define FRPC_PD_NOTIFY_CTX      0xABCDABCDull
+ #define FRPC_ALIGN              128u
+@@ -87,7 +90,7 @@ struct frpc_slot {
+ 	const char *what;
+ };
+ 
+-enum { F_IDLE, F_SETUP, F_LISTEN, F_FAILED };
++enum { F_IDLE, F_SETUP, F_LISTEN, F_FAILED, F_RETRY };
+ 
+ static uint32_t remotectl_call(uint32_t, const struct sweet_frpc_buf *, uint32_t, struct sweet_frpc_buf *, uint32_t);
+ static uint32_t apps_mem_call(uint32_t, const struct sweet_frpc_buf *, uint32_t, struct sweet_frpc_buf *, uint32_t);
+@@ -106,6 +109,7 @@ static struct {
+ 	struct frpc_slot slot[FRPC_SLOTS];
+ 	uint32_t seq;
+ 	unsigned ms;
++	unsigned attach_tries, retry_at;
+ 	/* setup */
+ 	uint32_t dl_handle, open_out[2];
+ 	char err[64];
+@@ -123,7 +127,8 @@ static struct {
+ /* ---------------------------------------------------------------- invoke */
+ 
+ static struct frpc_slot *
+-frpc_invoke(const char *what, uint32_t handle, uint32_t sc, const struct frpc_arg *args, bool kernel, frpc_done_fn done)
++frpc_invoke(const char *what, uint32_t handle, uint32_t sc, const struct frpc_arg *args, bool kernel, frpc_done_fn done,
++    uint32_t pd = SENSORS_PD)
+ {
+ 	unsigned nin = SC_IN(sc), n = nin + SC_OUT(sc), i;
+ 	struct frpc_slot *s = NULL;
+@@ -186,7 +191,7 @@ frpc_invoke(const char *what, uint32_t handle, uint32_t sc, const struct frpc_ar
+ 	struct frpc_msg m;
+ 	m.client_id = kernel ? 0 : FRPC_CLIENT_ID;
+ 	m.tid = FRPC_CLIENT_ID;
+-	m.ctx = (uint64_t)s->seq << 16 | (uint64_t)(s - f.slot + 1) << 8 | SENSORS_PD;
++	m.ctx = (uint64_t)s->seq << 16 | (uint64_t)(s - f.slot + 1) << 8 | pd;
+ 	m.handle = handle;
+ 	m.sc = sc;
+ 	m.addr = s->pa | FRPC_CB << 32;
+@@ -297,16 +302,37 @@ open_done(struct frpc_slot *s __unused, int32_t retval)
+ 	}
+ }
+ 
++static void
++probe_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	LOG("t=%u ms: probe: attach to the root PD -> retval %d (%s)", f.ms, retval,
++	    retval == 0 ? "transport fine, the sensors PD refuses" : "the DSP refuses attaches in general");
++}
++
+ static void
+ attach_done(struct frpc_slot *s __unused, int32_t retval)
+ {
+ 	static const char name[] = "adsp_default_listener";
+-	static uint32_t open_in[2];
++	static uint32_t open_in[2], probe_client = FRPC_CLIENT_ID + 1;
+ 	if (retval != 0) {
+-		setup_failed("attach to the sensors PD", retval);
++		f.attach_tries++;
++		if (f.attach_tries <= 3 || f.attach_tries % 10 == 0) {
++			LOG("t=%u ms: attach to the sensors PD: retval %d (try %u of %u)", f.ms, retval, f.attach_tries, FRPC_ATTACH_TRIES);
++		}
++		if (f.attach_tries >= FRPC_ATTACH_TRIES) {
++			setup_failed("attach to the sensors PD", retval);
++			return;
++		}
++		if (f.attach_tries == FRPC_PROBE_AFTER) {
++			struct frpc_arg a[1] = { { &probe_client, NULL, 4 } };
++			(void)frpc_invoke("attach root PD (probe)", FRPC_INIT_HANDLE, SC(FRPC_RMID_INIT_ATTACH, 1, 0), a, true,
++			    probe_done, ROOT_PD);
++		}
++		f.state = F_RETRY;
++		f.retry_at = f.ms + 500;
+ 		return;
+ 	}
+-	LOG("t=%u ms: attached to the sensors PD", f.ms);
++	LOG("t=%u ms: attached to the sensors PD%s", f.ms, f.attach_tries != 0 ? " (after retries)" : "");
+ 	open_in[0] = sizeof(name);
+ 	open_in[1] = sizeof(f.err);
+ 	bzero(f.err, sizeof(f.err));
+@@ -318,10 +344,20 @@ attach_done(struct frpc_slot *s __unused, int32_t retval)
+ }
+ 
+ static void
+-frpc_up(void)
++frpc_attach(void)
+ {
+ 	static uint32_t client = FRPC_CLIENT_ID;
++	struct frpc_arg a[1] = { { &client, NULL, 4 } };
+ 
++	f.state = F_SETUP;
++	if (frpc_invoke("attach", FRPC_INIT_HANDLE, SC(FRPC_RMID_INIT_ATTACH, 1, 0), a, true, attach_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++static void
++frpc_up(void)
++{
+ 	LOG("%s open: SMMU stream %x, pool %llx+%llx", FRPC_CHANNEL, FRPC_SID, FRPC_POOL_BASE, FRPC_POOL_SIZE);
+ 	if (!topaz_smmu_identity(FRPC_SID, 0, "FastRPC")) {
+ 		f.state = F_FAILED;
+@@ -342,11 +378,7 @@ frpc_up(void)
+ 		f.slot[i].va = f.pool + i * FRPC_SLOT_SIZE;
+ 		f.slot[i].pa = FRPC_POOL_BASE + i * FRPC_SLOT_SIZE;
+ 	}
+-	f.state = F_SETUP;
+-	struct frpc_arg a[1] = { { &client, NULL, 4 } };
+-	if (frpc_invoke("attach", FRPC_INIT_HANDLE, SC(FRPC_RMID_INIT_ATTACH, 1, 0), a, true, attach_done) == NULL) {
+-		f.state = F_FAILED;
+-	}
++	frpc_attach();
+ }
+ 
+ /* ---------------------------------------------------------------- the listener */
+@@ -596,6 +628,9 @@ static void
+ frpc_poll(unsigned ms)
+ {
+ 	f.ms = ms;
++	if (f.state == F_RETRY && ms >= f.retry_at) {
++		frpc_attach();
++	}
+ 	for (unsigned i = 0; i < FRPC_SLOTS; i++) {
+ 		struct frpc_slot *s = &f.slot[i];
+ 		/* next2 waits for the DSP's next call: only the others can be late */
+@@ -610,8 +645,8 @@ frpc_poll(unsigned ms)
+ static void
+ frpc_summary(void)
+ {
+-	static const char *const names[] = { "idle", "setting up", "listening", "FAILED" };
+-	LOG("%s; %u calls from the DSP (%u failed), %u late invokes, apps_mem %llu bytes", names[f.state], f.calls, f.failed,
++	static const char *const names[] = { "idle", "setting up", "listening", "FAILED", "waiting to retry the attach" };
++	LOG("%s (%u failed attaches); %u calls from the DSP (%u failed), %u late invokes, apps_mem %llu bytes", names[f.state], f.attach_tries, f.calls, f.failed,
+ 	    f.late, f.heap_used);
+ 	for (unsigned i = 0; i < FRPC_NIFACES; i++) {
+ 		if (f.by_iface[i] != 0) {

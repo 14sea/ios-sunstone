@@ -99,7 +99,7 @@ Gunyah); the firmware still reaches mission mode and scans. Firmware reports MAC
 uses its own locally administered address. **iOS does not see any of it yet**: topaz's public tree has
 no consumer of the `topaz_wlan_*` C API (no ifnet, no IO80211/Apple80211 layer for wifid).
 
-### ADSP (0121-0124, boot-41..44)
+### ADSP and sensors (0121-0129, 0132, boot-41..46)
 
 `adsp=1` boots the LPASS DSP through PAS (id 1) with the generic `pas_boot()`: adsp.mdt is linked at
 0x53400000 and relocated into adsp@86700000 (0x2800000, exactly its size), init_image/mem_setup/auth
@@ -123,6 +123,21 @@ not register: on Linux they need the sensor registry and config (`/mnt/vendor/pe
 `/vendor/etc/sensors/config/*.json`), which the DSP reads from the apps side through FastRPC
 (`fastrpcglink-apps-dsp`, the apps_std file listener that sscrpcd/hexagonrpcd run). Next for the ALS:
 an in-kernel FastRPC listener serving those files read-only.
+
+boot-45 (0126-0129, `../out/boot45-log28.txt`): the ADSP opens `fastrpcglink-apps-dsp` 4 ms after
+GLINK starts, SMMU stream 0xa3 goes to identity (CB4), the DSP answers our invokes, but the attach to
+the sensors PD returns **-1**: it went out 30 ms before the PD registered its SEE service (Linux waits
+for PDR to report the PD up). No reverse calls, still 0 sensors. The ADSP stays healthy.
+
+boot-46 (0132, `../out/boot46-log29.txt`): attach retried every 500 ms, accepted on the second try
+(t=505 ms); default listener registered, 2153 reverse calls (remotectl, apps_std). The PD reads
+`sns_reg_config`, the soc0 files (soc_id 578, QRD), `sns_reg_version` and all 278 registry files from
+persist. At t=12.0 s the SEE update lists **ambient_light (ams TMD3702), proximity, accel, gyro and
+mag**; the ALS on-change stream starts at 12.6 s, **lux 470-520 indoors**, 70 reports. Failed calls
+(542): the 53 vendor json configs (stat served, content not, each tried 10 times) and Huaqin's
+`/sys/class/huaqin/interface/hw_info/pcba_config`; they did not block registration but probably
+explain most of the 11.5 s between listener and sensors. Next: serve the json contents, then lux to
+CoreBrightness (ALS HID events) for auto-brightness.
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -223,6 +238,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0129 | apps_std for the sensors PD (`SweetAppsStd`): persist registry read-only, vendor sensor config stat table, socinfo from SMEM 137 |
 | 0130 | GPU review fixes: AP-only FIFO-index reset, feature negotiation, three-failure cutoff, conditional zap-resume retry; local tests/compile pass, device pending |
 | 0131 | Correct a6xx restart: always SET_SECURE_MODE 0 on attempt 0 without SCM; SCM resume stays attempt-1 fallback only; tests/compile pass, device pending |
+| 0132 | FastRPC: retry the sensors PD attach every 500 ms (40 tries), one root PD attach probe after 5 failures (boot-46: ALS, proximity, accel, gyro, mag up) |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
@@ -275,7 +291,7 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote) | U | [~] | 0125: opt-in 400/600 MHz, RPM ACKs + 2D selftest; default 300, full build/device pending |
-| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] | survey 2026-10-21: the ALS (ams TMD2725/TMD2755 at 0x39, SSC I2C bus 2, IRQ 98 per the vendor/persist sensor registry) hangs off the sensor hub in the ADSP; no AP-side I2C/QUP reaches it. Needs ADSP boot (PAS 1, adsp.mdt relocatable into adsp@86700000 0x2800000), the lpass GLINK edge (IPCC client 3), the sensor PD and its FastRPC file access (sscrpcd), then the SEE QMI/protobuf client (cf. postmarketOS libssc). Shares the ADSP work with item 5 |
+| 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [~] | ALS works in the kernel (boot-46): ADSP boot (0121/0122), GLINK edge (0123/0127), SEE client (0124), FastRPC listener serving the persist registry (0126-0129, 0132), lux on-change reports. Left: serve the vendor json contents (startup time), then lux to CoreBrightness as ALS HID events
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
 
