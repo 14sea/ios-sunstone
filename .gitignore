@@ -7,4 +7,7 @@ research/
 shim/out/
 xnu/out/
 xnu/out-*/
+xnu/out[0-9]*/
+# build products of tools/mkboot.sh and tools/gpu-build.sh
+out/
 __pycache__/

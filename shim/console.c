@@ -95,3 +95,17 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+/*
+ * Page break for long reports: if fewer than n rows are left, keep the full
+ * page on screen for hold_ms (time for a photo), then clear to bg.
+ */
+extern void con_hold_ms(unsigned ms);
+
+void con_need(int n, uint32_t bg, unsigned hold_ms)
+{
+	if (MARGIN + (row + n) * CH_H <= FB_H)
+		return;
+	con_hold_ms(hold_ms);
+	con_clear(bg);
+}

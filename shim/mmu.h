@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0x5c000000UL
+#define FB_PHYS	0x85200000UL	/* sunstone splash_region */
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;
