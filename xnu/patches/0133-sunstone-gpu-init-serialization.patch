@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -172,6 +172,7 @@
+ static uint64_t            gpu_ctl_phys;
+ static uint64_t            gpu_frames, gpu_ns_total, gpu_smmu_faults;
+ static IOLock             *gpu_lock;    /* the ring: framebuffer copies and user submissions */
++static IOLock             *gpu_init_lock; /* serializes the entire one-time handoff/clock init */
+ static uint64_t            gpu_resets;
+ static uint32_t            gpu_core_mhz;
+ /* Restart probe fences do not prove a workload can run. Stop after three failures. */
+@@ -239,6 +240,23 @@
+ 		}
+ 	}
+ 	return gpu_lock;
++}
++
++static IOLock *
++gpu_init_lock_get(void)
++{
++	IOLock *lock = __atomic_load_n(&gpu_init_lock, __ATOMIC_ACQUIRE);
++	if (lock == NULL) {
++		IOLock *candidate = IOLockAlloc();
++		if (candidate == NULL) {
++			return NULL;
++		}
++		if (!OSCompareAndSwapPtr(NULL, candidate, (void * volatile *)&gpu_init_lock)) {
++			IOLockFree(candidate);
++		}
++		lock = __atomic_load_n(&gpu_init_lock, __ATOMIC_ACQUIRE);
++	}
++	return lock;
+ }
+ 
+ /* Kernel fence values are a wrapping sequence: done when *gpu_ctl is at or past seq. */
+@@ -331,8 +349,9 @@
+ 	__builtin_arm_dsb(0xf);
+ }
+ 
++/* All reads of the initial state/result go through gpu_init's separate lock. */
+ static bool
+-gpu_init(void)
++gpu_init_locked(void)
+ {
+ 	int on = 1;
+ 
+@@ -415,6 +434,21 @@
+ 	    gpu_regs[REG_RBBM_STATUS], (unsigned long)(gpu_cb0 - gpu_smmu),
+ 	    gpu_regs[REG_CP_PROTECT_CNTL]);
+ 	return gpu_state > 0;
++}
++
++static bool
++gpu_init(void)
++{
++	IOLock *lock = gpu_init_lock_get();
++	if (lock == NULL) {
++		return false;
++	}
++	/* Wait for the owner, including RPM sleeps. gpu_clock_init uses gpu_lock;
++	 * using that same lock here would deadlock. -1 is not published mid-init. */
++	IOLockLock(lock);
++	bool ready = gpu_init_locked();
++	IOLockUnlock(lock);
++	return ready;
+ }
+ 
+ /* ---- Per-process SMMU stage-1 page tables (4 KB granule, 39-bit VA) ---- */

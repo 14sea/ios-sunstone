@@ -183,6 +183,18 @@ main(int argc, char **argv)
 		failed += check_recovered(conn, handle, p, 0xc0ffee44u + (uint32_t)test);
 	}
 
+	/* Record completion before freeing the canary BO. Survives lost stdout. */
+	uint64_t report_in[3] = {handle, (uint32_t)failed,
+	    (wedge ? 1u : 0u) | (protect ? 2u : 0u)};
+	uint32_t report_cnt = 0;
+	kr = IOConnectCallScalarMethod(conn, 8, report_in, 3, NULL, &report_cnt);
+	if (kr != KERN_SUCCESS) {
+		printf("SWEETGPU: kernel result report failed: 0x%x\n", kr);
+		failed++;
+	} else if (get_param(conn, 8) != 1) {
+		failed++;
+	}
+
 	/* 5. Free BO & close */
 	uint32_t free_cnt = 0;
 	IOConnectCallScalarMethod(conn, 2, &handle, 1, NULL, &free_cnt);

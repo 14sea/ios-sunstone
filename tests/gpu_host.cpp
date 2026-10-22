@@ -201,6 +201,61 @@ static void test_handoff() {
     assert(!gpu_init()); // a malformed handoff must not alias the ring as its fence
     puts("Handoff: default/400/600 MHz initialization, params and malformed layout rejection passed");
 }
+static std::mutex init_test_mutex;
+static std::condition_variable init_test_cv;
+static bool init_test_paused, init_test_release, init_test_waiting;
+static const char *init_test_arg;
+static thread_local bool init_test_framebuffer;
+static void pause_gpu_init(const char *arg) {
+    if(strcmp(arg,init_test_arg)) return;
+    std::unique_lock<std::mutex> lock(init_test_mutex);
+    init_test_paused=true; init_test_cv.notify_all();
+    init_test_cv.wait(lock,[]{ return init_test_release; });
+}
+static void observe_init_waiter(IOLock *lock) {
+    if(!init_test_framebuffer || lock!=gpu_init_lock) return;
+    std::lock_guard<std::mutex> guard(init_test_mutex);
+    init_test_waiting=true; init_test_cv.notify_all();
+}
+static void test_concurrent_handoff() {
+    for(bool success:{true,false}) {
+        setup(); rpm_setup(); boot_mhz=400;
+        sweet_gpu_handoff ho={};
+        memcpy(ho.magic,success ? "SUNGPUHO" : "BADMAGIC",8);
+        ho.version=1; ho.ok=1; ho.ring_phys=GPU_RING_PHYS;
+        ho.ring_dwords=GPU_RING_BYTES/4; ho.ctl_phys=gpu_ctl_phys;
+        ho.seqno=gpu_seqno; ho.core_mhz=300; ho.regs_phys=0x05900000;
+        memcpy((void*)(gpu_low_map->va+0x40000),&ho,sizeof(ho));
+        gpu_state=0;
+        assert(gpu_init_lock_get());
+        init_test_paused=init_test_release=init_test_waiting=false;
+        init_test_arg=success ? "sweetgpu_mhz" : "sweetgpu";
+        boot_arg_hook=pause_gpu_init; lock_hook=observe_init_waiter;
+        std::atomic<bool> owner_done{false},fb_done{false};
+        bool owner_result=false,flips=false;
+        std::thread owner([&]{ owner_result=sweet_gpu_ready(); owner_done=true; });
+        {
+            std::unique_lock<std::mutex> lock(init_test_mutex);
+            assert(init_test_cv.wait_for(lock,std::chrono::seconds(5),[]{ return init_test_paused; }));
+        }
+        std::thread fb([&]{
+            init_test_framebuffer=true;
+            flips=sweet_gpu_ready(); // framebuffer's one-time flip enable decision
+            fb_done=true;
+        });
+        {
+            std::unique_lock<std::mutex> lock(init_test_mutex);
+            assert(init_test_cv.wait_for(lock,std::chrono::seconds(5),[]{ return init_test_waiting; }));
+            assert(!owner_done && !fb_done); // no transient false result during init
+            init_test_release=true; init_test_cv.notify_all();
+        }
+        owner.join(); fb.join(); boot_arg_hook=nullptr; lock_hook=nullptr;
+        assert(owner_result==success && flips==success);
+        assert(sweet_gpu_ready()==success); // same final result is cached
+        assert(!gpu_init_lock->held && !gpu_lock->held);
+    }
+    puts("Concurrent init: framebuffer waits through RPM initialization; success/failure results agree");
+}
 static void test_recovery() {
     setup();
     auto *vm=sweet_gpu_vm_create(7); assert(vm); active_vm=vm;
@@ -378,7 +433,80 @@ static void test_rpm_parser() {
     assert(!gpu_rpm_rx() && gpu_rpm.error);
     puts("RPM: bounded TLV parsing, ACK identity, error TLVs, FIFO wrap and corrupt indices passed");
 }
+struct ReportClient {
+    struct sweet_gpu_bo {
+        IOMemoryDescriptor *mem=nullptr;
+        void *surf=nullptr;
+        uint32_t usable_size=0, delta=0;
+    } fBOs[4];
+    bool fTestReported=false;
+    int report(uint32_t selector, const uint64_t *in, uint32_t nin, uint32_t nout=0) {
+        struct { uint32_t scalarOutputCount; } arguments{nout};
+        auto *args=&arguments;
+        using IOReturn=int;
+        constexpr int kIOReturnBadArgument=-1, kIOReturnNoResources=-2;
+        constexpr unsigned SWEET_GPU_MAX_BOS=4;
+        IOReturn ret=kIOReturnSuccess;
+#define OSDynamicCast(T, p) dynamic_cast<T*>(p)
+        switch(selector) {
+#include "report_selector.inc"
+        default: assert(false);
+        }
+#undef OSDynamicCast
+        return ret;
+    }
+};
+static void test_completion_report() {
+    setup();
+    memset(gpu_test_report,0,sizeof(gpu_test_report));
+    gpu_state=0;
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_RESULT)==0 && gpu_state==0);
+    auto *mem=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,0,0x10000,0);
+    ReportClient client;
+    client.fBOs[1]={mem,nullptr,0x10000,0};
+    uint64_t in[]={1,0,3};
+    assert(client.report(8,in,2)!=0 && client.report(8,in,3,1)!=0);
+    in[0]=0; assert(client.report(8,in,3)!=0);
+    in[0]=4; assert(client.report(8,in,3)!=0);
+    in[0]=2; assert(client.report(8,in,3)!=0);
+    in[0]=1; in[1]=1ULL<<32; assert(client.report(8,in,3)!=0);
+    in[1]=0; in[2]=4; assert(client.report(8,in,3)!=0); in[2]=3;
+    client.fBOs[1].usable_size=0x100; assert(client.report(8,in,3)!=0);
+    client.fBOs[1].usable_size=0x10000;
+    client.fBOs[1].surf=mem; assert(client.report(8,in,3)!=0);
+    client.fBOs[1].surf=nullptr;
+    IOMemoryDescriptor other;
+    client.fBOs[1].mem=&other; assert(client.report(8,in,3)!=0);
+    client.fBOs[1].mem=mem;
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_REPORTS)==0);
+    // The kernel reads the BO canary; zero user failures alone cannot yield PASS.
+    assert(client.report(8,in,3)==0 && client.fTestReported);
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_RESULT)==2);
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_OBSERVED)==0);
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_EXPECTED)==0xc0ffee45);
+    assert(client.report(8,in,3)!=0);
+    for(uint32_t flags=0;flags<4;flags++) {
+        ReportClient next;
+        next.fBOs[1]=client.fBOs[1]; in[2]=flags;
+        uint32_t marker=(flags&2)?0xc0ffee45:(flags&1)?0xc0ffee44:0xc0ffee43;
+        ((uint32_t*)mem->data)[0x100/4]=marker;
+        assert(next.report(8,in,3)==0);
+        assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_RESULT)==1);
+        assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_OBSERVED)==marker);
+        assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_FLAGS)==flags);
+    }
+    gpu_state=-1;
+    assert(sweet_gpu_report_test(2,3,0xc0ffee45));
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_RESULT)==2);
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_FAILURES)==2);
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_REPORTS)==6);
+    assert(!sweet_gpu_report_test(0,4,0));
+    assert(sweet_gpu_param(SWEET_GPU_PARAM_TEST_REPORTS)==6 && gpu_state==-1);
+    free(mem->data); delete mem;
+    puts("Completion report: actual selector validates BO/arguments, reads canary, records PASS/FAIL once per client; counters survive GPU fallback");
+}
 int main() {
-    test_handoff(); test_recovery(); test_recovery_limit_and_zap(); test_power(); test_rpm_parser();
+    test_handoff(); test_concurrent_handoff(); test_recovery(); test_recovery_limit_and_zap(); test_power(); test_rpm_parser();
+    test_completion_report();
     puts("All GPU host checks passed (simulated hardware; device validation still required)");
 }

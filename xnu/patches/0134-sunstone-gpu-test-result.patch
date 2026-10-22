@@ -1,0 +1,152 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -175,6 +175,7 @@
+ static IOLock             *gpu_init_lock; /* serializes the entire one-time handoff/clock init */
+ static uint64_t            gpu_resets;
+ static uint32_t            gpu_core_mhz;
++static uint64_t            gpu_test_report[6]; /* params TEST_RESULT..TEST_REPORTS */
+ /* Restart probe fences do not prove a workload can run. Stop after three failures. */
+ #define GPU_MAX_RECOVERY_STREAK 3u
+ static uint32_t            gpu_recovery_streak;
+@@ -1478,6 +1479,15 @@
+ uint64_t
+ sweet_gpu_param(uint32_t which)
+ {
++	if (which >= SWEET_GPU_PARAM_TEST_RESULT && which <= SWEET_GPU_PARAM_TEST_REPORTS) {
++		if (!gpu_lock_get()) {
++			return 0;
++		}
++		IOLockLock(gpu_lock);
++		uint64_t value = gpu_test_report[which - SWEET_GPU_PARAM_TEST_RESULT];
++		IOLockUnlock(gpu_lock);
++		return value;
++	}
+ 	if (!gpu_init()) {
+ 		return 0;
+ 	}
+@@ -1503,6 +1513,29 @@
+ 	}
+ }
+ 
++bool
++sweet_gpu_report_test(uint32_t failures, uint32_t flags, uint32_t observed)
++{
++	if (flags > 3 || !gpu_lock_get()) {
++		return false;
++	}
++	uint32_t expected = (flags & 2) ? 0xc0ffee45u :
++	    (flags & 1) ? 0xc0ffee44u : 0xc0ffee43u;
++	IOLockLock(gpu_lock);
++	bool pass = failures == 0 && observed == expected;
++	gpu_test_report[0] = pass ? 1 : 2;
++	gpu_test_report[1] = failures;
++	gpu_test_report[2] = observed;
++	gpu_test_report[3] = expected;
++	gpu_test_report[4] = flags;
++	gpu_test_report[5]++;
++	IOLog("SWEET GPU: sweetgpu result %s (failures %u, flags 0x%x, canary 0x%08x expected 0x%08x, core %u MHz, resets %llu, reports %llu)\n",
++	    pass ? "PASS" : "FAIL", failures, flags, observed, expected,
++	    gpu_core_mhz, gpu_resets, gpu_test_report[5]);
++	IOLockUnlock(gpu_lock);
++	return true;
++}
++
+ #else /* !SWEET */
+ 
+ struct sweet_gpu_vm *
+@@ -1570,6 +1603,12 @@
+ }
+ 
+ bool
++sweet_gpu_report_test(uint32_t, uint32_t, uint32_t)
++{
++	return false;
++}
++
++bool
+ sweet_gpu_copy(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t)
+ {
+ 	return false;
+diff --git a/iokit/Kernel/arm/SweetGPU.h b/iokit/Kernel/arm/SweetGPU.h
+--- a/iokit/Kernel/arm/SweetGPU.h
++++ b/iokit/Kernel/arm/SweetGPU.h
+@@ -88,8 +88,18 @@
+ 	SWEET_GPU_PARAM_SMMU_FAULTS = 5,        /* total SMMU faults caught */
+ 	SWEET_GPU_PARAM_CORE_MHZ    = 6,        /* selected clock (RCG readback + 2D selftest) */
+ 	SWEET_GPU_PARAM_RESETS      = 7,        /* successful CP recoveries */
++	/* Last completed sweetgpu report; readable even after GPU fallback. */
++	SWEET_GPU_PARAM_TEST_RESULT = 8,        /* 0 absent, 1 PASS, 2 FAIL */
++	SWEET_GPU_PARAM_TEST_FAILURES = 9,      /* user test's failure count */
++	SWEET_GPU_PARAM_TEST_OBSERVED = 10,     /* kernel-read BO canary */
++	SWEET_GPU_PARAM_TEST_EXPECTED = 11,
++	SWEET_GPU_PARAM_TEST_FLAGS = 12,        /* bit 0 wedge, bit 1 CP_PROTECT */
++	SWEET_GPU_PARAM_TEST_REPORTS = 13,      /* completed reports this boot */
+ };
+ uint64_t sweet_gpu_param(uint32_t which);
++
++/* Diagnostic completion record, not a replacement for executing the tests. */
++bool sweet_gpu_report_test(uint32_t failures, uint32_t flags, uint32_t observed);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/iokit/Kernel/arm/SweetGPUDevice.cpp b/iokit/Kernel/arm/SweetGPUDevice.cpp
+--- a/iokit/Kernel/arm/SweetGPUDevice.cpp
++++ b/iokit/Kernel/arm/SweetGPUDevice.cpp
+@@ -33,6 +33,7 @@
+  *   6 CopyToSurface [bo_h, src_pitch, sx, sy, w, h, surf_id, dx, dy] -> status
+  *   7 BOFromSurface [surf_id]                  -> [handle, iova, user_va, size,
+  *                                                  width, height, bpr, format]
++ *   8 ReportTest    [bo_h, failures, flags]     -> status (once per client)
+  */
+ #include "SweetGPU.h"
+ #include "SweetSurface.h"
+@@ -102,6 +103,7 @@
+ 	struct sweet_gpu_bo  fBOs[SWEET_GPU_MAX_BOS];
+ 	uint32_t             fLastFence;
+ 	bool                 fFenced;
++	bool                 fTestReported;
+ 
+ 	static bool checkPermission(task_t task, void *securityID);
+ 	uint64_t    allocIOVA(uint32_t size);
+@@ -187,6 +189,7 @@
+ 	bzero(fBOs, sizeof(fBOs));
+ 	fLastFence = 0;
+ 	fFenced = false;
++	fTestReported = false;
+ 	IOLog("SWEET GPU: opened client for %s (asid %u)\n", name, fASID);
+ 	return true;
+ }
+@@ -561,6 +564,32 @@
+ 		break;
+ 	}
+ 
++	case 8: {       /* ReportTest: kernel reads the final canary at BO + 0x100. */
++		if (nin != 3 || args->scalarOutputCount != 0 || fTestReported ||
++		    in[0] == 0 || in[0] >= SWEET_GPU_MAX_BOS ||
++		    in[1] > UINT32_MAX || in[2] > 3 ||
++		    fBOs[in[0]].mem == NULL || fBOs[in[0]].surf != NULL ||
++		    fBOs[in[0]].usable_size < 0x104) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		struct sweet_gpu_bo *bo = &fBOs[in[0]];
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, bo->mem);
++		if (bmd == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uintptr_t canary = (uintptr_t)bmd->getBytesNoCopy() + bo->delta + 0x100;
++		sweet_gpu_clean_va(canary, sizeof(uint32_t), true);
++		uint32_t observed = *(volatile uint32_t *)canary;
++		if (!sweet_gpu_report_test((uint32_t)in[1], (uint32_t)in[2], observed)) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		fTestReported = true;
++		break;
++	}
++
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;

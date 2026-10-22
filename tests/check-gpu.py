@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FILES = ['SweetGPU.cpp', 'SweetGPU.h', 'SweetGPUPower.h', 'SweetFramebuffer.cpp']
+FILES = ['SweetGPU.cpp', 'SweetGPU.h', 'SweetGPUPower.h', 'SweetGPUDevice.cpp', 'SweetFramebuffer.cpp']
 
 def replace_func(s, name, replacement):
     m = re.search(r'(?:static\s+)?(?:inline\s+)?(?:uint32_t|void|bool)\s*\n'+name+r'\([^)]*\)\s*\{', s)
@@ -78,8 +78,12 @@ def main():
         s = replace_func(s, 'sweet_gpu_clean_va', 'void sweet_gpu_clean_va(uintptr_t,uint64_t,bool) {}')
         s = replace_func(s, 'vm_seq_done', 'static bool vm_seq_done(sweet_gpu_vm *v,uint32_t s) { return (int32_t)(v->fence_va[GPU_USER_FENCE_OFFSET/4]-s)>=0; }')
         (src/'under_test.cpp').write_text(s)
+        # Execute the actual diagnostic selector body with a minimal client/BO fixture.
+        device = (src/'SweetGPUDevice.cpp').read_text()
+        report = device.split('\tcase 8: {', 1)[1].split('\n\tdefault:', 1)[0]
+        (src/'report_selector.inc').write_text('case 8: {'+report)
         binary = td/'gpu-host'
-        subprocess.run(['g++','-std=c++17','-O1','-g','-fsanitize=undefined','-fno-sanitize-recover=all',
+        subprocess.run(['g++','-std=c++17','-pthread','-O1','-g','-fsanitize=undefined','-fno-sanitize-recover=all',
                         '-I'+str(ROOT/'tests'),'-I'+str(src),str(ROOT/'tests/gpu_host.cpp'),'-o',str(binary)],check=True)
         subprocess.run([str(binary)],check=True)
 
