@@ -2,7 +2,7 @@
 
 static sweet_gpu_vm *active_vm;
 static bool fail_drain, fail_sptprac, fail_restart, fail_high_blit, fail_clock_rollback;
-static bool halted, resetting, fail_work_blits, require_zap, zap_resumed, secure_cleared;
+static bool halted, resetting, fail_work_blits, require_resume_fallback, zap_resumed, secure_cleared;
 static unsigned smc_calls, smc_interrupts, smc_error;
 static bool smc_interrupt_forever;
 static unsigned rpm_features, rpm_counter_offer, rpm_version;
@@ -122,12 +122,14 @@ static void tick() {
             registers[REG_CP_RB_RPTR]=end; return;
         }
         if(type==7 && op==CP_SET_SECURE_MODE) {
-            assert(zap_resumed); // no unconditional secure-mode packet without zap_ok
-            secure_cleared=true;
             trace.push_back("secure0");
+            // Normal a6xx uses its already-loaded shader without any SCM call.
+            // Inject a separate fault only for the optional fallback tests.
+            if(require_resume_fallback && !zap_resumed) { halted=true; return; }
+            secure_cleared=true;
         }
         if(type==7 && op==CP_EVENT_WRITE && count==4) {
-            if(require_zap && !secure_cleared) return;
+            if(require_resume_fallback && !secure_cleared) return;
             uint64_t addr=gpu_ring[(ptr+2)%gpu_ring_dwords];
             uint32_t value=gpu_ring[(ptr+4)%gpu_ring_dwords];
             if(addr==gpu_ctl_phys) *gpu_ctl=value;
@@ -151,7 +153,7 @@ static void setup() {
     rpm_ap_indices.clear(); rpm_commands.clear();
     rpm_features=rpm_counter_offer=0; rpm_version=1; rpm_restart_pending=false;
     smc_calls=smc_interrupts=smc_error=0; smc_interrupt_forever=false;
-    fail_work_blits=require_zap=zap_resumed=secure_cleared=false;
+    fail_work_blits=require_resume_fallback=zap_resumed=secure_cleared=false;
     gpu_recovery_streak=0;
     gpu_rpm={}; gpu_state=1; gpu_queued=0; gpu_wptr=0; gpu_seqno=10; gpu_resets=0; gpu_core_mhz=300;
     gpu_ring_dwords=GPU_RING_BYTES/4;
@@ -207,7 +209,7 @@ static void test_recovery() {
     assert(gpu_recover("test",vm));
     assert(at("halt")<at("drain") && at("drain")<at("reset+"));
     assert(at("reset+")<at("bypass") && at("bypass")<at("reset-"));
-    assert(gpu_resets==1 && ring_idle(1) && smc_calls==0);
+    assert(gpu_resets==1 && ring_idle(1) && smc_calls==0 && secure_cleared);
     assert(registers[REG_CP_PROTECT_CNTL]==0xb);
     assert(registers[REG_CP_PROTECT_BASE+31]==(0x80000000u|0x11c00));
     assert(registers[gpu_restore_regs[17]]==gpu_restore_values[17]);
@@ -278,24 +280,31 @@ static void test_recovery_limit_and_zap() {
     assert(sweet_gpu_flush() && gpu_recovery_streak==0);
     sweet_gpu_vm_destroy(vm);
 
-    setup(); require_zap=true; smc_interrupts=2;
+    setup(); smc_error=1; // a6xx TZ need not implement the a5xx-style resume call
+    assert(gpu_recover("normal a6xx with SCM unsupported",nullptr));
+    assert(smc_calls==0 && secure_cleared && gpu_resets==1);
+    assert(std::count(trace.begin(),trace.end(),"secure0")==1);
+
+    setup(); require_resume_fallback=true; smc_interrupts=2;
     assert(gpu_recover("secure restart",nullptr));
     assert(smc_calls==3 && zap_resumed && secure_cleared && gpu_recovery_streak==1);
-    assert(at("zap-resume")<at("secure0"));
+    assert(at("secure0")<at("zap-resume")); // attempt 0 does not wait for SCM
+    assert(std::count(trace.begin(),trace.end(),"secure0")==2);
+    assert(trace.back()=="secure0"); // attempt 1 retries secure0 after successful resume
     assert(gpu_recover("secure restart again",nullptr));
     assert(smc_calls==4 && gpu_resets==2 && gpu_recovery_streak==2);
     for(unsigned error:{1u,2u,3u}) {
-        setup(); require_zap=true;
+        setup(); require_resume_fallback=true;
         smc_error=error; smc_interrupt_forever=error==3;
         assert(!gpu_recover("zap failure",nullptr));
         assert(resetting && gpu_state<0 && gpu_resets==0);
         assert(smc_calls==(error==3 ? 32u : 1u));
-        assert(std::find(trace.begin(),trace.end(),"secure0")==trace.end());
+        assert(std::count(trace.begin(),trace.end(),"secure0")==1); // only attempt 0 ran
     }
     setup(); fail_restart=true;
     assert(!gpu_recover("persistent restart failure",nullptr));
     assert(smc_calls==1 && gpu_state<0 && resetting && gpu_recovery_streak==1);
-    puts("Recovery budget: third consecutive workload failure stops retries; real work resets it; zap retry is conditional and bounded");
+    puts("Recovery budget: third consecutive workload failure stops retries; real work resets it; normal a6xx secure0 needs no SCM; fallback is conditional and bounded");
 }
 static void test_power() {
     for(unsigned mhz:{400u,600u}) {

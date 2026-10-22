@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -1108,10 +1108,9 @@
+ 	for (unsigned i = 0; i < sizeof(gpu_restore_regs) / sizeof(gpu_restore_regs[0]); i++) {
+ 		gpu_regs[gpu_restore_regs[i]] = gpu_restore_values[i];
+ 	}
+-	/* A successful resume is the only kernel-side evidence zap is available.
+-	 * The v1 shim handoff does not carry zap_ok; never assume it from ho.ok. */
+-	bool zap_ok = resume_zap && gpu_zap_resume();
+-	if (resume_zap && !zap_ok) {
++	/* The normal a6xx path reuses the loaded zap shader without an SCM resume.
++	 * SCM is only a best-effort fallback after the first restart fence fails. */
++	if (resume_zap && !gpu_zap_resume()) {
+ 		return false;
+ 	}
+ 	gpu_init_cp_protect();
+@@ -1136,10 +1135,9 @@
+ 	for (unsigned i = 0; i < 5; i++) {
+ 		emit(0);
+ 	}
+-	if (zap_ok) {
+-		emit(pkt7(CP_SET_SECURE_MODE, 1));
+-		emit(0);
+-	}
++	/* Like Linux a6xx hw_init, always switch out of secure mode after ME_INIT. */
++	emit(pkt7(CP_SET_SECURE_MODE, 1));
++	emit(0);
+ 	/* The shim's a619 2D baseline, including sysmem CCU and the render mode. */
+ 	static const uint32_t magic[][2] = {
+ 		{0x9804, 0x1f}, {0x9805, 0}, {0xa0f8, 0}, {0xb600, 0x00108000},
