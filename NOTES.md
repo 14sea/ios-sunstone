@@ -13,15 +13,12 @@ six RPM ACKs where voted, 2D selftest, three attempt-0 recoveries under `sweetgp
 --protect`, kernel-recorded `PASS` with canary c0ffee45 (boot-49/50), page flips on. Table in
 SUNSTONE.md (GPU). Default stays 300 MHz.
 
-**In flight:** 0135/0136 serve the vendor json from memory-only drop entries. The drop is built
-locally (never committed: it carries vendor files):
-
-    python3 fork/tools/mkdrop.py out/drop-sns51.bin --launchd out/launchd-root.plist \
-        fork/tools/ios/sweetgpu.plist out/ios-tools-49/sweetgpu:/usr/libexec/sweetgpu:755 \
-        --mem-dir fw/vendor/etc/sensors/config:/vendor/etc/sensors/config
-
-It also restores the plain sweetgpu job (boot-47..50 left `--wedge --protect` on the root).
-Every later boot image needs this drop (`DROP=`) or the json fall back to stat-only.
+**Done after boot-50:** 0135/0136 can serve files from memory-only drop entries. boot-51 served the
+53 vendor json that way and the PD then tried to rebuild the registry (2070 refused writes of
+`registry/../temp.json`, sensors at 40 s instead of 12 s). **Do not put the json into the drop**;
+stat-only (no drop at all) is the good state. boot-51's drop also restored the plain sweetgpu job
+on the root (boot-47..50 had left `--wedge --protect`); boot-51 sweetgpu `PASS`, 1 recovery.
+Later boots need no `DROP=`.
 Next for sensors: lux to CoreBrightness (ALS HID events).
 
 ## sunstone GPU handoff (2026-10-22, boot-48 follow-up)

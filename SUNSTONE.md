@@ -136,8 +136,16 @@ persist. At t=12.0 s the SEE update lists **ambient_light (ams TMD3702), proximi
 mag**; the ALS on-change stream starts at 12.6 s, **lux 470-520 indoors**, 70 reports. Failed calls
 (542): the 53 vendor json configs (stat served, content not, each tried 10 times) and Huaqin's
 `/sys/class/huaqin/interface/hw_info/pcba_config`; they did not block registration but probably
-explain most of the 11.5 s between listener and sensors. Next: serve the json contents, then lux to
-CoreBrightness (ALS HID events) for auto-brightness.
+explain most of the 11.5 s between listener and sensors.
+
+boot-51 (0135/0136, `../out/boot51-log34.txt`): the 53 json served from memory-only drop entries
+(`SWEET DROP: 53 files kept in memory`, all 53 opened). **Worse**: with the contents the PD re-parses
+the configs and rebuilds the registry: 2070 refused write opens of `registry/../temp.json`, asks for
+an apps-side `sns_registry` interface (not served), and the sensors register only at **40 s**
+(12 s with stat-only json). Persist stays untouched (all writes refused). Decision: keep 0135/0136
+as a mechanism but do **not** put the json into the drop; stat-only lets the PD use the stored
+registry. A likely trigger is a config selector that differs from Android's (e.g. the missing
+Huaqin `pcba_config`). Next: lux to CoreBrightness (ALS HID events) for auto-brightness.
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
@@ -260,7 +268,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0133 | Serialize complete GPU initialization so framebuffer waits through RPM and does not permanently disable flips; host regression/compile pass, boot pending |
 | 0134 | Kernel-read sweetgpu canary, retained result params 8..13 and IOLog summary; updated test tool; local checks pass, boot pending |
 | 0135 | drop: memory-only entries (`SWEET_DROP_MEM`, `mkdrop.py ... :mem` / `--mem-dir`), `sweet_drop_find()`; up to 256 entries |
-| 0136 | apps_std: files the drop keeps in memory, first the 53 vendor sensor json configs (EROFS vendor, never committed) |
+| 0136 | apps_std: files the drop keeps in memory; tried with the 53 vendor sensor json on boot-51: the PD then rebuilds the registry (40 s), so the json stay out of the drop |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
