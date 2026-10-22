@@ -116,6 +116,14 @@ answers VERSION within 1 ms and opens `glink_ssr`, `IPCRTR`, `fastrpcglink-apps-
 `avs/audio` (none mapped yet), `tms/pdr_enabled` and `tms/pddump_disabled`. No FastRPC is needed to
 reach the sensor service: 0124 talks QMI/protobuf to it directly.
 
+boot-44 (0124, `../out/boot44-log27.txt`): the SEE protocol works (all six requests answered `ok`,
+six SUID events decoded), but every lookup (ambient_light, proximity, accel, gyro, mag, pressure)
+returns **0 sensors**, and no update arrives later in the session. The physical sensor drivers do
+not register: on Linux they need the sensor registry and config (`/mnt/vendor/persist/sensors/registry`,
+`/vendor/etc/sensors/config/*.json`), which the DSP reads from the apps side through FastRPC
+(`fastrpcglink-apps-dsp`, the apps_std file listener that sscrpcd/hexagonrpcd run). Next for the ALS:
+an in-kernel FastRPC listener serving those files read-only.
+
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
 `tools/mkdrop.py` packs files (optionally a merged `launchd.plist` with one extra job) into a
