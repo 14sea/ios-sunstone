@@ -1,9 +1,11 @@
-# sunstone GPU recovery and fixed clocks (0125, 0130)
+# sunstone GPU recovery and fixed clocks (0125, 0130, 0131)
 
 2026-10-22. Implemented and checked locally; **not yet built as a full kernel or booted**.
 Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
 Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):
 firmware FIFO takeover, feature negotiation, the recovery budget and zap retry.
+0131 (`7e9f53c` in fork, XNU `1888049`) restores the normal a6xx secure-mode
+restart; SCM stays a fallback only.
 The last device evidence remains boot-36 (`../out/boot36-log19.txt`). The default
 clock stays at the shim's 300 MHz. No partitions were flashed for this change.
 
@@ -39,10 +41,14 @@ display fence timeout, recovery:
 5. Requires a new cache-flush fence before accepting another submission. If that
    first restart fence fails, drains and resets again, then attempts one SCM
    `BOOT_SET_REMOTE_STATE(ZAP_SHADER_RESUME=0, GPU_PAS=13)` and restarts once more.
-   The v1 shim handoff has no `zap_ok`: the first attempt omits `CP_SET_SECURE_MODE`;
-   only a successful SCM resume authorizes `CP_SET_SECURE_MODE 0` on the retry.
-   SCM transport and firmware result must both be zero. Interrupted sessions
-   preserve x6 and have a maximum of 32 SMC entries; no firmware reload is attempted.
+   **Attempt 0 always emits `CP_SET_SECURE_MODE 0` after `CP_ME_INIT`, with no SCM
+   call**, following Linux a6xx's reuse of an already-loaded zap shader. A normal
+   restart therefore works even if TZ does not support SCM zap resume. SCM is
+   only the attempt-1 fallback after a failed restart fence; its transport and
+   firmware result must both be zero before retrying the secure-mode packet.
+   Interrupted sessions preserve x6 and have a maximum of 32 SMC entries; no
+   firmware reload is attempted. The earlier 0130 assumption that every secure-mode
+   packet needed a successful SCM resume was incorrect for a6xx.
 
 The failed submission/frame still reports failure; a successful reset allows the
 next one to run. The framebuffer finishes a failed frame on the CPU and clears
@@ -115,8 +121,8 @@ identity), `../research/linux-msm/gpucc-sm6375.c`,
 in a temporary directory and executes their actual C++ with IOKit/MMIO substitutes
 and UBSan. Tests cover handoff initialization, recovery order, stalled/faulted IBs,
 next-submission success, failed bus drain/restart, pinned BO lifetime, the
-three-failure cutoff and real-work reset of that budget, conditional zap resume
-and bounded interrupted sessions, 400/600 MHz with firmware-era FIFO indices and
+three-failure cutoff and real-work reset of that budget, normal secure-mode
+restart with SCM unsupported, fallback-only zap resume and bounded interrupted sessions, 400/600 MHz with firmware-era FIFO indices and
 nonzero feature offers, AP/RPM index ownership, counter-offer negotiation,
 malformed/stale/error/missing ACKs, FIFO wrap and 2D fallback. `--source-root ../work/xnu` also requires byte-identical patched sources;
 `--catalog ../research/linux-msm/a6xx_catalog.c` compares all 32 protection words.

@@ -2,7 +2,8 @@
 
 ## sunstone GPU handoff (2026-10-22, review follow-up)
 
-Review-fix code commit: `d594f7f` (fork), matching XNU `f8dc8b9`.
+Latest correction: `7e9f53c` (fork, 0131), matching XNU `1888049`.
+Earlier review fixes: `d594f7f` (fork, 0130), matching XNU `f8dc8b9`.
 Initial implementation: `a86ccf0` (fork), matching XNU `cfbc46f`. Patch 0130 fixes the
 review findings: clear only AP-owned TX head/RX tail on firmware-link takeover,
 accept VERSION feature offers and negotiate zero, and stop on the third consecutive
@@ -10,14 +11,17 @@ workload failure. Restart probe fences do not clear the streak; real client/disp
 work and the verified clock selftest do. The iOS test now runs a valid IB after each
 deliberate fault, so independent tests do not exhaust the recovery budget.
 
-A failed first restart fence has one additional drain/reset attempt with SCM zap
-resume (state 0, GPU PAS 13). The v1 handoff has no zap_ok, so SET_SECURE_MODE 0 is
-now emitted only after a successful resume; SCM transport and result must both be
-zero, with at most 32 interrupted-session SMC entries. Resume/retry failure holds
-reset and disables the GPU. No shim ABI or firmware loading changes.
+0131 corrects the earlier a6xx/a5xx mix-up: attempt 0 always emits
+SET_SECURE_MODE 0 after ME_INIT without calling SCM, reusing the already-loaded
+zap shader like Linux a6xx. A failed first restart fence still permits one more
+drain/reset attempt with SCM zap resume (state 0, GPU PAS 13) as a best-effort
+fallback only. Normal recovery works with that SCM call unsupported. The fallback
+requires both transport/result zero; interrupted sessions are bounded to 32 SMC
+entries. Failure holds reset and disables the GPU. No shim ABI/firmware loading changes.
 
 Patch-series reconstruction, all UBSan host checks (including nonzero firmware
-indices/features, repeated bad frames and zap success/rejection/interruption) and
+indices/features, repeated bad frames, normal secure0 with SCM unsupported,
+and fallback zap success/rejection/interruption) and
 the changed SweetGPU.cpp arm64 Mach-O compile with real headers/build files from
 CI 39733814183 / artifact 12405779477 passed. iOS test source syntax check passed.
 No new full kernel link, push, CI dispatch, boot or flash. Recovery, zap and high
