@@ -99,7 +99,7 @@ Gunyah); the firmware still reaches mission mode and scans. Firmware reports MAC
 uses its own locally administered address. **iOS does not see any of it yet**: topaz's public tree has
 no consumer of the `topaz_wlan_*` C API (no ifnet, no IO80211/Apple80211 layer for wifid).
 
-### ADSP (0121/0122, boot-41/42, `../out/boot42-log25.txt`)
+### ADSP (0121-0124, boot-41..44)
 
 `adsp=1` boots the LPASS DSP through PAS (id 1) with the generic `pas_boot()`: adsp.mdt is linked at
 0x53400000 and relocated into adsp@86700000 (0x2800000, exactly its size), init_image/mem_setup/auth
@@ -107,7 +107,14 @@ no consumer of the `topaz_wlan_*` C API (no ifnet, no IO80211/Apple80211 layer f
 (master-kernel, sleepstate) made first and IPCC client 3 rung (0122), boot-42 shows
 `slave-kernel 00000006 READY` 40 ms after auth. SMEM apps<->adsp then holds 478/479/480 (its GLINK edge),
 429/443 (SMP2P) and 606/611/613. The LPI cx/mx proxy rails were not voted and were not needed.
-Next: GLINK + QRTR on the lpass edge (the GLINK code is modem-only so far), then the sensor PD.
+
+boot-43 (0123, `../out/boot43-log26.txt`): the same GLINK/QRTR stack runs on the ADSP edge. The ADSP
+answers VERSION within 1 ms and opens `glink_ssr`, `IPCRTR`, `fastrpcglink-apps-dsp`,
+`LOOPBACK_CTL_LPASS` and `apr_audio_svc`; QRTR HELLO from node 5, then 15 services: servreg-notif
+0x42:4a01, ssctl 0x2b:1402, test 0x0f (3 instances), coresight 0x33 (2), TMD 0x18:101, slimbus
+0x301:1, 0x1004:a, and **the SEE sensor client service 400 (0x190:1)**. It asks pd-mapper for
+`avs/audio` (none mapped yet), `tms/pdr_enabled` and `tms/pddump_disabled`. No FastRPC is needed to
+reach the sensor service: 0124 talks QMI/protobuf to it directly.
 
 ### Boot-image drop (0097/0099) and the boot-22/23 story
 
