@@ -340,13 +340,15 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
 | # | Item | Owner | Status | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Wi-Fi: port `TopazModem` (topaz 0113-0130) to the SM4375 modem subsystem | C | [~] | radio, WPA2 join and IP data path done (0117-0119, boot-39). Next: the iOS side (ifnet + IO80211/Apple80211 for wifid), which topaz never published |
-| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111; all 32 CP_PROTECT entries match Linux; boot-47 passes fault/wedge/protect recovery and canaries at 300 MHz |
+| 2 | GPU user client with per-process SMMU page tables + IOSurface for CoreAnimation's GL renderer | U | [x] | 0109-0111; all 32 CP_PROTECT entries match Linux; CP recovery after a wedge/fault (0125, 0130, 0131): `sweetgpu --wedge --protect` passes at 300 (boot-47), 400 (boot-49) and 600 MHz (boot-50) with three attempt-0 recoveries and the kernel-recorded canary (0134) |
 | 3a | Console filter (topaz 0112) as `sweetcons=WORDS`; `sweetfb_console=1` (topaz 0120) | C | [~] | filter done (0115); topaz 0120 touches SweetFramebuffer.cpp (user's area) |
 | 3b | `sweetbusy=N` and no registry-root busy hold for the IOKit daemon (topaz 0127/0128) | C | [x] | 0115 |
 | 3c | Empty `IOAcceleratorES` (topaz 0138) | U | [x] | 0111 |
 | 4 | RTC offset without a boot-arg: on UFS next to the log ring, updated from setUTCTimeOfDay, seeded with `tools/sweet-rtc-seed.sh` | C | [x] | 0116, boot-34; boot-arg stays as override |
 | 5 | Audio: ADSP/AudioReach to the speaker (topaz-woa `TopazAudio`/`TopazSpeaker` as reference) | - | [ ] | neither upstream has it |
 | 6 | GPU clock above 300 MHz (GX rail vote) | U | [x] | 0125/0130/0131/0133/0134: opt-in `sweetgpu_mhz=400/600`, RPM ACKs + 2D selftest; boot-49 (400) and boot-50 (600) PASS with page flips on. Default stays 300 (no thermal governor, no DDR vote) |
+| 6b | GPU clock follow-ups: measure the real core clock (CORE_MHZ is RCG readback plus selftest), temperature over long runs at 600 MHz (no thermal governor), DDR bandwidth votes like the stock OPPs | U | [ ] | before any default above 300 MHz; 600 MHz gains only ~8% on today's 2D copies |
+| 6c | GPU rendering for CoreAnimation (Mesa/freedreno-style GL path on the isolated user client) | U | [ ] | today CoreAnimation draws on the CPU and the GPU only copies frames; Settings still crashes in CoreImage's GL path (open item 6) |
 | 7 | Auto-brightness: ambient light sensor driver + CoreBrightness ALS HID events | C | [ ] deferred | The kernel side works (boot-46..52): lux on-change reports from the ADSP. The iOS side was tried in boot-52 (0137, parked in `xnu/patches-unused/`) and reverted: see "ADSP and sensors". To find out next: what makes Settings/CoreBrightness offer auto-brightness (MobileGestalt `ambient-light-sensor`, possibly cached; CoreBrightness `AutoBrightnessAvailable`) and where libEDR's brightness animation curve comes from (model/platform/OLED tables or an `IOMobileFramebufferGetBlock` block from the framebuffer, i.e. SweetFramebuffer, user's area). Needs disassembly of CoreBrightness/libEDR: blacktop `ipsw` is in the workspace (`../tools/ipsw`: `ipsw dyld a2s`, `ipsw dyld disass` on the SystemOS cryptex's shared cache) |
 | 8 | Battery: remaining capacity (0x84), full charge capacity as MaxCapacity, time remaining, current sign check | C | [x] | 0120, boot-40: unplugged -494..-790 mA, RMC 4864 -> 4831 mAh, replugged +84 mA charging=1 |
 | 9 | Bluetooth, cellular data, camera, sensors, GPS, SEP, App Store/Apple ID, security model | - | [ ] | nobody has these |
@@ -360,9 +362,8 @@ Owner U = user, C = Claude. Status: [ ] open, [~] in progress, [x] done.
    hypervisor); harmless so far. The WLAN MAC is the driver's fixed locally administered address
    (persist/wlan_mac.bin is not read).
 3. Test credentials for `wlantest=1` sit on userdata (`tools/sweet-wlan-seed.sh --clear` wipes them).
-4. GPU: recovery and opt-in 400/600 MHz validated (boot-47..50, see "GPU"); still unproven: the real
-   GPU clock (CORE_MHZ is RCG readback plus selftest), long runs at 600 MHz (no thermal governor), DDR
-   bandwidth votes. Default remains 300 MHz.
+4. GPU: recovery and opt-in 400/600 MHz validated (boot-47..50, see "GPU"); the remaining clock work
+   and GPU rendering are TODO 6b/6c. Default remains 300 MHz.
 5. CPU frequency: only the shim's one-time EPSS vote; the kernel side stays off (`sweetcpufreq=0`).
 6. Recurring crashes, all pre-existing: driverkitd sig 9 every boot; PosterBoard now and then; Settings
    (Preferences) when it draws app icons through CoreImage's GL path (no GL renderer yet).

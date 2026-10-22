@@ -197,7 +197,8 @@ the recovery budget between independent tests; three deliberate failures in a ro
 would now correctly disable the GPU. Opt-in `--wedge` submits an impossible `CP_WAIT_REG_MEM` on a
 mapped BO; `--protect` exercises the protection fault described above.
 
-Next steps:
+Next steps (status 2026-10-22: 1, 2 and 4 done with boot-49, 600 MHz passed on boot-50; the real
+clock, temperature and DDR votes of step 3 are open as SUNSTONE.md TODO 6b):
 
 1. Build the full kernel with 0133/0134 and rebuild ios-tools.
 2. Repeat boot-48 at `sweetgpu_mhz=400`, running `sweetgpu --wedge --protect`.

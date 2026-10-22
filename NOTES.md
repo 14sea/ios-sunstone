@@ -35,6 +35,10 @@ Next for sensors: auto-brightness, deferred (see below).
 
 ## sunstone GPU handoff (2026-10-22, boot-48 follow-up)
 
+**Status note (2026-10-22, after boot-50):** superseded by boot-49 (400 MHz) and boot-50 (600 MHz):
+both pass with page flips on and the kernel-recorded `PASS`; results in SUNSTONE.md ("GPU"),
+remaining GPU work in TODO 6b/6c.
+
 Code commit: `834e51c` (fork, 0133/0134), matching XNU `2967215`.
 
 Boot-47 (`../out/boot47-log30.txt`) at 300 MHz has all 13 SWEETGPU lines,
@@ -71,6 +75,10 @@ canary 0xc0ffee45; then sustained UI and 600 MHz validation. Default stays 300.
 See [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md).
 
 ## Earlier GPU review follow-up (2026-10-22, before boot-47/48)
+
+**Status note (2026-10-22, after boot-50):** superseded by boot-49 (400 MHz) and boot-50 (600 MHz):
+both pass with page flips on and the kernel-recorded `PASS`; results in SUNSTONE.md ("GPU"),
+remaining GPU work in TODO 6b/6c.
 
 Latest correction: `7e9f53c` (fork, 0131), matching XNU `1888049`.
 Earlier review fixes: `d594f7f` (fork, 0130), matching XNU `f8dc8b9`.
