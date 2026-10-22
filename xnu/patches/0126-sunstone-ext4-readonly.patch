@@ -1,0 +1,438 @@
+diff --git a/iokit/Kernel/arm/SweetExt4.cpp b/iokit/Kernel/arm/SweetExt4.cpp
+new file mode 100644
+index 0000000..1ad0362
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetExt4.cpp
+@@ -0,0 +1,363 @@
++/*
++ * Read-only ext4 through sweet_ufs (sunstone), see SweetExt4.h. First user: the sensor
++ * registry on persist that the ADSP reads through FastRPC (SweetAppsStd.cpp).
++ * On-disk layout per the kernel's Documentation/filesystems/ext4 (superblock at byte 1024,
++ * group descriptors in the block after it, extent tree in i_block).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <sys/param.h>
++#include <sys/errno.h>
++#include "SweetExt4.h"
++
++extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++#define LOG(fmt, ...)           IOLog("SWEET EXT4: " fmt "\n", ##__VA_ARGS__)
++
++#define EXT4_MAGIC              0xEF53
++#define EXT4_EXT_MAGIC          0xF30A
++#define INCOMPAT_RECOVER        0x0004u
++#define INCOMPAT_META_BG        0x0010u
++#define INCOMPAT_64BIT          0x0080u
++#define INCOMPAT_ENCRYPT        0x10000u
++/* filetype, recover, journal_dev, extents, 64bit, flex_bg, ea_inode, csum_seed, largedir, inline_data */
++#define INCOMPAT_KNOWN          (0x0002u | INCOMPAT_RECOVER | 0x0008u | 0x0040u | INCOMPAT_64BIT | 0x0200u | 0x0400u | \
++	                        0x2000u | 0x4000u | 0x8000u)
++#define FL_EXTENTS              0x00080000u
++#define FL_INLINE_DATA          0x10000000u
++#define S_IFMT_                 0xF000u
++#define S_IFDIR_                0x4000u
++#define INODE_BYTES             128u                    /* what we look at: up to i_size_high */
++
++static inline uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++
++static int
++dev_read(struct sweet_ext4 *fs, uint64_t off, void *dst, uint32_t len)
++{
++	return sweet_ufs_read_part(fs->part, off, dst, len);
++}
++
++extern "C" int
++sweet_ext4_mount(struct sweet_ext4 *fs, const char *part)
++{
++	uint8_t *sb = (uint8_t *)IOMallocZeroData(1024);
++	int err;
++
++	if (sb == NULL) {
++		return ENOMEM;
++	}
++	bzero(fs, sizeof(*fs));
++	strlcpy(fs->part, part, sizeof(fs->part));
++	err = dev_read(fs, 1024, sb, 1024);
++	if (err != 0) {
++		IOFreeData(sb, 1024);
++		return err;
++	}
++	uint32_t log_bs = le32(sb + 0x18), incompat = le32(sb + 0x60);
++	uint64_t blocks = le32(sb + 0x04);
++	uint32_t per_group = le32(sb + 0x20);
++	if (le16(sb + 0x38) != EXT4_MAGIC || log_bs > 6 || per_group == 0) {
++		LOG("%s: not ext4 (magic %04x)", part, le16(sb + 0x38));
++		IOFreeData(sb, 1024);
++		return EINVAL;
++	}
++	if (incompat & INCOMPAT_64BIT) {
++		blocks |= (uint64_t)le32(sb + 0x150) << 32;
++	}
++	fs->block_size = 1024u << log_bs;
++	fs->inode_size = le32(sb + 0x4C) == 0 ? 128 : le16(sb + 0x58);
++	fs->inodes_per_group = le32(sb + 0x28);
++	fs->desc_size = (incompat & INCOMPAT_64BIT) ? le16(sb + 0xFE) : 32;
++	fs->first_data_block = le32(sb + 0x14);
++	fs->groups = (uint32_t)((blocks - fs->first_data_block + per_group - 1) / per_group);
++	IOFreeData(sb, 1024);
++	if ((incompat & ~INCOMPAT_KNOWN) != 0 || (incompat & (INCOMPAT_META_BG | INCOMPAT_ENCRYPT)) != 0 ||
++	    fs->inode_size < INODE_BYTES || fs->desc_size < 32 || fs->inodes_per_group == 0) {
++		LOG("%s: unsupported layout: incompat %x inode %u desc %u", part, incompat, fs->inode_size, fs->desc_size);
++		return ENOTSUP;
++	}
++	fs->buf = (uint8_t *)IOMallocData(2 * fs->block_size);
++	if (fs->buf == NULL) {
++		return ENOMEM;
++	}
++	LOG("%s: %u-byte blocks, %llu blocks, %u groups, %u-byte inodes%s", part, fs->block_size, blocks, fs->groups,
++	    fs->inode_size, (incompat & INCOMPAT_RECOVER) ? ", journal not replayed" : "");
++	return 0;
++}
++
++/* the first INODE_BYTES bytes of inode ino */
++static int
++read_inode(struct sweet_ext4 *fs, uint32_t ino, uint8_t *inode)
++{
++	uint8_t desc[64];
++	int err;
++
++	if (ino == 0 || (ino - 1) / fs->inodes_per_group >= fs->groups) {
++		return ENOENT;
++	}
++	uint32_t group = (ino - 1) / fs->inodes_per_group, index = (ino - 1) % fs->inodes_per_group;
++	uint64_t gdt = (uint64_t)(fs->first_data_block + 1) * fs->block_size;
++	err = dev_read(fs, gdt + (uint64_t)group * fs->desc_size, desc, MIN(fs->desc_size, (uint32_t)sizeof(desc)));
++	if (err != 0) {
++		return err;
++	}
++	uint64_t table = le32(desc + 8);
++	if (fs->desc_size >= 64) {
++		table |= (uint64_t)le32(desc + 0x28) << 32;
++	}
++	return dev_read(fs, table * fs->block_size + (uint64_t)index * fs->inode_size, inode, INODE_BYTES);
++}
++
++static uint64_t
++inode_size(const uint8_t *inode)
++{
++	return le32(inode + 4) | (uint64_t)le32(inode + 0x6C) << 32;
++}
++
++/* physical block of logical block lblk, 0 for a hole or an unwritten extent */
++static int
++map_block(struct sweet_ext4 *fs, const uint8_t *inode, uint32_t lblk, uint64_t *pblk)
++{
++	uint8_t *tree = fs->buf + fs->block_size;
++	*pblk = 0;
++
++	if (le32(inode + 0x20) & FL_EXTENTS) {
++		const uint8_t *node = inode + 0x28;
++		uint32_t room = 60;
++		for (unsigned level = 0; level < 6; level++) {
++			uint16_t n = le16(node + 2), depth = le16(node + 6);
++			if (le16(node) != EXT4_EXT_MAGIC || 12u + 12u * n > room) {
++				return EIO;
++			}
++			const uint8_t *e = node + 12;
++			if (depth == 0) {
++				for (uint16_t i = 0; i < n; i++, e += 12) {
++					uint32_t first = le32(e), len = le16(e + 4);
++					bool unwritten = len > 32768;
++					len = unwritten ? len - 32768 : len;
++					if (lblk >= first && lblk - first < len) {
++						if (!unwritten) {
++							*pblk = ((uint64_t)le16(e + 6) << 32 | le32(e + 8)) + (lblk - first);
++						}
++						return 0;
++					}
++				}
++				return 0;                           /* hole */
++			}
++			const uint8_t *pick = NULL;
++			for (uint16_t i = 0; i < n; i++, e += 12) {
++				if (le32(e) <= lblk) {
++					pick = e;
++				}
++			}
++			if (pick == NULL) {
++				return 0;
++			}
++			uint64_t leaf = le32(pick + 4) | (uint64_t)le16(pick + 8) << 32;
++			int err = dev_read(fs, leaf * fs->block_size, tree, fs->block_size);
++			if (err != 0) {
++				return err;
++			}
++			node = tree;
++			room = fs->block_size;
++		}
++		return EIO;
++	}
++	if (lblk < 12) {
++		*pblk = le32(inode + 0x28 + 4 * lblk);
++		return 0;
++	}
++	if (lblk - 12 < fs->block_size / 4) {
++		uint32_t ind = le32(inode + 0x28 + 48), v = 0;
++		if (ind == 0) {
++			return 0;
++		}
++		int err = dev_read(fs, (uint64_t)ind * fs->block_size + 4 * (lblk - 12), &v, 4);
++		*pblk = v;
++		return err;
++	}
++	return EFBIG;                                   /* double/triple indirect: not on our volumes */
++}
++
++static int
++read_data(struct sweet_ext4 *fs, const uint8_t *inode, uint64_t off, void *dst, uint32_t len, uint32_t *got)
++{
++	uint64_t size = inode_size(inode);
++	uint32_t done = 0;
++	int err = 0;
++
++	*got = 0;
++	if (off >= size) {
++		return 0;
++	}
++	len = (uint32_t)MIN((uint64_t)len, size - off);
++	if (le32(inode + 0x20) & FL_INLINE_DATA) {
++		if (off + len > 60) {
++			return ENOTSUP;                     /* the rest would be in the system.data xattr */
++		}
++		memcpy(dst, inode + 0x28 + off, len);
++		*got = len;
++		return 0;
++	}
++	while (done < len && err == 0) {
++		uint64_t pos = off + done, pblk = 0;
++		uint32_t in = (uint32_t)(pos % fs->block_size), take = MIN(fs->block_size - in, len - done);
++		err = map_block(fs, inode, (uint32_t)(pos / fs->block_size), &pblk);
++		if (err == 0 && pblk == 0) {
++			bzero((uint8_t *)dst + done, take);
++		} else if (err == 0) {
++			err = dev_read(fs, pblk * fs->block_size + in, (uint8_t *)dst + done, take);
++		}
++		if (err == 0) {
++			done += take;
++		}
++	}
++	*got = done;
++	return err;
++}
++
++/* the directory entry at *pos (advanced past it); *child 0 means an empty slot */
++static int
++dir_entry(struct sweet_ext4 *fs, const uint8_t *inode, uint64_t *pos, char *name, uint32_t *child)
++{
++	uint8_t *blk = fs->buf;
++	uint32_t got = 0, in = (uint32_t)(*pos % fs->block_size);
++	int err = read_data(fs, inode, *pos - in, blk, fs->block_size, &got);
++
++	if (err != 0) {
++		return err;
++	}
++	if (in + 8 > got) {
++		return EIO;
++	}
++	uint32_t ino = le32(blk + in), rec = le16(blk + in + 4), nlen = blk[in + 6];
++	if (rec < 8 || (rec & 3) != 0 || in + rec > got || 8 + nlen > rec) {
++		return EIO;
++	}
++	memcpy(name, blk + in + 8, nlen);
++	name[nlen] = 0;
++	*child = ino;
++	*pos += rec;
++	return 0;
++}
++
++extern "C" int
++sweet_ext4_readdir(struct sweet_ext4 *fs, uint32_t ino, uint64_t *cookie, char *name, uint32_t *child)
++{
++	uint8_t inode[INODE_BYTES];
++	int err = read_inode(fs, ino, inode);
++
++	name[0] = 0;
++	*child = 0;
++	if (err != 0) {
++		return err;
++	}
++	if ((le16(inode) & S_IFMT_) != S_IFDIR_) {
++		return ENOTDIR;
++	}
++	while (*cookie < inode_size(inode)) {
++		err = dir_entry(fs, inode, cookie, name, child);
++		if (err != 0) {
++			name[0] = 0;
++			return err;
++		}
++		if (*child != 0 && strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
++			return 0;
++		}
++	}
++	name[0] = 0;
++	*child = 0;
++	return 0;
++}
++
++extern "C" int
++sweet_ext4_lookup(struct sweet_ext4 *fs, const char *path, uint32_t *ino)
++{
++	char want[SWEET_EXT4_NAME_MAX + 1], name[SWEET_EXT4_NAME_MAX + 1];
++	uint8_t inode[INODE_BYTES];
++	uint32_t cur = SWEET_EXT4_ROOT;
++
++	while (*path != 0) {
++		size_t n = 0;
++		while (*path == '/') {
++			path++;
++		}
++		while (path[n] != 0 && path[n] != '/') {
++			n++;
++		}
++		if (n == 0) {
++			break;
++		}
++		if (n > SWEET_EXT4_NAME_MAX) {
++			return ENAMETOOLONG;
++		}
++		memcpy(want, path, n);
++		want[n] = 0;
++		path += n;
++		if (strcmp(want, ".") == 0) {
++			continue;
++		}
++		int err = read_inode(fs, cur, inode);
++		if (err != 0) {
++			return err;
++		}
++		if ((le16(inode) & S_IFMT_) != S_IFDIR_) {
++			return ENOTDIR;
++		}
++		uint32_t found = 0, child = 0;
++		for (uint64_t pos = 0; pos < inode_size(inode) && found == 0;) {
++			err = dir_entry(fs, inode, &pos, name, &child);
++			if (err != 0) {
++				return err;
++			}
++			if (child != 0 && strcmp(name, want) == 0) {
++				found = child;
++			}
++		}
++		if (found == 0) {
++			return ENOENT;
++		}
++		cur = found;
++	}
++	*ino = cur;
++	return 0;
++}
++
++extern "C" int
++sweet_ext4_stat(struct sweet_ext4 *fs, uint32_t ino, struct sweet_ext4_stat *st)
++{
++	uint8_t inode[INODE_BYTES];
++	int err = read_inode(fs, ino, inode);
++
++	if (err != 0) {
++		return err;
++	}
++	st->mode = le16(inode);
++	st->links = le16(inode + 0x1A);
++	st->size = inode_size(inode);
++	st->atime = le32(inode + 0x08);
++	st->ctime = le32(inode + 0x0C);
++	st->mtime = le32(inode + 0x10);
++	return 0;
++}
++
++extern "C" int
++sweet_ext4_read(struct sweet_ext4 *fs, uint32_t ino, uint64_t off, void *dst, uint32_t len, uint32_t *got)
++{
++	uint8_t inode[INODE_BYTES];
++	int err = read_inode(fs, ino, inode);
++
++	*got = 0;
++	if (err != 0) {
++		return err;
++	}
++	if ((le16(inode) & S_IFMT_) == S_IFDIR_) {
++		return EISDIR;
++	}
++	return read_data(fs, inode, off, dst, len, got);
++}
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetExt4.h b/iokit/Kernel/arm/SweetExt4.h
+new file mode 100644
+index 0000000..ce7e2b4
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetExt4.h
+@@ -0,0 +1,51 @@
++/*
++ * Read-only ext4 on a GPT partition of the UFS disk, through sweet_ufs_read_part()
++ * (bsd/dev/sweet_ufs.c). Enough for small Android volumes like persist: extents (any depth)
++ * or direct/single-indirect block maps, linear directory scans (htree directories read fine
++ * that way), 32- and 64-bit group descriptors. No journal replay, no writes.
++ *
++ * A volume keeps one scratch buffer: calls on the same volume must not run concurrently.
++ */
++#ifndef _IOKIT_SWEETEXT4_H
++#define _IOKIT_SWEETEXT4_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SWEET_EXT4_ROOT     2u
++#define SWEET_EXT4_NAME_MAX 255u
++
++struct sweet_ext4 {
++	char part[40];
++	uint32_t block_size, inode_size, inodes_per_group, desc_size, groups, first_data_block;
++	uint8_t *buf;                                   /* 2 blocks: data + extent tree walk */
++};
++
++struct sweet_ext4_stat {
++	uint16_t mode;                                  /* S_IFMT bits and permissions, as on disk */
++	uint16_t links;
++	uint64_t size;
++	uint32_t mtime, ctime, atime;
++};
++
++/* 0 or an errno: EAGAIN while the UFS driver is not up yet, EINVAL for not-ext4 */
++int sweet_ext4_mount(struct sweet_ext4 *fs, const char *part);
++int sweet_ext4_lookup(struct sweet_ext4 *fs, const char *path, uint32_t *ino);
++int sweet_ext4_stat(struct sweet_ext4 *fs, uint32_t ino, struct sweet_ext4_stat *st);
++/* reads up to len bytes at off; *got is short only at the end of the file */
++int sweet_ext4_read(struct sweet_ext4 *fs, uint32_t ino, uint64_t off, void *dst, uint32_t len, uint32_t *got);
++/*
++ * Next entry of directory ino after *cookie (start with 0), "." and ".." skipped. name gets
++ * SWEET_EXT4_NAME_MAX + 1 bytes; an empty name and return 0 means the end.
++ */
++int sweet_ext4_readdir(struct sweet_ext4 *fs, uint32_t ino, uint64_t *cookie, char *name, uint32_t *child);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _IOKIT_SWEETEXT4_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index c247e7b..c21e536 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetExt4.cpp                                 optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

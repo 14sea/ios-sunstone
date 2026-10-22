@@ -1,0 +1,577 @@
+diff --git a/iokit/Kernel/arm/TopazDSP.h b/iokit/Kernel/arm/TopazDSP.h
+new file mode 100644
+index 0000000..06e9ffe
+--- /dev/null
++++ b/iokit/Kernel/arm/TopazDSP.h
+@@ -0,0 +1,40 @@
++/*
++ * What TopazModem offers to other drivers that talk to the ADSP (sunstone).
++ *
++ * TopazModem boots the ADSP (adsp=1) and runs its GLINK edge on the modem thread. A client
++ * named in TopazModem's dsp_clients[] gets one GLINK channel on that edge: the ADSP opens it,
++ * TopazModem answers, and from then on every callback below runs on the modem thread, so a
++ * client needs no locking against itself. topaz_dsp_send() may only be called from there too.
++ */
++#ifndef _IOKIT_TOPAZDSP_H
++#define _IOKIT_TOPAZDSP_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct topaz_dsp_client {
++	const char *channel;                            /* GLINK channel name on the ADSP edge */
++	void (*rx)(const uint8_t *p, uint32_t len);     /* one whole packet from the ADSP */
++	void (*up)(void);                               /* the channel is open both ways (once) */
++	void (*poll)(unsigned ms);                      /* every pass of the ADSP watch, ms since GLINK start */
++	void (*summary)(void);                          /* with the edge summary in the log */
++};
++
++/* queue one packet on the client's channel; false when the channel is not up or the queue is full */
++bool topaz_dsp_send(const struct topaz_dsp_client *c, const void *p, uint32_t len);
++
++/* an SMEM item from the global partition (read-only for the caller), NULL when absent */
++const void *topaz_smem_item(uint16_t item, uint32_t *size);
++
++/* route an apps-smmu stream through a context bank with translation off (IOVA == PA) */
++bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _IOKIT_TOPAZDSP_H */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 2f20459..43a7efe 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -30,6 +30,7 @@
+ #include <libkern/crc.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include "TopazDSP.h"
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -548,6 +549,26 @@ struct qrtr_ctrl { uint32_t cmd, a, b, c, d; } __attribute__((packed));
+  * Everything runs on the modem thread; replies leave on the edge whose QRTR node they go to.
+  */
+ #define TXQ_LEN 64
++#define GLINK_CHANS 3
++struct glink_edge;
++typedef void (*glink_rx_fn)(struct glink_edge *e, const uint8_t *p, uint32_t len);
++
++/* one GLINK channel: IPCRTR (QRTR) on every edge, the dsp_clients[] channels on the ADSP's */
++struct glink_chan {
++	const char *name;
++	glink_rx_fn rx;
++	const struct topaz_dsp_client *client;     /* NULL: ours (IPCRTR) */
++	bool client_up;
++	uint32_t lcid, rcid;
++	bool remote_open, open_sent, open_acked, intents_sent, intent_req_sent;
++	struct { uint32_t id, size; bool used; } ri[128];   /* the remote's RX intents */
++	unsigned ri_count, rx_pkts, tx_pkts;
++	uint8_t asm_buf[OUR_INTENT_SIZE];
++	uint32_t asm_len;
++	struct { void *p; uint32_t len; } txq[TXQ_LEN];   /* packets waiting for a free remote RX intent */
++	unsigned txq_head, txq_tail, txq_drops;
++};
++
+ struct glink_edge {
+ 	const char *name;
+ 	uint32_t client;                        /* IPCC client of the remote */
+@@ -555,17 +576,12 @@ struct glink_edge {
+ 	struct smem_part_hdr *part;
+ 	volatile uint32_t *desc;                /* [0] tx tail [1] tx head [2] rx tail [3] rx head */
+ 	uint8_t *tx, *rx;
+-	uint32_t rx_len, rcid;
+-	bool remote_open, open_sent, open_acked, intents_sent, intent_req_sent;
+-	struct { uint32_t id, size; bool used; } ri[256];
+-	unsigned ri_count;
+-	uint8_t asm_buf[OUR_INTENT_SIZE];
+-	uint32_t asm_len;
++	uint32_t rx_len;
++	struct glink_chan ch[GLINK_CHANS];
++	unsigned nch;
+ 	bool q_hello_sent, q_hello_rx, q_announced;
+ 	struct { uint32_t svc, inst, node, port; } q_srv[64];
+ 	unsigned q_srv_count, rx_msgs, tx_msgs, q_resumes, q_unhandled;
+-	struct { void *p; uint32_t len; } txq[TXQ_LEN];   /* packets waiting for a free remote RX intent */
+-	unsigned txq_head, txq_tail, txq_drops;
+ };
+ #define GLINK_EDGE_INIT(n, c) { n, c, GLINK_FEATURES, 1, 1, QRTR_NODE_BCAST }
+ static struct glink_edge e_modem = GLINK_EDGE_INIT("modem", IPCC_CLIENT_MPSS);
+@@ -667,23 +683,24 @@ send_cmd(struct glink_edge *e, uint16_t cmd, uint16_t p1, uint32_t p2)
+ }
+ 
+ static void
+-send_open(struct glink_edge *e)
++send_open(struct glink_edge *e, struct glink_chan *c)
+ {
+-	struct { struct glink_msg m; char name[8]; } __attribute__((packed)) req = {};
++	struct { struct glink_msg m; char name[40]; } __attribute__((packed)) req = {};
++	uint32_t n = (uint32_t)strlen(c->name) + 1;
+ 	req.m.cmd = CMD_OPEN;
+-	req.m.p1 = CHAN_LCID;
+-	req.m.p2 = sizeof(CHAN_NAME);
+-	memcpy(req.name, CHAN_NAME, sizeof(CHAN_NAME));
+-	tx_write(e, &req, sizeof(req), NULL, 0);
+-	e->open_sent = true;
++	req.m.p1 = (uint16_t)c->lcid;
++	req.m.p2 = n;
++	memcpy(req.name, c->name, MIN(n, (uint32_t)sizeof(req.name)));
++	tx_write(e, &req, sizeof(struct glink_msg) + ((n + 7) & ~7u), NULL, 0);
++	c->open_sent = true;
+ }
+ 
+ static void
+-advertise_intents(struct glink_edge *e, uint32_t count, uint32_t size)
++advertise_intents(struct glink_edge *e, struct glink_chan *c, uint32_t count, uint32_t size)
+ {
+ 	struct { struct glink_msg m; uint32_t pair[2 * OUR_INTENTS]; } __attribute__((packed)) m = {};
+ 	m.m.cmd = CMD_INTENT;
+-	m.m.p1 = CHAN_LCID;
++	m.m.p1 = (uint16_t)c->lcid;
+ 	m.m.p2 = count;
+ 	for (uint32_t i = 0; i < count && i < OUR_INTENTS; i++) {
+ 		m.pair[2 * i] = size;
+@@ -693,55 +710,80 @@ advertise_intents(struct glink_edge *e, uint32_t count, uint32_t size)
+ }
+ 
+ static bool
+-chan_up(struct glink_edge *e)
++chan_up(const struct glink_chan *c)
+ {
+-	return e->remote_open && e->open_acked;
++	return c->remote_open && c->open_acked;
++}
++
++static struct glink_chan *
++chan_by_rcid(struct glink_edge *e, uint32_t rcid)
++{
++	for (unsigned i = 0; i < e->nch; i++) {
++		if (e->ch[i].remote_open && e->ch[i].rcid == rcid) {
++			return &e->ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct glink_chan *
++glink_add_chan(struct glink_edge *e, const char *name, glink_rx_fn rx)
++{
++	if (e->nch >= GLINK_CHANS) {
++		return NULL;
++	}
++	struct glink_chan *c = &e->ch[e->nch++];
++	c->name = name;
++	c->rx = rx;
++	c->lcid = e->nch;                           /* 1: IPCRTR, 2: ... */
++	return c;
+ }
+ 
+ static bool
+-glink_try_send(struct glink_edge *e, const void *data, uint32_t len)
++glink_try_send(struct glink_edge *e, struct glink_chan *c, const void *data, uint32_t len)
+ {
+ 	unsigned i;
+-	for (i = 0; i < e->ri_count; i++) {
+-		if (!e->ri[i].used && e->ri[i].size >= len) {
++	for (i = 0; i < c->ri_count; i++) {
++		if (!c->ri[i].used && c->ri[i].size >= len) {
+ 			break;
+ 		}
+ 	}
+-	if (i == e->ri_count) {
+-		if (!e->intent_req_sent) {
+-			send_cmd(e, CMD_RX_INTENT_REQ, CHAN_LCID, len);
+-			e->intent_req_sent = true;
++	if (i == c->ri_count) {
++		if (!c->intent_req_sent) {
++			send_cmd(e, CMD_RX_INTENT_REQ, (uint16_t)c->lcid, len);
++			c->intent_req_sent = true;
+ 		}
+ 		return false;
+ 	}
+-	struct glink_data_hdr h = { { CMD_TX_DATA, CHAN_LCID, e->ri[i].id }, len, 0 };
+-	e->ri[i].used = true;
++	struct glink_data_hdr h = { { CMD_TX_DATA, (uint16_t)c->lcid, c->ri[i].id }, len, 0 };
++	c->ri[i].used = true;
++	c->tx_pkts++;
+ 	return tx_write(e, &h, sizeof(h), data, len);
+ }
+ 
+ static void
+-txq_pump(struct glink_edge *e)
++txq_pump(struct glink_edge *e, struct glink_chan *c)
+ {
+-	while (e->txq_head != e->txq_tail &&
+-	    glink_try_send(e, e->txq[e->txq_head % TXQ_LEN].p, e->txq[e->txq_head % TXQ_LEN].len)) {
+-		IOFree(e->txq[e->txq_head % TXQ_LEN].p, e->txq[e->txq_head % TXQ_LEN].len);
+-		e->txq_head++;
++	while (c->txq_head != c->txq_tail &&
++	    glink_try_send(e, c, c->txq[c->txq_head % TXQ_LEN].p, c->txq[c->txq_head % TXQ_LEN].len)) {
++		IOFree(c->txq[c->txq_head % TXQ_LEN].p, c->txq[c->txq_head % TXQ_LEN].len);
++		c->txq_head++;
+ 	}
+ }
+ 
+ static void
+-glink_send(struct glink_edge *e, const void *data, uint32_t len)
++glink_send(struct glink_edge *e, struct glink_chan *c, const void *data, uint32_t len)
+ {
+ 	void *p;
+-	if (e->txq_tail - e->txq_head >= TXQ_LEN || (p = IOMalloc(len)) == NULL) {
+-		e->txq_drops++;
++	if (c->txq_tail - c->txq_head >= TXQ_LEN || (p = IOMalloc(len)) == NULL) {
++		c->txq_drops++;
+ 		return;
+ 	}
+ 	memcpy(p, data, len);
+-	e->txq[e->txq_tail % TXQ_LEN].p = p;
+-	e->txq[e->txq_tail % TXQ_LEN].len = len;
+-	e->txq_tail++;
+-	txq_pump(e);
++	c->txq[c->txq_tail % TXQ_LEN].p = p;
++	c->txq[c->txq_tail % TXQ_LEN].len = len;
++	c->txq_tail++;
++	txq_pump(e, c);
+ }
+ 
+ /* ---------------------------------------------------------------- QRTR */
+@@ -781,7 +823,7 @@ edge_qrtr_send(struct glink_edge *e, uint32_t type, uint32_t src_port, uint32_t
+ 		n = sizeof(*h);
+ 	}
+ 	memcpy(buf + n, payload, len);
+-	glink_send(e, buf, (n + len + 3) & ~3u);
++	glink_send(e, &e->ch[0], buf, (n + len + 3) & ~3u);
+ 	IOFree(buf, cap);
+ }
+ 
+@@ -899,6 +941,7 @@ static bool
+ rx_one(struct glink_edge *e)
+ {
+ 	struct glink_msg m;
++	struct glink_chan *c;
+ 	uint32_t avail = rx_avail(e), n;
+ 
+ 	if (avail < sizeof(m)) {
+@@ -906,6 +949,7 @@ rx_one(struct glink_edge *e)
+ 	}
+ 	rx_peek(e, 0, &m, sizeof(m));
+ 	e->rx_msgs++;
++	/* p1 is the sender's channel id: our rcid, except in OPEN_ACK/CLOSE_ACK (our lcid) */
+ 	switch (m.cmd) {
+ 	case CMD_VERSION:
+ 		rx_advance(e, 8);
+@@ -931,13 +975,19 @@ rx_one(struct glink_edge *e)
+ 		}
+ 		rx_peek(e, 8, name, MIN(m.p2, 32u));
+ 		rx_advance(e, n);
+-		LOG("t=%u ms: %s: glink OPEN \"%s\" rcid %u", g_ms, e->name, name, m.p1);
+-		if (strcmp(name, CHAN_NAME) == 0) {
+-			e->rcid = m.p1;
+-			e->remote_open = true;
+-			send_cmd(e, CMD_OPEN_ACK, (uint16_t)e->rcid, 0);
+-			if (!e->open_sent) {
+-				send_open(e);
++		c = NULL;
++		for (unsigned i = 0; i < e->nch; i++) {
++			if (strcmp(name, e->ch[i].name) == 0) {
++				c = &e->ch[i];
++			}
++		}
++		LOG("t=%u ms: %s: glink OPEN \"%s\" rcid %u%s", g_ms, e->name, name, m.p1, c != NULL ? "" : " (not served)");
++		if (c != NULL) {
++			c->rcid = m.p1;
++			c->remote_open = true;
++			send_cmd(e, CMD_OPEN_ACK, (uint16_t)c->rcid, 0);
++			if (!c->open_sent) {
++				send_open(e, c);
+ 			}
+ 		}
+ 		break;
+@@ -945,16 +995,16 @@ rx_one(struct glink_edge *e)
+ 	case CMD_OPEN_ACK:
+ 		rx_advance(e, 8);
+ 		LOG("t=%u ms: %s: glink OPEN_ACK lcid %u", g_ms, e->name, m.p1);
+-		if (m.p1 == CHAN_LCID) {
+-			e->open_acked = true;
++		if (m.p1 >= 1 && m.p1 <= e->nch) {
++			e->ch[m.p1 - 1].open_acked = true;
+ 		}
+ 		break;
+ 	case CMD_CLOSE:
+ 		rx_advance(e, 8);
+ 		LOG("t=%u ms: %s: glink CLOSE rcid %u", g_ms, e->name, m.p1);
+ 		send_cmd(e, CMD_CLOSE_ACK, m.p1, 0);
+-		if (m.p1 == e->rcid) {
+-			e->remote_open = false;
++		if ((c = chan_by_rcid(e, m.p1)) != NULL) {
++			c->remote_open = false;
+ 		}
+ 		break;
+ 	case CMD_INTENT:
+@@ -962,28 +1012,32 @@ rx_one(struct glink_edge *e)
+ 		if (avail < n) {
+ 			return false;
+ 		}
+-		for (uint32_t i = 0; i < m.p2; i++) {
++		c = chan_by_rcid(e, m.p1);
++		for (uint32_t i = 0; i < m.p2 && c != NULL; i++) {
+ 			uint32_t pair[2];
+ 			rx_peek(e, 8 + 8 * i, pair, 8);
+-			if (m.p1 == e->rcid && e->ri_count < sizeof(e->ri) / sizeof(e->ri[0])) {
+-				e->ri[e->ri_count].size = pair[0];
+-				e->ri[e->ri_count].id = pair[1];
+-				e->ri[e->ri_count].used = false;
+-				e->ri_count++;
++			if (c->ri_count < sizeof(c->ri) / sizeof(c->ri[0])) {
++				c->ri[c->ri_count].size = pair[0];
++				c->ri[c->ri_count].id = pair[1];
++				c->ri[c->ri_count].used = false;
++				c->ri_count++;
+ 			}
+ 		}
+ 		rx_advance(e, n);
+-		e->intent_req_sent = false;
++		if (c != NULL) {
++			c->intent_req_sent = false;
++		}
+ 		break;
+ 	case CMD_RX_DONE:
+ 	case CMD_RX_DONE_W_REUSE:
+ 		rx_advance(e, 8);
+-		for (unsigned i = 0; i < e->ri_count; i++) {
+-			if (e->ri[i].id == m.p2) {
++		c = chan_by_rcid(e, m.p1);
++		for (unsigned i = 0; c != NULL && i < c->ri_count; i++) {
++			if (c->ri[i].id == m.p2) {
+ 				if (m.cmd == CMD_RX_DONE_W_REUSE) {
+-					e->ri[i].used = false;
++					c->ri[i].used = false;
+ 				} else {
+-					e->ri[i] = e->ri[--e->ri_count];
++					c->ri[i] = c->ri[--c->ri_count];
+ 				}
+ 				break;
+ 			}
+@@ -991,13 +1045,15 @@ rx_one(struct glink_edge *e)
+ 		break;
+ 	case CMD_RX_INTENT_REQ:
+ 		rx_advance(e, 8);
+-		advertise_intents(e, 1, MAX(m.p2, OUR_INTENT_SIZE));
+-		send_cmd(e, CMD_RX_INTENT_REQ_ACK, CHAN_LCID, 1);
++		if ((c = chan_by_rcid(e, m.p1)) != NULL) {
++			advertise_intents(e, c, 1, MAX(m.p2, OUR_INTENT_SIZE));
++			send_cmd(e, CMD_RX_INTENT_REQ_ACK, (uint16_t)c->lcid, 1);
++		}
+ 		break;
+ 	case CMD_RX_INTENT_REQ_ACK:
+ 		rx_advance(e, 8);
+-		if (m.p2 == 0) {
+-			e->intent_req_sent = false;      /* ask again on the next pump */
++		if (m.p2 == 0 && (c = chan_by_rcid(e, m.p1)) != NULL) {
++			c->intent_req_sent = false;      /* ask again on the next pump */
+ 		}
+ 		break;
+ 	case CMD_CLOSE_ACK:
+@@ -1019,23 +1075,32 @@ rx_one(struct glink_edge *e)
+ 		if (avail < n) {
+ 			return false;
+ 		}
++		c = chan_by_rcid(e, m.p1);
++		if (c == NULL) {
++			rx_advance(e, n);
++			LOG("t=%u ms: %s: glink data for unknown rcid %u dropped", g_ms, e->name, m.p1);
++			break;
++		}
+ 		if (m.cmd == CMD_TX_DATA) {
+-			e->asm_len = 0;
++			c->asm_len = 0;
+ 		}
+-		if (e->asm_len + hdr[0] <= sizeof(e->asm_buf)) {
+-			rx_peek(e, 16, e->asm_buf + e->asm_len, hdr[0]);
+-			e->asm_len += hdr[0];
++		if (c->asm_len + hdr[0] <= sizeof(c->asm_buf)) {
++			rx_peek(e, 16, c->asm_buf + c->asm_len, hdr[0]);
++			c->asm_len += hdr[0];
+ 		}
+ 		rx_advance(e, n);
+ 		if (hdr[1] == 0) {
+-			if (m.p1 == e->rcid) {
+-				qrtr_rx(e, e->asm_buf, e->asm_len);
++			c->rx_pkts++;
++			if (c->client != NULL) {
++				c->client->rx(c->asm_buf, c->asm_len);
++			} else {
++				c->rx(e, c->asm_buf, c->asm_len);
+ 			}
+ 			if (e->features & 1) {
+-				send_cmd(e, CMD_RX_DONE_W_REUSE, CHAN_LCID, m.p2);
++				send_cmd(e, CMD_RX_DONE_W_REUSE, (uint16_t)c->lcid, m.p2);
+ 			} else {
+-				send_cmd(e, CMD_RX_DONE, CHAN_LCID, m.p2);
+-				advertise_intents(e, 1, OUR_INTENT_SIZE);
++				send_cmd(e, CMD_RX_DONE, (uint16_t)c->lcid, m.p2);
++				advertise_intents(e, c, 1, OUR_INTENT_SIZE);
+ 			}
+ 		}
+ 		break;
+@@ -1061,6 +1126,11 @@ glink_start(struct glink_edge *e)
+ 		return false;
+ 	}
+ 	LOG("%s: glink: desc %s, our TX FIFO %u bytes", e->name, existed ? "made by the remote" : "ours", GLINK_TX_SIZE);
++	if (e->nch == 0 || strcmp(e->ch[0].name, CHAN_NAME) != 0) {
++		LOG("%s: glink: IPCRTR must be channel 1", e->name);
++		e->desc = NULL;
++		return false;
++	}
+ 	e->desc[2] = 0;                              /* rx tail */
+ 	e->desc[1] = 0;                              /* tx head */
+ 	mb();
+@@ -1072,6 +1142,8 @@ glink_start(struct glink_edge *e)
+ static void
+ glink_poll(struct glink_edge *e, unsigned ms)
+ {
++	struct glink_chan *q = &e->ch[0];           /* IPCRTR */
++
+ 	g_ms = ms;
+ 	if (e->rx == NULL && e->rx_msgs == 0) {
+ 		uint32_t sz = 0;
+@@ -1083,13 +1155,23 @@ glink_poll(struct glink_edge *e, unsigned ms)
+ 	}
+ 	for (int i = 0; i < 64 && e->rx != NULL && rx_one(e); i++) {
+ 	}
+-	txq_pump(e);
+-	if (chan_up(e) && !e->intents_sent) {
+-		advertise_intents(e, OUR_INTENTS, OUR_INTENT_SIZE);
+-		e->intents_sent = true;
+-		LOG("t=%u ms: %s: IPCRTR open both ways, %u intents sent", ms, e->name, OUR_INTENTS);
++	for (unsigned i = 0; i < e->nch; i++) {
++		struct glink_chan *c = &e->ch[i];
++		txq_pump(e, c);
++		if (chan_up(c) && !c->intents_sent) {
++			advertise_intents(e, c, OUR_INTENTS, OUR_INTENT_SIZE);
++			c->intents_sent = true;
++			LOG("t=%u ms: %s: %s open both ways, %u intents sent", ms, e->name, c->name, OUR_INTENTS);
++		}
++		if (c->client != NULL) {
++			if (chan_up(c) && !c->client_up) {
++				c->client_up = true;
++				c->client->up();
++			}
++			c->client->poll(ms);
++		}
+ 	}
+-	if (chan_up(e) && !e->q_hello_sent) {
++	if (chan_up(q) && !e->q_hello_sent) {
+ 		struct qrtr_ctrl c = { QRTR_TYPE_HELLO, 0, 0, 0, 0 };
+ 		edge_qrtr_send(e, QRTR_TYPE_HELLO, QRTR_PORT_CTRL, e->q_node, QRTR_PORT_CTRL, &c, sizeof(c));
+ 		e->q_hello_sent = true;
+@@ -1100,18 +1182,25 @@ glink_poll(struct glink_edge *e, unsigned ms)
+ 		}
+ 	}
+ 	/* nobody opened IPCRTR after 2 s: open it from our side */
+-	if (ms >= 2000 && !e->open_sent && e->rx != NULL) {
++	if (ms >= 2000 && !q->open_sent && e->rx != NULL) {
+ 		LOG("t=%u ms: %s: remote did not open IPCRTR, opening it", ms, e->name);
+-		send_open(e);
++		send_open(e, q);
+ 	}
+ }
+ 
+ static void
+ glink_summary(struct glink_edge *e)
+ {
+-	LOG("%s: glink: rx %u msgs, tx %u, chan %s, remote intents %u, txq %u drops %u; qrtr node %x hello %u, %u services, %u RESUME_TX", e->name,
+-	    e->rx_msgs, e->tx_msgs, chan_up(e) ? "UP" : "down", e->ri_count, e->txq_tail - e->txq_head, e->txq_drops,
+-	    e->q_node, e->q_hello_rx, e->q_srv_count, e->q_resumes);
++	LOG("%s: glink: rx %u msgs, tx %u; qrtr node %x hello %u, %u services, %u RESUME_TX", e->name,
++	    e->rx_msgs, e->tx_msgs, e->q_node, e->q_hello_rx, e->q_srv_count, e->q_resumes);
++	for (unsigned i = 0; i < e->nch; i++) {
++		struct glink_chan *c = &e->ch[i];
++		LOG("%s:   channel %s: %s, rx %u tx %u packets, remote intents %u, txq %u drops %u", e->name, c->name,
++		    chan_up(c) ? "UP" : "down", c->rx_pkts, c->tx_pkts, c->ri_count, c->txq_tail - c->txq_head, c->txq_drops);
++		if (c->client != NULL) {
++			c->client->summary();
++		}
++	}
+ 	svc_summary();
+ 	for (unsigned i = 0; i < e->q_srv_count; i++) {
+ 		LOG("  service %x:%x node %u port %x %s", e->q_srv[i].svc, e->q_srv[i].inst, e->q_srv[i].node, e->q_srv[i].port, svc_name(e->q_srv[i].svc));
+@@ -3701,6 +3790,12 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return ok;
+ }
+ 
++extern "C" bool
++topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
++{
++	return smmu_identity(sid, mask, name);
++}
++
+ /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
+ 
+ #define CE_PA               (0x0C800000ull + 0x240000)
+@@ -6620,6 +6715,9 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
+ 		if (ready && !glink) {
+ 			e_modem.part = part;
++			if (e_modem.nch == 0) {
++				(void)glink_add_chan(&e_modem, CHAN_NAME, qrtr_rx);
++			}
+ 			glink = glink_start(&e_modem);
+ 			if (!glink) {
+ 				ready = false;  /* no retry */
+@@ -6922,6 +7020,31 @@ modem_boot(void)
+ #define ADSP_ITEM_SMP2P_OUT     429             /* DT smp2p-adsp: qcom,smem = <443 429> */
+ #define ADSP_ITEM_CRASH         423
+ 
++/* ---- other drivers on the ADSP edge (TopazDSP.h): one GLINK channel each */
++static const struct topaz_dsp_client *const dsp_clients[] = { NULL };
++
++extern "C" bool
++topaz_dsp_send(const struct topaz_dsp_client *client, const void *p, uint32_t len)
++{
++	for (unsigned i = 0; i < e_adsp.nch; i++) {
++		struct glink_chan *c = &e_adsp.ch[i];
++		if (c->client == client) {
++			if (!chan_up(c) || c->txq_tail - c->txq_head >= TXQ_LEN) {
++				return false;
++			}
++			glink_send(&e_adsp, c, p, len);
++			return true;
++		}
++	}
++	return false;
++}
++
++extern "C" const void *
++topaz_smem_item(uint16_t item, uint32_t *size)
++{
++	return smem == NULL ? NULL : smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), item, size);
++}
++
+ static void
+ adsp_kick(void)
+ {
+@@ -7042,6 +7165,16 @@ adsp_boot(void)
+ 		return false;
+ 	}
+ 	e_adsp.part = part;
++	(void)glink_add_chan(&e_adsp, CHAN_NAME, qrtr_rx);
++	for (unsigned i = 0; i < sizeof(dsp_clients) / sizeof(dsp_clients[0]); i++) {
++		if (dsp_clients[i] == NULL) {
++			continue;
++		}
++		struct glink_chan *c = glink_add_chan(&e_adsp, dsp_clients[i]->channel, NULL);
++		if (c != NULL) {
++			c->client = dsp_clients[i];
++		}
++	}
+ 	return glink_start(&e_adsp);
+ }
+ 

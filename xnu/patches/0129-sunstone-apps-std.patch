@@ -1,0 +1,648 @@
+diff --git a/iokit/Kernel/arm/SweetAppsStd.cpp b/iokit/Kernel/arm/SweetAppsStd.cpp
+new file mode 100644
+index 0000000..f708c58
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAppsStd.cpp
+@@ -0,0 +1,603 @@
++/*
++ * apps_std for the ADSP's sensors PD (sunstone): the read-only file service behind FastRPC
++ * (SweetFastRPC.cpp), what sscrpcd/hexagonrpcd serve on Linux (hexagonrpcd/apps_std.c,
++ * method layouts from its interface/apps_std.c).
++ *
++ * The PD reads the sensor registry the stock system left on persist and checks the vendor
++ * configs it was built from. What the paths are backed by:
++ *   /mnt/vendor/persist/..., /persist/...   the persist partition, ext4 (SweetExt4)
++ *   /vendor/etc/sensors/sns_reg_config      persist /sensors/registry/sns_reg_config (the same
++ *                                           614 bytes as the vendor copy, checked 2026-10-22)
++ *   /vendor/etc/sensors/config/ *.json      stat and readdir only, from a table made from the
++ *                                           stock vendor_a (EROFS+LZ4, not readable here); the
++ *                                           registry records exactly these 53 files at mtime
++ *                                           1230768000, so the PD has no reason to re-parse them
++ *   /sys/devices/soc0/...                   socinfo from SMEM item 137, as Linux socinfo.c prints it
++ * "/system" in front of "/vendor" is accepted. Nothing can be written.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <sys/param.h>
++#include <sys/errno.h>
++#include "TopazDSP.h"
++#include "SweetFastRPC.h"
++#include "SweetExt4.h"
++
++#define LOG(fmt, ...)           IOLog("SWEET APPS_STD: " fmt "\n", ##__VA_ARGS__)
++
++#define FD_MAX                  32
++#define LOG_OPENS               400             /* successful opens logged; failures always */
++#define CFG_MTIME               1230768000u     /* the vendor image's file times (2009-01-01) */
++#define SMEM_SOCINFO            137
++#define S_IFDIR_                0040000u
++#define S_IFREG_                0100000u
++
++enum { SRC_EXT4 = 1, SRC_CFG, SRC_SOC };
++
++struct node {
++	int src;
++	bool dir;
++	uint32_t ino;                                   /* SRC_EXT4 */
++	int index;                                      /* SRC_CFG / SRC_SOC file, -1 for their directory */
++	uint64_t size;
++	uint32_t mode, mtime;
++};
++
++struct afd {
++	bool used;
++	struct node n;
++	uint64_t pos;                                   /* file offset, or directory cookie */
++};
++
++/* stock vendor_a /vendor/etc/sensors/config (HyperOS sunstone), name and size */
++static const struct { const char *name; uint32_t size; } cfg_files[] = {
++	{ "moonstone_qrd_ak991x_0.json", 6445 },
++	{ "moonstone_qrd_ak991x_1.json", 6135 },
++	{ "moonstone_qrd_bmi3x0.json", 8322 },
++	{ "moonstone_qrd_icm4x6xx_0.json", 8039 },
++	{ "moonstone_qrd_qmc630x_0.json", 6354 },
++	{ "moonstone_qrd_qmc630x_1.json", 6265 },
++	{ "moonstone_qrd_sar_algo_1.json", 1442 },
++	{ "moonstone_qrd_sx933x.json", 12377 },
++	{ "moonstone_qrd_tmd2755.json", 5119 },
++	{ "sns_amd.json", 799 },
++	{ "sns_amd_sw_disabled.json", 257 },
++	{ "sns_amd_sw_enabled.json", 581 },
++	{ "sns_aod.json", 554 },
++	{ "sns_aont.json", 141 },
++	{ "sns_basic_gestures.json", 1238 },
++	{ "sns_bring_to_ear.json", 1252 },
++	{ "sns_ccd.json", 6303 },
++	{ "sns_ccd_v2_walk.json", 442 },
++	{ "sns_ccd_v3_1_walk.json", 1266 },
++	{ "sns_ccd_v3_walk.json", 1222 },
++	{ "sns_cm.json", 850 },
++	{ "sns_dae.json", 880 },
++	{ "sns_device_orient.json", 1260 },
++	{ "sns_diag_filter.json", 6098 },
++	{ "sns_direct_channel.json", 164 },
++	{ "sns_distance_bound.json", 1175 },
++	{ "sns_dpc.json", 965 },
++	{ "sns_facing.json", 937 },
++	{ "sns_fmv.json", 1488 },
++	{ "sns_fmv_legacy.json", 1596 },
++	{ "sns_geomag_rv.json", 1249 },
++	{ "sns_gyro_cal.json", 1004 },
++	{ "sns_heart_rate.json", 3585 },
++	{ "sns_mag_cal.json", 685 },
++	{ "sns_mag_cal_legacy.json", 306 },
++	{ "sns_multishake.json", 943 },
++	{ "sns_pedometer.json", 1112 },
++	{ "sns_rmd.json", 923 },
++	{ "sns_rotv.json", 874 },
++	{ "sns_smd.json", 1383 },
++	{ "sns_tilt.json", 844 },
++	{ "sns_tilt_sw_disabled.json", 266 },
++	{ "sns_tilt_sw_enabled.json", 547 },
++	{ "sns_tilt_to_wake.json", 1621 },
++	{ "sns_wrist_pedo.json", 645 },
++	{ "strait_bu52053nvx_0.json", 2830 },
++	{ "strait_default_sensors.json", 5480 },
++	{ "strait_dynamic_sensors.json", 635 },
++	{ "strait_icp101xx_0.json", 3663 },
++	{ "strait_power_0.json", 278 },
++	{ "strait_qrd_lsm6dst_0.json", 7698 },
++	{ "strait_qrd_tmd2725.json", 6579 },
++	{ "strait_tmd2725.json", 6594 },
++};
++#define CFG_COUNT               (sizeof(cfg_files) / sizeof(cfg_files[0]))
++
++static const char *const soc_names[] = {
++	"soc_id", "revision", "hw_platform", "platform_version", "platform_subtype", "platform_subtype_id",
++};
++#define SOC_COUNT               (sizeof(soc_names) / sizeof(soc_names[0]))
++
++static struct {
++	struct sweet_ext4 persist;
++	bool persist_ok;
++	char soc[SOC_COUNT][40];
++	bool soc_done;
++	struct afd fd[FD_MAX];
++	uint8_t prim[264];
++	uint8_t data[0xA000];
++	unsigned opens, open_fails, reads, writes_refused;
++	uint64_t bytes;
++} a;
++
++/* ---------------------------------------------------------------- backing stores */
++
++static bool
++persist_fs(void)
++{
++	if (!a.persist_ok) {
++		int err = sweet_ext4_mount(&a.persist, "persist");
++		a.persist_ok = err == 0;
++		if (err != 0) {
++			LOG("persist: mount failed (%d)", err);
++		}
++	}
++	return a.persist_ok;
++}
++
++/* hw_platform and platform_subtype names of the msm-5.4 socinfo.c */
++static const char *
++soc_platform(uint32_t hw)
++{
++	static const struct { uint32_t id; const char *name; } plat[] = {
++		{ 0, "Unknown" }, { 1, "Surf" }, { 2, "FFA" }, { 3, "Fluid" }, { 4, "SVLTE_FFA" }, { 5, "SLVTE_SURF" },
++		{ 7, "MDM_MTP_NO_DISPLAY" }, { 8, "MTP" }, { 9, "Liquid" }, { 10, "Dragon" }, { 11, "QRD" }, { 13, "HRD" },
++		{ 14, "DTV" }, { 21, "RCM" }, { 23, "STP" }, { 24, "SBC" }, { 25, "ADP" }, { 26, "CHI" }, { 27, "SDP" },
++		{ 28, "RRP" }, { 29, "CLS" }, { 30, "TTP" }, { 31, "HDK" }, { 32, "IOT" }, { 33, "ATP" }, { 34, "IDP" },
++	};
++	for (unsigned i = 0; i < sizeof(plat) / sizeof(plat[0]); i++) {
++		if (plat[i].id == hw) {
++			return plat[i].name;
++		}
++	}
++	return "Unknown";
++}
++
++static const char *
++soc_subtype(uint32_t hw, uint32_t subtype)
++{
++	static const char *const qrd_sub[] = { "QRD", "SKUAA", "SKUF", "SKUAB", NULL, "SKUG" };
++	static const char *const sub[] = { "Unknown", "charm", "strange", "strange_2a" };
++	const char *n = NULL;
++	if (hw == 11) {
++		n = subtype < sizeof(qrd_sub) / sizeof(qrd_sub[0]) ? qrd_sub[subtype] : NULL;
++	} else {
++		n = subtype < sizeof(sub) / sizeof(sub[0]) ? sub[subtype] : NULL;
++	}
++	return n != NULL ? n : "Invalid";
++}
++
++/* the sysfs files of Linux drivers/soc/qcom/socinfo.c */
++static void
++soc_fill(void)
++{
++	uint32_t size = 0, w[17] = {};
++	const uint8_t *si = (const uint8_t *)topaz_smem_item(SMEM_SOCINFO, &size);
++
++	if (a.soc_done) {
++		return;
++	}
++	a.soc_done = true;
++	if (si == NULL || size < 68) {
++		LOG("socinfo: SMEM item %u missing (%u bytes)", SMEM_SOCINFO, size);
++		return;
++	}
++	memcpy(w, si, MIN(size, (uint32_t)sizeof(w)));
++	uint32_t id = w[1], ver = w[2], hw = w[13], pver = w[14], subtype = w[16];
++	const char *pn = soc_platform(hw), *sn = soc_subtype(hw, subtype);
++	snprintf(a.soc[0], sizeof(a.soc[0]), "%u\n", id);
++	snprintf(a.soc[1], sizeof(a.soc[1]), "%u.%u\n", ver >> 16, ver & 0xFFFF);
++	snprintf(a.soc[2], sizeof(a.soc[2]), "%s\n", pn);
++	snprintf(a.soc[3], sizeof(a.soc[3]), "%u\n", pver);
++	snprintf(a.soc[4], sizeof(a.soc[4]), "%s\n", sn);
++	snprintf(a.soc[5], sizeof(a.soc[5]), "%u\n", subtype);
++	LOG("socinfo v%u.%u: soc_id %u revision %u.%u hw_platform %u (%s) version %u subtype %u (%s)", w[0] >> 16, w[0] & 0xFFFF,
++	    id, ver >> 16, ver & 0xFFFF, hw, pn, pver, subtype, sn);
++}
++
++static bool
++starts(const char *s, const char *prefix, const char **rest)
++{
++	size_t n = strlen(prefix);
++	if (strncmp(s, prefix, n) != 0 || (s[n] != 0 && s[n] != '/')) {
++		return false;
++	}
++	*rest = s + n;
++	return true;
++}
++
++/* a path of the PD's to what backs it; an AEE result */
++static uint32_t
++resolve(const char *path, struct node *n)
++{
++	const char *rest = "";
++
++	bzero(n, sizeof(*n));
++	if (strncmp(path, "/system/vendor/", 15) == 0) {
++		path += 7;
++	}
++	bool on_persist = starts(path, "/mnt/vendor/persist", &rest) || starts(path, "/persist", &rest);
++	if (!on_persist && strcmp(path, "/vendor/etc/sensors/sns_reg_config") == 0) {
++		rest = "/sensors/registry/sns_reg_config";
++		on_persist = true;
++	}
++	if (on_persist) {
++		struct sweet_ext4_stat st;
++		if (!persist_fs()) {
++			return AEE_EFAILED;
++		}
++		if (sweet_ext4_lookup(&a.persist, rest, &n->ino) != 0 || sweet_ext4_stat(&a.persist, n->ino, &st) != 0) {
++			return AEE_ENOSUCH;
++		}
++		n->src = SRC_EXT4;
++		n->dir = (st.mode & 0170000) == S_IFDIR_;
++		n->size = st.size;
++		n->mode = st.mode;
++		n->mtime = st.mtime;
++		return AEE_SUCCESS;
++	}
++	if (starts(path, "/vendor/etc/sensors/config", &rest)) {
++		n->src = SRC_CFG;
++		n->index = -1;
++		while (*rest == '/') {
++			rest++;
++		}
++		for (unsigned i = 0; *rest != 0 && i < CFG_COUNT; i++) {
++			if (strcmp(rest, cfg_files[i].name) == 0) {
++				n->index = (int)i;
++			}
++		}
++		if (*rest != 0 && n->index < 0) {
++			return AEE_ENOSUCH;
++		}
++		n->dir = n->index < 0;
++		n->size = n->dir ? 4096 : cfg_files[n->index].size;
++		n->mode = n->dir ? S_IFDIR_ | 0755 : S_IFREG_ | 0644;
++		n->mtime = CFG_MTIME;
++		return AEE_SUCCESS;
++	}
++	if (starts(path, "/sys/devices/soc0", &rest)) {
++		soc_fill();
++		n->src = SRC_SOC;
++		n->index = -1;
++		while (*rest == '/') {
++			rest++;
++		}
++		for (unsigned i = 0; *rest != 0 && i < SOC_COUNT; i++) {
++			if (strcmp(rest, soc_names[i]) == 0 && a.soc[i][0] != 0) {
++				n->index = (int)i;
++			}
++		}
++		if (*rest != 0 && n->index < 0) {
++			return AEE_ENOSUCH;
++		}
++		n->dir = n->index < 0;
++		n->size = n->dir ? 0 : strlen(a.soc[n->index]);
++		n->mode = n->dir ? S_IFDIR_ | 0755 : S_IFREG_ | 0444;
++		return AEE_SUCCESS;
++	}
++	return AEE_ENOSUCH;
++}
++
++/* ---------------------------------------------------------------- descriptors */
++
++static struct afd *
++fd_get(uint64_t h, bool dir)
++{
++	if (h == 0 || h > FD_MAX || !a.fd[h - 1].used || a.fd[h - 1].n.dir != dir) {
++		return NULL;
++	}
++	return &a.fd[h - 1];
++}
++
++static uint32_t
++fd_new(const struct node *n, uint32_t *h)
++{
++	for (unsigned i = 0; i < FD_MAX; i++) {
++		if (!a.fd[i].used) {
++			a.fd[i].used = true;
++			a.fd[i].n = *n;
++			a.fd[i].pos = 0;
++			*h = i + 1;
++			return AEE_SUCCESS;
++		}
++	}
++	LOG("out of descriptors");
++	return AEE_ENOMEMORY;
++}
++
++static uint32_t
++do_open(const char *path, const char *mode, uint32_t *h, bool want_dir)
++{
++	struct node n;
++	uint32_t r;
++
++	bool writes = false;
++	for (const char *m = mode; m != NULL && *m != 0; m++) {
++		writes |= *m == 'w' || *m == 'a' || *m == '+';
++	}
++	if (writes) {
++		a.writes_refused++;
++		LOG("open %s \"%s\": read-only here, refused", path, mode);
++		return AEE_EUNSUPPORTED;
++	}
++	r = resolve(path, &n);
++	if (r == AEE_SUCCESS && n.dir != want_dir) {
++		r = AEE_EBADPARM;
++	}
++	if (r == AEE_SUCCESS && n.src == SRC_CFG && !n.dir) {
++		r = AEE_EUNSUPPORTED;                       /* no EROFS reader: stat only */
++	}
++	if (r == AEE_SUCCESS) {
++		r = fd_new(&n, h);
++	}
++	if (r != AEE_SUCCESS) {
++		a.open_fails++;
++		LOG("%s %s: %s", want_dir ? "opendir" : "open", path,
++		    r == AEE_ENOSUCH ? "no such file" : r == AEE_EUNSUPPORTED ? "content not served" : "failed");
++	} else if (++a.opens <= LOG_OPENS) {
++		LOG("%s %s -> %u (%llu bytes)", want_dir ? "opendir" : "open", path, *h, n.size);
++	}
++	return r;
++}
++
++/* ---------------------------------------------------------------- methods */
++
++static uint32_t
++m_read(const struct sweet_frpc_buf *in, struct sweet_frpc_buf *out)
++{
++	uint32_t req[2], got = 0;
++	memcpy(req, in[0].p, 8);
++	struct afd *d = fd_get(req[0], false);
++	uint32_t want = MIN(req[1], (uint32_t)sizeof(a.data));
++
++	if (d == NULL) {
++		return AEE_EBADPARM;
++	}
++	if (req[1] > sizeof(a.data)) {
++		LOG("read of %u bytes, serving %u", req[1], want);
++	}
++	if (d->n.src == SRC_EXT4) {
++		if (sweet_ext4_read(&a.persist, d->n.ino, d->pos, a.data, want, &got) != 0) {
++			return AEE_EFAILED;
++		}
++	} else if (d->n.src == SRC_SOC) {
++		const char *s = a.soc[d->n.index];
++		uint32_t len = (uint32_t)strlen(s);
++		got = d->pos < len ? MIN(want, len - (uint32_t)d->pos) : 0;
++		memcpy(a.data, s + d->pos, got);
++	}
++	bzero(a.data + got, want - got);
++	d->pos += got;
++	a.reads++;
++	a.bytes += got;
++	uint32_t r[2] = { got, got < req[1] ? 1u : 0u };
++	memcpy(a.prim, r, 8);
++	out[0].p = a.prim;
++	out[0].len = 8;
++	out[1].p = a.data;
++	out[1].len = want;
++	return AEE_SUCCESS;
++}
++
++static uint32_t
++m_seek(const struct sweet_frpc_buf *in)
++{
++	uint32_t req[3];
++	memcpy(req, in[0].p, 12);
++	struct afd *d = fd_get(req[0], false);
++	int64_t base;
++
++	if (d == NULL || req[2] > 2) {
++		return AEE_EBADPARM;
++	}
++	base = req[2] == 0 ? 0 : req[2] == 1 ? (int64_t)d->pos : (int64_t)d->n.size;
++	base += (int32_t)req[1];
++	if (base < 0) {
++		return AEE_EBADPARM;
++	}
++	d->pos = (uint64_t)base;
++	return AEE_SUCCESS;
++}
++
++static uint32_t
++m_readdir(const struct sweet_frpc_buf *in, struct sweet_frpc_buf *out)
++{
++	uint64_t h;
++	memcpy(&h, in[0].p, 8);
++	struct afd *d = fd_get(h, true);
++	char *name = (char *)a.prim + 4;
++	uint32_t child = 0, eof;
++
++	if (d == NULL) {
++		return AEE_EBADPARM;
++	}
++	bzero(a.prim, 264);
++	if (d->n.src == SRC_EXT4) {
++		if (sweet_ext4_readdir(&a.persist, d->n.ino, &d->pos, name, &child) != 0) {
++			return AEE_EFAILED;
++		}
++	} else if (d->n.src == SRC_CFG && d->pos < CFG_COUNT) {
++		strlcpy(name, cfg_files[d->pos++].name, 256);
++	} else if (d->n.src == SRC_SOC) {
++		while (d->pos < SOC_COUNT && a.soc[d->pos][0] == 0) {
++			d->pos++;
++		}
++		if (d->pos < SOC_COUNT) {
++			strlcpy(name, soc_names[d->pos++], 256);
++		}
++	}
++	eof = name[0] == 0;
++	memcpy(a.prim, &child, 4);                      /* the inode: hexagonrpcd gives 0 */
++	memcpy(a.prim + 260, &eof, 4);
++	out[0].p = a.prim;
++	out[0].len = 264;
++	return AEE_SUCCESS;
++}
++
++static uint32_t
++m_stat(const char *path, struct sweet_frpc_buf *out)
++{
++	struct node n;
++	uint32_t r = resolve(path, &n);
++	struct { uint64_t tsz, dev, ino; uint32_t mode, nlink; uint64_t rdev, size; int64_t at, atn, mt, mtn, ct, ctn; }
++	__attribute__((packed)) st = {};
++
++	if (r != AEE_SUCCESS) {
++		LOG("stat %s: no such file", path);
++		return r;
++	}
++	st.ino = n.src == SRC_EXT4 ? n.ino : 0;
++	st.mode = n.mode;
++	st.nlink = 1;
++	st.size = n.size;
++	st.at = st.mt = st.ct = n.mtime;
++	memcpy(a.prim, &st, sizeof(st));
++	out[0].p = a.prim;
++	out[0].len = sizeof(st);
++	if (a.opens < LOG_OPENS) {
++		LOG("stat %s: mode %o size %llu mtime %u", path, n.mode, n.size, n.mtime);
++	}
++	return AEE_SUCCESS;
++}
++
++static uint32_t
++apps_std_call(uint32_t method, const struct sweet_frpc_buf *in, uint32_t nin, struct sweet_frpc_buf *out, uint32_t nout)
++{
++	static uint32_t fdout;
++	static uint64_t dirout, lenout;
++	static uint32_t unknown_logged;
++	uint32_t w[4] = {};
++
++	if (nin >= 1) {
++		memcpy(w, in[0].p, MIN(in[0].len, (uint32_t)sizeof(w)));
++	}
++	switch (method) {
++	case 0:                                         /* fopen(name, mode) -> fd */
++		if (nin != 3 || nout != 1 || in[0].len < 8) {
++			break;
++		}
++		out[0].p = &fdout;
++		out[0].len = 4;
++		return do_open((const char *)in[1].p, (const char *)in[2].p, &fdout, false);
++	case 19:                                        /* fopen_with_env(env, delim, name, mode) -> fd */
++		if (nin != 5 || nout != 1 || in[0].len < 16) {
++			break;
++		}
++		out[0].p = &fdout;
++		out[0].len = 4;
++		if (((const char *)in[3].p)[0] != '/') {
++			LOG("open %s via $%s: relative paths are not served", (const char *)in[3].p, (const char *)in[1].p);
++			a.open_fails++;
++			return AEE_ENOSUCH;
++		}
++		return do_open((const char *)in[3].p, (const char *)in[4].p, &fdout, false);
++	case 2:                                         /* fflush(fd) */
++		return nin == 1 ? AEE_SUCCESS : AEE_EBADPARM;
++	case 3:                                         /* fclose(fd) */
++	{
++		struct afd *d = nin == 1 && in[0].len >= 4 ? fd_get(w[0], false) : NULL;
++		if (d == NULL) {
++			return AEE_EBADPARM;
++		}
++		d->used = false;
++		return AEE_SUCCESS;
++	}
++	case 4:                                         /* fread(fd, size) -> written, eof, data */
++		if (nin != 1 || nout != 2 || in[0].len < 8) {
++			break;
++		}
++		return m_read(in, out);
++	case 9:                                         /* fseek(fd, pos, whence) */
++		if (nin != 1 || in[0].len < 12) {
++			break;
++		}
++		return m_seek(in);
++	case 10:                                        /* flen(fd) -> u64 */
++	{
++		struct afd *d = nin == 1 && nout == 1 && in[0].len >= 4 ? fd_get(w[0], false) : NULL;
++		if (d == NULL) {
++			break;
++		}
++		lenout = d->n.size;
++		out[0].p = &lenout;
++		out[0].len = 8;
++		return AEE_SUCCESS;
++	}
++	case 11:                                        /* rewind(fd) */
++	{
++		struct afd *d = nin == 1 && in[0].len >= 4 ? fd_get(w[0], false) : NULL;
++		if (d == NULL) {
++			break;
++		}
++		d->pos = 0;
++		return AEE_SUCCESS;
++	}
++	case 26:                                        /* opendir(name) -> u64 dir */
++	{
++		uint32_t h = 0, r;
++		if (nin != 2 || nout != 1) {
++			break;
++		}
++		r = do_open((const char *)in[1].p, NULL, &h, true);
++		dirout = h;
++		out[0].p = &dirout;
++		out[0].len = 8;
++		return r;
++	}
++	case 27:                                        /* closedir(u64 dir) */
++	{
++		uint64_t h = 0;
++		if (nin != 1 || in[0].len < 8) {
++			break;
++		}
++		memcpy(&h, in[0].p, 8);
++		struct afd *d = fd_get(h, true);
++		if (d == NULL) {
++			return AEE_EBADPARM;
++		}
++		d->used = false;
++		return AEE_SUCCESS;
++	}
++	case 28:                                        /* readdir(u64 dir) -> inode, name[256], eof */
++		if (nin != 1 || nout != 1 || in[0].len < 8) {
++			break;
++		}
++		return m_readdir(in, out);
++	case 31:                                        /* stat(name) -> 96 bytes (method id 31 first) */
++		if (nin != 2 || nout != 1) {
++			break;
++		}
++		return m_stat((const char *)in[1].p, out);
++	default:
++		if ((unknown_logged & (1u << (method & 31))) == 0) {
++			unknown_logged |= 1u << (method & 31);
++			LOG("method %u (%u in, %u out) not implemented", method, nin, nout);
++		}
++		return AEE_EUNSUPPORTED;
++	}
++	LOG("method %u: unexpected arguments (%u in, %u out)", method, nin, nout);
++	return AEE_EBADPARM;
++}
++
++static void
++apps_std_summary(void)
++{
++	unsigned open = 0;
++	for (unsigned i = 0; i < FD_MAX; i++) {
++		open += a.fd[i].used;
++	}
++	LOG("%u opens (%u failed), %u reads, %llu bytes, %u write opens refused, %u descriptors open",
++	    a.opens, a.open_fails, a.reads, a.bytes, a.writes_refused, open);
++}
++
++/* C linkage and external from the declaration in SweetFastRPC.h */
++const struct sweet_frpc_iface sweet_apps_std = { "apps_std", apps_std_call, apps_std_summary };
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFastRPC.cpp b/iokit/Kernel/arm/SweetFastRPC.cpp
+index c0ba097..930118f 100644
+--- a/iokit/Kernel/arm/SweetFastRPC.cpp
++++ b/iokit/Kernel/arm/SweetFastRPC.cpp
+@@ -95,7 +95,7 @@ static const struct sweet_frpc_iface frpc_remotectl = { "remotectl", remotectl_c
+ static const struct sweet_frpc_iface frpc_apps_mem = { "apps_mem", apps_mem_call, NULL };
+ 
+ /* the reverse interfaces by handle: remotectl must be 0 */
+-static const struct sweet_frpc_iface *const frpc_ifaces[] = { &frpc_remotectl, &frpc_apps_mem };
++static const struct sweet_frpc_iface *const frpc_ifaces[] = { &frpc_remotectl, &sweet_apps_std, &frpc_apps_mem };
+ #define FRPC_NIFACES           (sizeof(frpc_ifaces) / sizeof(frpc_ifaces[0]))
+ 
+ static struct {
+diff --git a/iokit/Kernel/arm/SweetFastRPC.h b/iokit/Kernel/arm/SweetFastRPC.h
+index d44e057..821e525 100644
+--- a/iokit/Kernel/arm/SweetFastRPC.h
++++ b/iokit/Kernel/arm/SweetFastRPC.h
+@@ -37,6 +37,9 @@ struct sweet_frpc_iface {
+ 	void (*summary)(void);
+ };
+ 
++/* the interfaces served (defined by each driver) */
++extern const struct sweet_frpc_iface sweet_apps_std;
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 7f9fd34..32cd7b0 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitc
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetExt4.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetFastRPC.cpp                              optional iokitcpp
++iokit/Kernel/arm/SweetAppsStd.cpp                              optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

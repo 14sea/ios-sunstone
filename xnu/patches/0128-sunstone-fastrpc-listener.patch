@@ -1,0 +1,726 @@
+diff --git a/iokit/Kernel/arm/SweetFastRPC.cpp b/iokit/Kernel/arm/SweetFastRPC.cpp
+new file mode 100644
+index 0000000..c0ba097
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetFastRPC.cpp
+@@ -0,0 +1,631 @@
++/*
++ * FastRPC with the ADSP's sensors PD, in the kernel (sunstone, boot-arg adsp=1).
++ *
++ * The SEE sensor drivers on the ADSP only register once the sensors PD has read the sensor
++ * registry and configs from the apps side; on Linux sscrpcd (or hexagonrpcd -s) serves those
++ * files through the FastRPC "reverse tunnel". This is that, on the GLINK channel
++ * "fastrpcglink-apps-dsp" the ADSP opens on its edge (TopazModem, TopazDSP.h):
++ *
++ *   attach to the sensors PD      handle 1 method 0 (Linux fastrpc_init_attach(SENSORS_PD))
++ *   remotectl_open("adsp_default_listener") -> h, adsp_default_listener_register(h), close(h)
++ *   adsp_listener_init2, then adsp_listener_next2 for good: each answer is one call from the
++ *   DSP to an apps interface (remotectl, apps_std, apps_mem); its reply rides on the next next2.
++ *
++ * An invoke is a 40-byte fastrpc_msg on the channel pointing at one payload: argument metadata
++ * plus an inline copy of every buffer (Linux drivers/misc/fastrpc.c fastrpc_get_args); the DSP
++ * reads the inputs and writes the outputs there and answers {ctx, retval}. Method layouts and
++ * the reverse-call encoding follow hexagonrpc (libhexagonrpc, hexagonrpcd/listener.c, iobuffer.c).
++ * Payloads live in low RAM xnu does not manage (FRPC_POOL), which the DSP reaches through
++ * apps-smmu stream 0xa3 (DT qcom,msm_fastrpc_compute_cb10, "adsprpc-smd") put in identity:
++ * every address we hand out is physical, with the context bank (3) in bits 32 and up.
++ * Everything runs on the modem thread (TopazModem callbacks), so there are no locks.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/param.h>
++#include "TopazDSP.h"
++#include "SweetFastRPC.h"
++
++#define LOG(fmt, ...)           IOLog("SWEET FRPC: " fmt "\n", ##__VA_ARGS__)
++
++#define FRPC_CHANNEL            "fastrpcglink-apps-dsp"
++#define FRPC_SID                0xA3u           /* apps-smmu stream of compute cb10 */
++#define FRPC_CB                 3ull            /* its context bank for the DSP (Linux fastrpc_sid_offset) */
++#define FRPC_POOL_BASE          0xDA000000ull   /* low RAM xnu does not own, after TopazModem's pool */
++#define FRPC_POOL_SIZE          0x00400000ull
++#define FRPC_SLOTS              4               /* invokes in flight: next2 and one nested at most */
++#define FRPC_SLOT_SIZE          0x10000u
++#define FRPC_HEAP_OFF           (FRPC_SLOTS * FRPC_SLOT_SIZE)   /* apps_mem pages after the slots */
++
++#define FRPC_INIT_HANDLE        1               /* process group */
++#define FRPC_REMOTECTL          0               /* the DSP's remotectl */
++#define FRPC_LISTENER           3               /* adsp_listener */
++#define FRPC_RMID_INIT_ATTACH   0
++#define FRPC_RMID_INIT_MMAP     4
++#define SENSORS_PD              2
++#define FRPC_CLIENT_ID          1               /* Linux: session index + 1 */
++#define FRPC_PD_NOTIFY_CTX      0xABCDABCDull
++#define FRPC_ALIGN              128u
++#define FRPC_MAX_ARGS           8
++#define FRPC_MAX_REVERSE_BUFS   16
++#define FRPC_PENDING            0xFFFFFFFEu     /* a local method finishes later (nested invoke) */
++#define ADSP_MMAP_ADD_PAGES     0x1000u
++
++#define SC(m, in, out)          ((((uint32_t)(m)) & 0x1f) << 24 | (((uint32_t)(in)) & 0xff) << 16 | (((uint32_t)(out)) & 0xff) << 8)
++#define SC_METHOD(sc)           (((sc) >> 24) & 0x1f)
++#define SC_IN(sc)               (((sc) >> 16) & 0xff)
++#define SC_OUT(sc)              (((sc) >> 8) & 0xff)
++#define SC_HANDLES(sc)          ((sc) & 0xff)
++
++struct frpc_msg { int32_t client_id, tid; uint64_t ctx; uint32_t handle, sc; uint64_t addr, size; } __attribute__((packed));
++struct frpc_rsp { uint64_t ctx; int32_t retval; } __attribute__((packed));
++struct frpc_rbuf { uint64_t pv, len; } __attribute__((packed));
++struct frpc_ibuf { uint32_t num, pgidx; } __attribute__((packed));
++struct frpc_page { uint64_t addr, size; } __attribute__((packed));
++struct frpc_mmap_req { int32_t client_id; uint32_t flags; uint64_t vaddr; int32_t num, pad; } __attribute__((packed));
++
++static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
++
++/* one invoke argument: inputs are copied into the payload, outputs back to out */
++struct frpc_arg { const void *in; void *out; uint32_t len; };
++
++struct frpc_slot;
++typedef void (*frpc_done_fn)(struct frpc_slot *s, int32_t retval);
++
++struct frpc_slot {
++	bool busy;
++	uint32_t seq, handle, sc;
++	uint8_t *va;
++	uint64_t pa;
++	struct { void *dst; uint32_t off, len; } outs[FRPC_MAX_ARGS];
++	unsigned nouts, sent_ms;
++	bool late_logged;
++	frpc_done_fn done;
++	const char *what;
++};
++
++enum { F_IDLE, F_SETUP, F_LISTEN, F_FAILED };
++
++static uint32_t remotectl_call(uint32_t, const struct sweet_frpc_buf *, uint32_t, struct sweet_frpc_buf *, uint32_t);
++static uint32_t apps_mem_call(uint32_t, const struct sweet_frpc_buf *, uint32_t, struct sweet_frpc_buf *, uint32_t);
++static const struct sweet_frpc_iface frpc_remotectl = { "remotectl", remotectl_call, NULL };
++static const struct sweet_frpc_iface frpc_apps_mem = { "apps_mem", apps_mem_call, NULL };
++
++/* the reverse interfaces by handle: remotectl must be 0 */
++static const struct sweet_frpc_iface *const frpc_ifaces[] = { &frpc_remotectl, &frpc_apps_mem };
++#define FRPC_NIFACES           (sizeof(frpc_ifaces) / sizeof(frpc_ifaces[0]))
++
++static struct {
++	int state;
++	IOMemoryMap *map;
++	uint8_t *pool;
++	uint64_t heap_used;
++	struct frpc_slot slot[FRPC_SLOTS];
++	uint32_t seq;
++	unsigned ms;
++	/* setup */
++	uint32_t dl_handle, open_out[2];
++	char err[64];
++	/* listener: the reply that goes out with the next next2, and what next2 brought */
++	uint32_t rctx, result, outenc_len;
++	uint32_t next_in[4], next_out[4];
++	uint8_t inenc[4096];
++	uint8_t outenc[0x9000];
++	struct sweet_frpc_buf rin[FRPC_MAX_REVERSE_BUFS], rout[FRPC_MAX_REVERSE_BUFS];
++	uint8_t rin_data[4096];
++	uint32_t rsc, rnout;
++	unsigned calls, failed, by_iface[FRPC_NIFACES], late;
++} f;
++
++/* ---------------------------------------------------------------- invoke */
++
++static struct frpc_slot *
++frpc_invoke(const char *what, uint32_t handle, uint32_t sc, const struct frpc_arg *args, bool kernel, frpc_done_fn done)
++{
++	unsigned nin = SC_IN(sc), n = nin + SC_OUT(sc), i;
++	struct frpc_slot *s = NULL;
++
++	for (i = 0; i < FRPC_SLOTS; i++) {
++		if (!f.slot[i].busy) {
++			s = &f.slot[i];
++			break;
++		}
++	}
++	if (s == NULL || n > FRPC_MAX_ARGS) {
++		LOG("%s: no free invoke slot (%u args)", what, n);
++		return NULL;
++	}
++	uint32_t meta = (uint32_t)(sizeof(struct frpc_rbuf) + sizeof(struct frpc_ibuf) + sizeof(struct frpc_page)) * n +
++	    8 * 16 + 4 * 64 + 4;                        /* + fdlist, crclist, poll word */
++	struct frpc_rbuf *rpra = (struct frpc_rbuf *)s->va;
++	struct frpc_ibuf *list = (struct frpc_ibuf *)(s->va + sizeof(struct frpc_rbuf) * n);
++	struct frpc_page *pages = (struct frpc_page *)(s->va + (sizeof(struct frpc_rbuf) + sizeof(struct frpc_ibuf)) * n);
++	uint32_t off = meta;
++
++	bzero(s->va, meta);
++	s->nouts = 0;
++	for (i = 0; i < n; i++) {
++		uint32_t len = args[i].len;
++		off = (off + FRPC_ALIGN - 1) & ~(FRPC_ALIGN - 1);
++		if (off + len > FRPC_SLOT_SIZE) {
++			LOG("%s: arguments do not fit (%u bytes at %u)", what, len, off);
++			return NULL;
++		}
++		rpra[i].pv = (uint64_t)(uintptr_t)(s->va + off);
++		rpra[i].len = len;
++		list[i].num = len != 0 ? 1 : 0;
++		list[i].pgidx = i;
++		if (len != 0) {
++			uint64_t first = (s->pa + off) & ~0xFFFull, last = (s->pa + off + len - 1) & ~0xFFFull;
++			pages[i].addr = first | FRPC_CB << 32;
++			pages[i].size = last - first + 0x1000;
++		}
++		if (i < nin) {
++			memcpy(s->va + off, args[i].in, len);
++		} else {
++			bzero(s->va + off, len);
++			s->outs[s->nouts].dst = args[i].out;
++			s->outs[s->nouts].off = off;
++			s->outs[s->nouts].len = len;
++			s->nouts++;
++		}
++		off += len;
++	}
++	s->busy = true;
++	s->seq = ++f.seq & 0xFFFF;
++	s->handle = handle;
++	s->sc = sc;
++	s->done = done;
++	s->what = what;
++	s->sent_ms = f.ms;
++	s->late_logged = false;
++
++	struct frpc_msg m;
++	m.client_id = kernel ? 0 : FRPC_CLIENT_ID;
++	m.tid = FRPC_CLIENT_ID;
++	m.ctx = (uint64_t)s->seq << 16 | (uint64_t)(s - f.slot + 1) << 8 | SENSORS_PD;
++	m.handle = handle;
++	m.sc = sc;
++	m.addr = s->pa | FRPC_CB << 32;
++	m.size = (off + 0xFFF) & ~0xFFFu;
++	mb();
++	if (!topaz_dsp_send(&sweet_fastrpc_dsp, &m, sizeof(m))) {
++		LOG("%s: channel refused the message", what);
++		s->busy = false;
++		return NULL;
++	}
++	return s;
++}
++
++static void
++frpc_rx(const uint8_t *p, uint32_t len)
++{
++	struct frpc_rsp r;
++
++	if (len < sizeof(r)) {
++		LOG("short message, %u bytes", len);
++		return;
++	}
++	memcpy(&r, p, sizeof(r));
++	if (r.ctx == FRPC_PD_NOTIFY_CTX) {
++		LOG("PD notification, retval %d", r.retval);
++		return;
++	}
++	unsigned idx = (unsigned)((r.ctx >> 8) & 0xFF);
++	struct frpc_slot *s = (idx >= 1 && idx <= FRPC_SLOTS) ? &f.slot[idx - 1] : NULL;
++	if (s == NULL || !s->busy || s->seq != ((r.ctx >> 16) & 0xFFFF)) {
++		LOG("answer for unknown ctx %llx (retval %d)", r.ctx, r.retval);
++		return;
++	}
++	mb();
++	for (unsigned i = 0; i < s->nouts; i++) {
++		memcpy(s->outs[i].dst, s->va + s->outs[i].off, s->outs[i].len);
++	}
++	s->busy = false;                                /* the callback may invoke again */
++	s->done(s, r.retval);
++}
++
++/* ---------------------------------------------------------------- setup */
++
++static void next2(void);
++
++static void
++setup_failed(const char *what, int32_t retval)
++{
++	LOG("%s failed: retval %d (0x%x)%s%s", what, retval, (uint32_t)retval, f.err[0] ? ": " : "", f.err);
++	f.state = F_FAILED;
++}
++
++static void
++init2_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	if (retval != 0) {
++		setup_failed("adsp_listener_init2", retval);
++		return;
++	}
++	LOG("t=%u ms: listener up, waiting for the sensors PD's calls", f.ms);
++	f.state = F_LISTEN;
++	f.rctx = 0;
++	f.result = 0xFFFFFFFFu;                         /* nothing to answer yet (hexagonrpcd does the same) */
++	f.outenc_len = 0;
++	next2();
++}
++
++static void
++close_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	if (retval != 0) {
++		LOG("remotectl_close(%u): retval %d, going on", f.dl_handle, retval);
++	}
++	if (frpc_invoke("adsp_listener_init2", FRPC_LISTENER, SC(3, 0, 0), NULL, false, init2_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++static void
++register_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	static uint32_t close_in[2], dlerr;
++	if (retval != 0) {
++		setup_failed("adsp_default_listener_register", retval);
++		return;
++	}
++	LOG("t=%u ms: default listener registered", f.ms);
++	close_in[0] = f.dl_handle;
++	close_in[1] = 0;
++	struct frpc_arg a[3] = { { close_in, NULL, 8 }, { NULL, &dlerr, 4 }, { NULL, NULL, 0 } };
++	if (frpc_invoke("remotectl_close", FRPC_REMOTECTL, SC(1, 1, 2), a, false, close_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++static void
++open_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	f.err[sizeof(f.err) - 1] = 0;
++	if (retval != 0 || f.open_out[1] != 0) {
++		setup_failed("remotectl_open(adsp_default_listener)", retval != 0 ? retval : (int32_t)f.open_out[1]);
++		return;
++	}
++	f.dl_handle = f.open_out[0];
++	LOG("t=%u ms: adsp_default_listener is handle %x", f.ms, f.dl_handle);
++	if (frpc_invoke("adsp_default_listener_register", f.dl_handle, SC(0, 0, 0), NULL, false, register_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++static void
++attach_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	static const char name[] = "adsp_default_listener";
++	static uint32_t open_in[2];
++	if (retval != 0) {
++		setup_failed("attach to the sensors PD", retval);
++		return;
++	}
++	LOG("t=%u ms: attached to the sensors PD", f.ms);
++	open_in[0] = sizeof(name);
++	open_in[1] = sizeof(f.err);
++	bzero(f.err, sizeof(f.err));
++	struct frpc_arg a[4] = { { open_in, NULL, 8 }, { name, NULL, sizeof(name) }, { NULL, f.open_out, 8 },
++		                 { NULL, f.err, sizeof(f.err) } };
++	if (frpc_invoke("remotectl_open", FRPC_REMOTECTL, SC(0, 2, 2), a, false, open_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++static void
++frpc_up(void)
++{
++	static uint32_t client = FRPC_CLIENT_ID;
++
++	LOG("%s open: SMMU stream %x, pool %llx+%llx", FRPC_CHANNEL, FRPC_SID, FRPC_POOL_BASE, FRPC_POOL_SIZE);
++	if (!topaz_smmu_identity(FRPC_SID, 0, "FastRPC")) {
++		f.state = F_FAILED;
++		return;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(FRPC_POOL_BASE, FRPC_POOL_SIZE, kIODirectionInOut);
++	f.map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	if (md != NULL) {
++		md->release();
++	}
++	if (f.map == NULL) {
++		LOG("pool mapping failed");
++		f.state = F_FAILED;
++		return;
++	}
++	f.pool = (uint8_t *)f.map->getVirtualAddress();
++	for (unsigned i = 0; i < FRPC_SLOTS; i++) {
++		f.slot[i].va = f.pool + i * FRPC_SLOT_SIZE;
++		f.slot[i].pa = FRPC_POOL_BASE + i * FRPC_SLOT_SIZE;
++	}
++	f.state = F_SETUP;
++	struct frpc_arg a[1] = { { &client, NULL, 4 } };
++	if (frpc_invoke("attach", FRPC_INIT_HANDLE, SC(FRPC_RMID_INIT_ATTACH, 1, 0), a, true, attach_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++/* ---------------------------------------------------------------- the listener */
++
++static void next2_done(struct frpc_slot *s, int32_t retval);
++
++static void
++next2(void)
++{
++	f.next_in[0] = f.rctx;
++	f.next_in[1] = f.result;
++	f.next_in[2] = f.outenc_len;
++	f.next_in[3] = sizeof(f.inenc);
++	struct frpc_arg a[4] = { { f.next_in, NULL, 16 }, { f.outenc, NULL, f.outenc_len }, { NULL, f.next_out, 16 },
++		                 { NULL, f.inenc, sizeof(f.inenc) } };
++	if (frpc_invoke("adsp_listener_next2", FRPC_LISTENER, SC(4, 2, 2), a, false, next2_done) == NULL) {
++		f.state = F_FAILED;
++	}
++}
++
++/* the call's outputs as the DSP wants them back: per buffer a u32 size, 8-byte aligned data */
++static bool
++encode_outs(uint32_t nout)
++{
++	uint32_t pos = 0;
++	for (uint32_t i = 0; i < nout; i++) {
++		uint32_t len = f.rout[i].len;
++		if (pos + 4 + 8 + len > sizeof(f.outenc)) {
++			return false;
++		}
++		memcpy(f.outenc + pos, &len, 4);
++		pos += 4;
++		if (len != 0) {
++			uint32_t pad = (8 - (pos & 7)) & 7;
++			bzero(f.outenc + pos, pad);
++			pos += pad;
++			memcpy(f.outenc + pos, f.rout[i].p, len);
++			pos += len;
++		}
++	}
++	f.outenc_len = pos;
++	return true;
++}
++
++/* answer the current reverse call (from next2_done, or later for FRPC_PENDING) */
++static void
++frpc_reply(uint32_t result)
++{
++	f.result = result;
++	f.outenc_len = 0;
++	if (result == AEE_SUCCESS && !encode_outs(f.rnout)) {
++		LOG("reply for handle call does not fit, failing it");
++		f.result = AEE_ENOMEMORY;
++		f.outenc_len = 0;
++	}
++	if (result != AEE_SUCCESS) {
++		f.failed++;
++	}
++	next2();
++}
++
++/* split next2's input blob into the call's input buffers (iobuffer.c inbuf_decode) */
++static bool
++decode_ins(uint32_t nin, uint32_t len)
++{
++	uint32_t pos = 0, used = 0;
++	if (nin > FRPC_MAX_REVERSE_BUFS || len > sizeof(f.inenc)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < nin; i++) {
++		uint32_t n;
++		if (pos + 4 > len) {
++			return false;
++		}
++		memcpy(&n, f.inenc + pos, 4);
++		pos += 4;
++		if (n != 0) {
++			pos += (8 - (pos & 7)) & 7;
++		}
++		if (n > len - MIN(pos, len) || used + n + 1 > sizeof(f.rin_data)) {
++			return false;
++		}
++		memcpy(f.rin_data + used, f.inenc + pos, n);
++		f.rin_data[used + n] = 0;                    /* strings stay terminated even when the DSP's are not */
++		f.rin[i].p = f.rin_data + used;
++		f.rin[i].len = n;
++		used += (n + 1 + 7) & ~7u;
++		pos += n;
++	}
++	return true;
++}
++
++static void
++next2_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	if (retval != 0) {
++		setup_failed("adsp_listener_next2", retval);
++		return;
++	}
++	uint32_t handle = f.next_out[1], sc = f.next_out[2], len = f.next_out[3];
++	uint32_t nin = SC_IN(sc), method = SC_METHOD(sc);
++	f.rctx = f.next_out[0];
++	f.rsc = sc;
++	f.rnout = SC_OUT(sc);
++	f.calls++;
++	bzero(f.rout, sizeof(f.rout));
++	if (SC_HANDLES(sc) != 0 || f.rnout > FRPC_MAX_REVERSE_BUFS || !decode_ins(nin, len)) {
++		LOG("call %u: handle %u sc %08x, %u input bytes: cannot decode", f.calls, handle, sc, len);
++		frpc_reply(AEE_EBADPARM);
++		return;
++	}
++	if (method == 31) {
++		if (nin == 0 || f.rin[0].len < 4) {
++			frpc_reply(AEE_EBADPARM);
++			return;
++		}
++		memcpy(&method, f.rin[0].p, 4);
++	}
++	if (handle >= FRPC_NIFACES) {
++		LOG("call %u: handle %u method %u: no such interface", f.calls, handle, method);
++		frpc_reply(AEE_EUNSUPPORTED);
++		return;
++	}
++	f.by_iface[handle]++;
++	uint32_t result = frpc_ifaces[handle]->call(method, f.rin, nin, f.rout, f.rnout);
++	if (result != AEE_SUCCESS && result != FRPC_PENDING) {
++		LOG("call %u: %s method %u -> %d", f.calls, frpc_ifaces[handle]->name, method, (int32_t)result);
++	}
++	if (result != FRPC_PENDING) {
++		frpc_reply(result);
++	}
++}
++
++/* ---------------------------------------------------------------- local interfaces */
++
++/* remotectl: open/close an apps interface by name (hexagonrpcd localctl.c) */
++static uint32_t
++remotectl_call(uint32_t method, const struct sweet_frpc_buf *in, uint32_t nin, struct sweet_frpc_buf *out, uint32_t nout)
++{
++	static uint32_t prim[2];
++	static uint8_t errbuf[256];
++	uint32_t n_err;
++
++	if (method == 0 && nin == 2 && nout == 2 && in[0].len >= 8) {          /* open(name) -> handle, dlerr */
++		const char *name = (const char *)in[1].p;
++		memcpy(&n_err, (const uint8_t *)in[0].p + 4, 4);
++		bzero(errbuf, sizeof(errbuf));
++		out[0].p = prim;
++		out[0].len = 8;
++		out[1].p = errbuf;
++		out[1].len = MIN(n_err, (uint32_t)sizeof(errbuf));
++		for (uint32_t i = 1; i < FRPC_NIFACES; i++) {
++			if (strcmp(frpc_ifaces[i]->name, name) == 0) {
++				prim[0] = i;
++				prim[1] = 0;
++				LOG("t=%u ms: the DSP opened %s (handle %u)", f.ms, name, i);
++				return AEE_SUCCESS;
++			}
++		}
++		LOG("t=%u ms: the DSP asked for interface \"%s\": not served", f.ms, name);
++		prim[0] = 0;
++		prim[1] = (uint32_t)-5;
++		return (uint32_t)-5;                        /* what hexagonrpcd and Android answer */
++	}
++	if (method == 1 && nin == 1 && nout == 2 && in[0].len >= 8) {          /* close(handle) -> dlerr */
++		memcpy(&n_err, (const uint8_t *)in[0].p + 4, 4);
++		bzero(errbuf, sizeof(errbuf));
++		prim[0] = 0;
++		out[0].p = prim;
++		out[0].len = 4;
++		out[1].p = errbuf;
++		out[1].len = MIN(n_err, (uint32_t)sizeof(errbuf));
++		return AEE_SUCCESS;
++	}
++	return AEE_EUNSUPPORTED;
++}
++
++/* apps_mem: heap pages for the PD (hexagonrpcd apps_mem.c -> Linux fastrpc_req_mmap) */
++static uint64_t mmap_out[2];
++static uint64_t mmap_rsp;
++static uint64_t mmap_bytes;
++
++static void
++mmap_done(struct frpc_slot *s __unused, int32_t retval)
++{
++	if (retval != 0) {
++		LOG("t=%u ms: apps_mem map of %llu bytes: INIT_MMAP retval %d", f.ms, mmap_bytes, retval);
++		f.heap_used -= mmap_bytes;                  /* the last allocation, give it back */
++		frpc_reply((uint32_t)retval);
++		return;
++	}
++	mmap_out[0] = 0;
++	mmap_out[1] = mmap_rsp & 0xFFFFFFFFull;
++	f.rout[0].p = mmap_out;
++	f.rout[0].len = 16;
++	LOG("t=%u ms: apps_mem: %llu bytes at %llx for the DSP at %llx", f.ms, mmap_bytes,
++	    FRPC_POOL_BASE + f.heap_used - mmap_bytes + FRPC_HEAP_OFF, mmap_out[1]);
++	frpc_reply(AEE_SUCCESS);
++}
++
++static uint32_t
++apps_mem_call(uint32_t method, const struct sweet_frpc_buf *in, uint32_t nin, struct sweet_frpc_buf *out __unused, uint32_t nout)
++{
++	static struct frpc_mmap_req req;
++	static struct frpc_page page;
++	struct { uint32_t heap_id, lflags, rflags, pad; uint64_t vin, len; } __attribute__((packed)) a;
++
++	if (method == 3) {                              /* request_unmap64: the pages stay ours */
++		LOG("t=%u ms: apps_mem unmap (kept)", f.ms);
++		return AEE_SUCCESS;
++	}
++	if (method != 2 || nin != 1 || nout != 1 || in[0].len < sizeof(a)) {
++		return AEE_EUNSUPPORTED;
++	}
++	memcpy(&a, in[0].p, sizeof(a));
++	uint64_t len = (a.len + 0xFFF) & ~0xFFFull;
++	if (!(a.rflags & ADSP_MMAP_ADD_PAGES) || len == 0) {
++		LOG("t=%u ms: apps_mem map: heap %u flags %x/%x len %llu not supported", f.ms, a.heap_id, a.lflags, a.rflags, a.len);
++		return AEE_EUNSUPPORTED;
++	}
++	if (FRPC_HEAP_OFF + f.heap_used + len > FRPC_POOL_SIZE) {
++		LOG("t=%u ms: apps_mem map: %llu bytes, pool exhausted (%llu used)", f.ms, len, f.heap_used);
++		return AEE_ENOMEMORY;
++	}
++	uint64_t off = FRPC_HEAP_OFF + f.heap_used;
++	bzero(f.pool + off, len);
++	f.heap_used += len;
++	mmap_bytes = len;
++	req.client_id = FRPC_CLIENT_ID;
++	req.flags = a.rflags;
++	req.vaddr = 0;
++	req.num = sizeof(page);
++	req.pad = 0;
++	page.addr = (FRPC_POOL_BASE + off) | FRPC_CB << 32;
++	page.size = len;
++	struct frpc_arg args[3] = { { &req, NULL, sizeof(req) }, { &page, NULL, sizeof(page) }, { NULL, &mmap_rsp, 8 } };
++	if (frpc_invoke("INIT_MMAP", FRPC_INIT_HANDLE, SC(FRPC_RMID_INIT_MMAP, 2, 1), args, true, mmap_done) == NULL) {
++		f.heap_used -= len;
++		return AEE_ENOMEMORY;
++	}
++	return FRPC_PENDING;
++}
++
++/* ---------------------------------------------------------------- TopazModem client */
++
++static void
++frpc_poll(unsigned ms)
++{
++	f.ms = ms;
++	for (unsigned i = 0; i < FRPC_SLOTS; i++) {
++		struct frpc_slot *s = &f.slot[i];
++		/* next2 waits for the DSP's next call: only the others can be late */
++		if (s->busy && !s->late_logged && s->handle != FRPC_LISTENER && ms - s->sent_ms > 3000) {
++			s->late_logged = true;
++			f.late++;
++			LOG("t=%u ms: %s (handle %u sc %08x): no answer after 3 s", ms, s->what, s->handle, s->sc);
++		}
++	}
++}
++
++static void
++frpc_summary(void)
++{
++	static const char *const names[] = { "idle", "setting up", "listening", "FAILED" };
++	LOG("%s; %u calls from the DSP (%u failed), %u late invokes, apps_mem %llu bytes", names[f.state], f.calls, f.failed,
++	    f.late, f.heap_used);
++	for (unsigned i = 0; i < FRPC_NIFACES; i++) {
++		if (f.by_iface[i] != 0) {
++			LOG("  %s: %u calls", frpc_ifaces[i]->name, f.by_iface[i]);
++		}
++		if (frpc_ifaces[i]->summary != NULL) {
++			frpc_ifaces[i]->summary();
++		}
++	}
++}
++
++/* C linkage and external from the declaration in TopazDSP.h */
++const struct topaz_dsp_client sweet_fastrpc_dsp = {
++	FRPC_CHANNEL, frpc_rx, frpc_up, frpc_poll, frpc_summary
++};
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetFastRPC.h b/iokit/Kernel/arm/SweetFastRPC.h
+new file mode 100644
+index 0000000..d44e057
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetFastRPC.h
+@@ -0,0 +1,44 @@
++/*
++ * FastRPC reverse calls from the ADSP's sensors PD (sunstone), see SweetFastRPC.cpp.
++ *
++ * The DSP opens an apps-side interface by name (remotectl), then calls its methods. An
++ * interface listed in SweetFastRPC.cpp's frpc_ifaces[] gets those calls on the modem thread,
++ * one at a time, with the input buffers decoded. It answers with an AEE_* result and points
++ * out[0..nout-1] at its own storage (valid until its next call); the DSP expects exactly nout
++ * output buffers whose sizes follow from the method's IDL (hexagonrpc's interface/ *.c).
++ */
++#ifndef _IOKIT_SWEETFASTRPC_H
++#define _IOKIT_SWEETFASTRPC_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define AEE_SUCCESS         0
++#define AEE_EFAILED         1
++#define AEE_ENOMEMORY       2
++#define AEE_EBADPARM        14
++#define AEE_EUNSUPPORTED    20
++#define AEE_ENOSUCH         39
++
++struct sweet_frpc_buf {
++	void *p;
++	uint32_t len;
++};
++
++struct sweet_frpc_iface {
++	const char *name;
++	/* method from the scalars (or the first input word for method ids 31 and up) */
++	uint32_t (*call)(uint32_t method, const struct sweet_frpc_buf *in, uint32_t nin,
++	    struct sweet_frpc_buf *out, uint32_t nout);
++	void (*summary)(void);
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _IOKIT_SWEETFASTRPC_H */
+diff --git a/iokit/Kernel/arm/TopazDSP.h b/iokit/Kernel/arm/TopazDSP.h
+index 06e9ffe..27c4606 100644
+--- a/iokit/Kernel/arm/TopazDSP.h
++++ b/iokit/Kernel/arm/TopazDSP.h
+@@ -24,6 +24,9 @@ struct topaz_dsp_client {
+ 	void (*summary)(void);                          /* with the edge summary in the log */
+ };
+ 
++/* the clients TopazModem serves (defined by each driver) */
++extern const struct topaz_dsp_client sweet_fastrpc_dsp;
++
+ /* queue one packet on the client's channel; false when the channel is not up or the queue is full */
+ bool topaz_dsp_send(const struct topaz_dsp_client *c, const void *p, uint32_t len);
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 43a7efe..afefc7b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7021,7 +7021,7 @@ modem_boot(void)
+ #define ADSP_ITEM_CRASH         423
+ 
+ /* ---- other drivers on the ADSP edge (TopazDSP.h): one GLINK channel each */
+-static const struct topaz_dsp_client *const dsp_clients[] = { NULL };
++static const struct topaz_dsp_client *const dsp_clients[] = { &sweet_fastrpc_dsp };
+ 
+ extern "C" bool
+ topaz_dsp_send(const struct topaz_dsp_client *client, const void *p, uint32_t len)
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index c21e536..7f9fd34 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetExt4.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetFastRPC.cpp                              optional iokitcpp
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp

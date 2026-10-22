@@ -206,6 +206,10 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0122 | ADSP: our outbound SMP2P item 429 first (READY comes only then), SMEM/SMP2P dumps |
 | 0123 | GLINK/QRTR state per edge (`struct glink_edge`), replies routed by QRTR node; ADSP edge (IPCC client 3) served after READY, its channels, services and unserved requests logged |
 | 0124 | SEE sensor client on the ADSP (QMI 400): SUID lookups, ambient light attributes and on-change enable, lux in the log |
+| 0126 | read-only ext4 on a UFS partition (`SweetExt4`: extents, linear directories), first user the persist sensor registry |
+| 0127 | GLINK channels per edge; DSP clients (`TopazDSP.h`): a driver gets its own channel on the ADSP edge, plus SMEM items and SMMU identity |
+| 0128 | FastRPC to the ADSP sensors PD (`SweetFastRPC`): attach, default listener, `adsp_listener_next2` loop, reverse calls (remotectl, apps_mem); payloads in 0xda000000 via SMMU stream 0xa3 |
+| 0129 | apps_std for the sensors PD (`SweetAppsStd`): persist registry read-only, vendor sensor config stat table, socinfo from SMEM 137 |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
