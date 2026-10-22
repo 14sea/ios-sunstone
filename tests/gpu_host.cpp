@@ -2,7 +2,13 @@
 
 static sweet_gpu_vm *active_vm;
 static bool fail_drain, fail_sptprac, fail_restart, fail_high_blit, fail_clock_rollback;
-static bool halted, resetting;
+static bool halted, resetting, fail_work_blits, require_zap, zap_resumed, secure_cleared;
+static unsigned smc_calls, smc_interrupts, smc_error;
+static bool smc_interrupt_forever;
+static unsigned rpm_features, rpm_counter_offer, rpm_version;
+static bool rpm_restart_pending;
+static std::vector<std::vector<uint32_t>> rpm_commands;
+static std::vector<std::pair<uint32_t,uint32_t>> rpm_ap_indices;
 static unsigned next_ib; // 0=success, 1=wedged, 2=translation fault
 static unsigned rpm_failure; // 1=error, 2=stale ack, 3=timeout
 static std::vector<std::vector<uint32_t>> votes;
@@ -18,13 +24,26 @@ static void rpm_push(const std::vector<uint32_t> &msg) {
 static void rpm_peer() {
     if(!gpu_rpm.tx.size) return;
     auto &f=gpu_rpm.tx;
+    if(rpm_restart_pending) {
+        // The remote independently takes over its own indices on the fresh AP edge.
+        put(gpu_rpm.ram,f.off,0); put(gpu_rpm.ram,gpu_rpm.rx.off+4,0);
+        rpm_restart_pending=false;
+    }
     uint32_t tail=raw(gpu_rpm.ram,f.off),head=raw(gpu_rpm.ram,f.off+4);
     if(tail==head) return;
     std::vector<uint32_t> m;
     while(tail!=head) { m.push_back(raw(gpu_rpm.ram,f.off+8+tail)); tail=(tail+4)%f.size; }
     put(gpu_rpm.ram,f.off,tail);
     unsigned cmd=m[0]&0xffff;
-    if(cmd==0) { rpm_push({0x10000,0}); rpm_push({0x10001,0}); }
+    rpm_commands.push_back(m);
+    if(cmd==0) {
+        if(rpm_counter_offer) {
+            rpm_push({0x10001,rpm_counter_offer}); rpm_counter_offer=0;
+        } else {
+            rpm_push({rpm_version<<16,rpm_features});
+            rpm_push({(rpm_version<<16)|1,0});
+        }
+    }
     if(cmd==2) {
         rpm_push({0x10004,0});
         rpm_push({0x30002,13,0x5f6d7072,0x75716572,0x73747365,0});
@@ -40,6 +59,10 @@ static void rpm_peer() {
 }
 static uint32_t mmio_read(uintptr_t b,uint32_t o) { return raw(b,o); }
 static void mmio_write(uintptr_t b,uint32_t o,uint32_t v) {
+    if(b==gpu_rpm.ram && gpu_rpm.tx.size && gpu_rpm.rx.size) {
+        assert(o!=gpu_rpm.tx.off && o!=gpu_rpm.rx.off+4); // RPM-owned indices
+        if(o==gpu_rpm.tx.off+4 || o==gpu_rpm.rx.off) rpm_ap_indices.emplace_back(o,v);
+    }
     if(b==gpu_cb0 && o==0) {
         trace.push_back((v&1) ? "stage1" : "bypass");
     }
@@ -51,6 +74,20 @@ static void mmio_write(uintptr_t b,uint32_t o,uint32_t v) {
     }
     if(regions.count(0x00208000) && b==region(0x00208000) && o==0x0c) rpm_peer();
 }
+static void mock_smc(uint64_t a[8]) {
+    assert(a[1]==2 && a[2]==0 && a[3]==13 && !a[4] && !a[5] && !a[7]);
+    ++smc_calls;
+    if(a[0]==0x4200010a) assert(a[6]==0);
+    else assert(a[0]==1 && a[6]==0x12345); // interrupted session ID is preserved
+    trace.push_back("zap-resume");
+    if(smc_interrupts || smc_interrupt_forever) {
+        if(smc_interrupts) --smc_interrupts;
+        a[0]=1; a[6]=0x12345; return;
+    }
+    a[0]=smc_error==1 ? (uint64_t)-1 : 0;
+    a[1]=smc_error==2 ? 7 : 0;
+    zap_resumed=!a[0] && !a[1];
+}
 static void reg_write(uint32_t r,uint32_t v) {
     if(r==REG_CP_SQE_CNTL) { halted=(v==3); trace.push_back(halted ? "halt" : "start"); }
     if(r==REG_RBBM_GPR0_CNTL && v==0x1e0) {
@@ -61,6 +98,7 @@ static void reg_write(uint32_t r,uint32_t v) {
         resetting=v;
         trace.push_back(v ? "reset+" : "reset-");
         if(v) {
+            zap_resumed=secure_cleared=false;
             std::fill(registers.begin(),registers.begin()+0x10000,0);
             registers[r]=1;
         }
@@ -83,7 +121,13 @@ static void tick() {
             put(gpu_cb0,0x60,0x10200000); put(gpu_cb0,0x68,0x12);
             registers[REG_CP_RB_RPTR]=end; return;
         }
+        if(type==7 && op==CP_SET_SECURE_MODE) {
+            assert(zap_resumed); // no unconditional secure-mode packet without zap_ok
+            secure_cleared=true;
+            trace.push_back("secure0");
+        }
         if(type==7 && op==CP_EVENT_WRITE && count==4) {
+            if(require_zap && !secure_cleared) return;
             uint64_t addr=gpu_ring[(ptr+2)%gpu_ring_dwords];
             uint32_t value=gpu_ring[(ptr+4)%gpu_ring_dwords];
             if(addr==gpu_ctl_phys) *gpu_ctl=value;
@@ -93,6 +137,7 @@ static void tick() {
             }
         }
         if(type==7 && op==CP_BLIT) {
+            if(fail_work_blits) { halted=true; return; }
             bool high=regions.count(0x05990000) && (raw(region(0x05990000),0x1020)&31)!=3;
             if(!(high && fail_high_blit))
                 memcpy((void*)(gpu_low_map->va+0x22000),(void*)(gpu_low_map->va+0x21000),256);
@@ -103,6 +148,11 @@ static void tick() {
 }
 static void setup() {
     regions.clear(); registers.assign(0x20000,0); trace.clear(); votes.clear();
+    rpm_ap_indices.clear(); rpm_commands.clear();
+    rpm_features=rpm_counter_offer=0; rpm_version=1; rpm_restart_pending=false;
+    smc_calls=smc_interrupts=smc_error=0; smc_interrupt_forever=false;
+    fail_work_blits=require_zap=zap_resumed=secure_cleared=false;
+    gpu_recovery_streak=0;
     gpu_rpm={}; gpu_state=1; gpu_queued=0; gpu_wptr=0; gpu_seqno=10; gpu_resets=0; gpu_core_mhz=300;
     gpu_ring_dwords=GPU_RING_BYTES/4;
     gpu_low_map=gpu_map(GPU_LOW_PHYS,GPU_LOW_SIZE);
@@ -157,7 +207,7 @@ static void test_recovery() {
     assert(gpu_recover("test",vm));
     assert(at("halt")<at("drain") && at("drain")<at("reset+"));
     assert(at("reset+")<at("bypass") && at("bypass")<at("reset-"));
-    assert(gpu_resets==1 && ring_idle(1));
+    assert(gpu_resets==1 && ring_idle(1) && smc_calls==0);
     assert(registers[REG_CP_PROTECT_CNTL]==0xb);
     assert(registers[REG_CP_PROTECT_BASE+31]==(0x80000000u|0x11c00));
     assert(registers[gpu_restore_regs[17]]==gpu_restore_values[17]);
@@ -201,9 +251,57 @@ static void test_recovery() {
     sweet_gpu_vm_destroy(vm);
     puts("Recovery: halt/drain/reset ordering, wedge/fault recovery, failed restart, DMA quarantine passed");
 }
+static void test_recovery_limit_and_zap() {
+    setup(); fail_work_blits=true;
+    for(unsigned n=1;n<=3;n++) {
+        assert(sweet_gpu_copy(GPU_LOW_PHYS+0x21000,64,0,0,16,4,
+                              GPU_LOW_PHYS+0x22000,64,0,0));
+        assert(!sweet_gpu_flush());
+        assert(gpu_recovery_streak==n && !gpu_lock->held);
+        assert((gpu_state>0)==(n<3));
+    }
+    assert(resetting && gpu_resets==2); // third failure stops before another restart
+    auto stopped_trace=trace.size();
+    assert(!sweet_gpu_ready());
+    assert(!sweet_gpu_copy(0,64,0,0,16,4,0,64,0,0));
+    assert(trace.size()==stopped_trace); // no further per-frame reset penalty
+
+    setup();
+    auto *vm=sweet_gpu_vm_create(11); active_vm=vm;
+    bool fault=false; uint32_t seq=0;
+    for(unsigned n=0;n<2;n++) { next_ib=1; assert(!sweet_gpu_submit_ib(vm,1,&seq,&fault)); }
+    assert(gpu_recovery_streak==2);
+    assert(sweet_gpu_submit_ib(vm,1,&seq,&fault) && gpu_recovery_streak==0);
+    next_ib=1; assert(!sweet_gpu_submit_ib(vm,1,&seq,&fault));
+    assert(gpu_state>0 && gpu_recovery_streak==1);
+    assert(sweet_gpu_copy(GPU_LOW_PHYS+0x21000,64,0,0,16,4,GPU_LOW_PHYS+0x22000,64,0,0));
+    assert(sweet_gpu_flush() && gpu_recovery_streak==0);
+    sweet_gpu_vm_destroy(vm);
+
+    setup(); require_zap=true; smc_interrupts=2;
+    assert(gpu_recover("secure restart",nullptr));
+    assert(smc_calls==3 && zap_resumed && secure_cleared && gpu_recovery_streak==1);
+    assert(at("zap-resume")<at("secure0"));
+    assert(gpu_recover("secure restart again",nullptr));
+    assert(smc_calls==4 && gpu_resets==2 && gpu_recovery_streak==2);
+    for(unsigned error:{1u,2u,3u}) {
+        setup(); require_zap=true;
+        smc_error=error; smc_interrupt_forever=error==3;
+        assert(!gpu_recover("zap failure",nullptr));
+        assert(resetting && gpu_state<0 && gpu_resets==0);
+        assert(smc_calls==(error==3 ? 32u : 1u));
+        assert(std::find(trace.begin(),trace.end(),"secure0")==trace.end());
+    }
+    setup(); fail_restart=true;
+    assert(!gpu_recover("persistent restart failure",nullptr));
+    assert(smc_calls==1 && gpu_state<0 && resetting && gpu_recovery_streak==1);
+    puts("Recovery budget: third consecutive workload failure stops retries; real work resets it; zap retry is conditional and bounded");
+}
 static void test_power() {
     for(unsigned mhz:{400u,600u}) {
         setup(); rpm_setup(); boot_mhz=mhz;
+        for(unsigned off:{0u,4u,0x1008u,0x100cu}) put(region(0x045f0000),off,64);
+        rpm_restart_pending=true; rpm_features=0xa5;
         assert(gpu_clock_init()); assert(gpu_core_mhz==mhz);
         assert(votes.size()==6 && (raw(region(0x05990000),0x1020)&31)==(mhz==400 ? 2u:1u));
         assert(votes[4][8]==0x78677772 && votes[4][12]==4 && votes[4][13]==(mhz==400 ? 0xc0u:0x100u));
@@ -221,11 +319,35 @@ static void test_power() {
     assert(!gpu_clock_init() && gpu_state==-1);
     setup(); rpm_setup(); boot_mhz=999;
     assert(gpu_clock_init() && votes.empty());
-    setup(); rpm_setup(); put(region(0x045f0000),4,8);
-    assert(!gpu_rpm_init() && votes.empty()); // do not re-handshake a used link
+    setup(); rpm_setup();
+    // Stale AP indices must be reset even if they are out of range.
+    put(region(0x045f0000),4,0xffffffff); put(region(0x045f0000),0x1008,0xffffffff);
+    assert(gpu_rpm_init());
+    assert(rpm_ap_indices[0]==std::make_pair(4u,0u));
+    assert(rpm_ap_indices[1]==std::make_pair(0x1008u,0u));
+    auto commands_before=rpm_commands.size();
+    assert(!gpu_rpm_init() && rpm_commands.size()==commands_before); // same kernel owner cannot restart
+    setup(); rpm_setup();
+    for(unsigned off:{0u,4u,0x1008u,0x100cu}) put(region(0x045f0000),off,64);
+    rpm_restart_pending=true;
+    assert(gpu_rpm_init()); // firmware-era link, peer owns its half of the reset
+    setup(); rpm_setup(); put(region(0x045f0000),0,0xffffffff);
+    assert(!gpu_rpm_init() && rpm_commands.empty()); // invalid RPM-owned index stays invalid
+    setup(); rpm_setup(); rpm_features=0xa5;
+    assert(gpu_rpm_init());
+    bool saw_ack=false;
+    for(const auto &m:rpm_commands) if((m[0]&0xffff)==1) { saw_ack=true; assert(m[1]==0); }
+    assert(saw_ack);
+    setup(); rpm_setup(); rpm_counter_offer=0xff;
+    assert(gpu_rpm_init());
+    unsigned versions=0;
+    for(const auto &m:rpm_commands) if((m[0]&0xffff)==0) { ++versions; assert(m[1]==0); }
+    assert(versions==2);
+    setup(); rpm_setup(); rpm_version=2;
+    assert(!gpu_rpm_init());
     setup(); rpm_setup(); put(region(0x045f0000),0x7000-256+24,0); // overlap
     assert(!gpu_rpm_init());
-    puts("Clock: 400/600 MHz voltage votes, stale/error/missing ACKs, 2D fallback and used-link refusal passed");
+    puts("Clock: 400/600 MHz voltage votes, stale/error/missing ACKs, 2D fallback, firmware FIFO takeover and feature negotiation passed");
 }
 static void test_rpm_parser() {
     setup(); gpu_rpm.msgid=7;
@@ -248,6 +370,6 @@ static void test_rpm_parser() {
     puts("RPM: bounded TLV parsing, ACK identity, error TLVs, FIFO wrap and corrupt indices passed");
 }
 int main() {
-    test_handoff(); test_recovery(); test_power(); test_rpm_parser();
+    test_handoff(); test_recovery(); test_recovery_limit_and_zap(); test_power(); test_rpm_parser();
     puts("All GPU host checks passed (simulated hardware; device validation still required)");
 }

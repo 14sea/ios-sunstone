@@ -50,6 +50,19 @@ get_param(io_connect_t c, uint64_t which)
 	return out;
 }
 
+/* A successful real IB between deliberate faults resets the recovery budget. */
+static int
+check_recovered(io_connect_t conn, uint64_t handle, volatile uint32_t *p, uint32_t marker)
+{
+	p[3] = marker;
+	uint64_t in[3] = {handle, 0, 4}, fence = 0;
+	uint32_t count = 1;
+	kern_return_t kr = IOConnectCallScalarMethod(conn, 3, in, 3, &fence, &count);
+	printf("SWEETGPU: post-failure submit -> 0x%x word=0x%08x resets=%llu\n",
+	    kr, p[0x100 / 4], get_param(conn, 7));
+	return kr != KERN_SUCCESS || p[0x100 / 4] != marker;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -142,6 +155,7 @@ main(int argc, char **argv)
 	kr = IOConnectCallScalarMethod(conn, 3, bad_in, 3, &fence, &sub_cnt);
 	printf("SWEETGPU: Submit unmapped IOVA -> 0x%x faults=%llu\n", kr, get_param(conn, 5));
 	if (kr == KERN_SUCCESS || get_param(conn, 5) <= faults_before) failed++;
+	failed += check_recovered(conn, handle, p, 0xc0ffee43u);
 
 	/* Explicit bring-up tests: an impossible wait, and a HW protected register read. */
 	for (int test = 0; test < 2; test++) {
@@ -166,15 +180,8 @@ main(int argc, char **argv)
 		printf("SWEETGPU: %s -> 0x%x resets=%llu (was %llu)\n",
 		    test == 0 ? "wedge" : "CP_PROTECT", kr, get_param(conn, 7), resets_before);
 		if (kr == KERN_SUCCESS || get_param(conn, 7) <= resets_before) failed++;
+		failed += check_recovered(conn, handle, p, 0xc0ffee44u + (uint32_t)test);
 	}
-
-	/* Prove the next submission works after the SMMU fault / deliberate wedge. */
-	p[3] = 0xc0ffee43u;
-	sub_cnt = 1;
-	kr = IOConnectCallScalarMethod(conn, 3, sub_in, 3, &fence, &sub_cnt);
-	printf("SWEETGPU: post-failure submit -> 0x%x word=0x%08x resets=%llu\n",
-	    kr, p[0x100 / 4], get_param(conn, 7));
-	if (kr != KERN_SUCCESS || p[0x100 / 4] != 0xc0ffee43u) failed++;
 
 	/* 5. Free BO & close */
 	uint32_t free_cnt = 0;

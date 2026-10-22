@@ -1,0 +1,273 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -174,6 +174,9 @@
+ static IOLock             *gpu_lock;    /* the ring: framebuffer copies and user submissions */
+ static uint64_t            gpu_resets;
+ static uint32_t            gpu_core_mhz;
++/* Restart probe fences do not prove a workload can run. Stop after three failures. */
++#define GPU_MAX_RECOVERY_STREAK 3u
++static uint32_t            gpu_recovery_streak;
+ 
+ /* Immutable register values inherited from the shim, before any client runs. */
+ static const uint32_t gpu_restore_regs[] = {
+@@ -1051,25 +1054,46 @@
+ 	IODelay(100); /* Linux: reset must be asserted for at least 100 us. */
+ }
+ 
+-/* Reset only with the ring lock held; keep the client attached until DMA drains. */
++/* SMCCC 1.1 register call, matching the shim's SCM convention. */
++static void
++gpu_smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1],
++	    x2 __asm__("x2") = a[2], x3 __asm__("x3") = a[3],
++	    x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5],
++	    x6 __asm__("x6") = a[6], x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3;
++	a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++}
++
++/* One logical SCM BOOT_SET_REMOTE_STATE(ZAP_SHADER_RESUME=0, PAS_GPU=13).
++ * Bound interrupted-session resumes; do not loop indefinitely under the ring lock. */
+ static bool
+-gpu_recover(const char *why, struct sweet_gpu_vm *vm)
+-{
+-	IOLog("SWEET GPU: reset: %s (rptr %x wptr %x rbbm %x hwf %x prot %x)\n",
+-	    why, gpu_regs[REG_CP_RB_RPTR], gpu_wptr, gpu_regs[REG_RBBM_STATUS],
+-	    gpu_regs[REG_CP_HW_FAULT], gpu_regs[REG_CP_PROTECT_STATUS]);
+-	bool drained = gpu_halt();
+-	gpu_assert_reset();
+-	gpu_queued = 0;
+-	if (!drained) {
+-		if (vm != NULL) {
+-			vm->quarantined = true;
+-		}
+-		/* Leave reset asserted and the original SMMU mapping in place. */
+-		gpu_off("bus drain failed; reset held, VM pinned");
+-		return false;
+-	}
+-	smmu_detach(NULL, NULL, NULL);
++gpu_zap_resume(void)
++{
++	uint64_t a[8] = {0x4200010a, 2, 0, 13, 0, 0, 0, 0};
++	for (unsigned n = 0; n < 32; n++) {
++		gpu_smc(a);
++		if (a[0] != 1) { /* SCM_INTERRUPTED */
++			IOLog("SWEET GPU: zap resume: ret %llx result %llx\n", a[0], a[1]);
++			return a[0] == 0 && a[1] == 0;
++		}
++		uint64_t session = a[6];
++		a[0] = 1; a[1] = 2; a[2] = 0; a[3] = 13;
++		a[4] = 0; a[5] = 0; a[6] = session; a[7] = 0;
++	}
++	IOLog("SWEET GPU: zap resume interrupted-session limit\n");
++	return false;
++}
++
++/* Called with reset asserted and DMA drained. Only a fence failure is retryable. */
++static bool
++gpu_restart(bool resume_zap, bool *retryable)
++{
++	*retryable = false;
+ 	gpu_regs[REG_RBBM_SW_RESET_CMD] = 0;
+ 	(void)gpu_regs[REG_RBBM_SW_RESET_CMD];
+ 	IODelay(1);
+@@ -1078,12 +1102,17 @@
+ 	/* SPTPRAC is inside the wrapper, outside the GX reset. */
+ 	gpu_regs[0x1a881] = 0x778000;
+ 	if (!gpu_poll(0x1f8d0, 0x38, 0x28)) {
+-		gpu_assert_reset();
+-		gpu_off("SPTPRAC restart failed");
++		IOLog("SWEET GPU: SPTPRAC restart failed\n");
+ 		return false;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(gpu_restore_regs) / sizeof(gpu_restore_regs[0]); i++) {
+ 		gpu_regs[gpu_restore_regs[i]] = gpu_restore_values[i];
++	}
++	/* A successful resume is the only kernel-side evidence zap is available.
++	 * The v1 shim handoff does not carry zap_ok; never assume it from ho.ok. */
++	bool zap_ok = resume_zap && gpu_zap_resume();
++	if (resume_zap && !zap_ok) {
++		return false;
+ 	}
+ 	gpu_init_cp_protect();
+ 	/* Never copy the old RPTR into WPTR: discard the entire abandoned stream. */
+@@ -1107,8 +1136,10 @@
+ 	for (unsigned i = 0; i < 5; i++) {
+ 		emit(0);
+ 	}
+-	emit(pkt7(CP_SET_SECURE_MODE, 1));
+-	emit(0);
++	if (zap_ok) {
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++	}
+ 	/* The shim's a619 2D baseline, including sysmem CCU and the render mode. */
+ 	static const uint32_t magic[][2] = {
+ 		{0x9804, 0x1f}, {0x9805, 0}, {0xa0f8, 0}, {0xb600, 0x00108000},
+@@ -1126,15 +1157,53 @@
+ 	emit(12); /* RM6_BLIT2DSCALE */
+ 	event(CACHE_FLUSH_TS, true);
+ 	kick();
+-	if (!ring_idle(100)) {
++	*retryable = true;
++	return ring_idle(100);
++}
++
++/* Reset only with the ring lock held; keep the client attached until DMA drains. */
++static bool
++gpu_recover(const char *why, struct sweet_gpu_vm *vm)
++{
++	IOLog("SWEET GPU: reset: %s (rptr %x wptr %x rbbm %x hwf %x prot %x)\n",
++	    why, gpu_regs[REG_CP_RB_RPTR], gpu_wptr, gpu_regs[REG_RBBM_STATUS],
++	    gpu_regs[REG_CP_HW_FAULT], gpu_regs[REG_CP_PROTECT_STATUS]);
++	gpu_recovery_streak++;
++	/* Retry only once, with zap resumed, if the first restart fence failed. */
++	for (unsigned attempt = 0; attempt < 2; attempt++) {
++		bool drained = gpu_halt();
++		gpu_assert_reset();
++		gpu_queued = 0;
++		if (!drained) {
++			if (vm != NULL) {
++				vm->quarantined = true;
++			}
++			/* Leave reset asserted and the original SMMU mapping in place. */
++			gpu_off("bus drain failed; reset held, VM pinned");
++			return false;
++		}
++		smmu_detach(NULL, NULL, NULL);
++		if (gpu_recovery_streak >= GPU_MAX_RECOVERY_STREAK) {
++			gpu_off("three consecutive workload failures; reset held");
++			return false;
++		}
++		bool retryable;
++		if (gpu_restart(attempt != 0, &retryable)) {
++			gpu_resets++;
++			IOLog("SWEET GPU: CP recovered (%llu resets), fence %u, failure streak %u\n",
++			    gpu_resets, gpu_seqno, gpu_recovery_streak);
++			return true;
++		}
++		if (attempt == 0 && retryable) {
++			IOLog("SWEET GPU: restart fence failed; retrying once with zap resume\n");
++			continue;
++		}
+ 		(void)gpu_halt();
+ 		gpu_assert_reset();
+-		gpu_off("CP restart fence failed");
+-		return false;
+-	}
+-	gpu_resets++;
+-	IOLog("SWEET GPU: CP recovered (%llu resets), fence %u\n", gpu_resets, gpu_seqno);
+-	return true;
++		gpu_off("CP restart failed");
++		return false;
++	}
++	return false;
+ }
+ 
+ /* A stale kernel fence is also a wedge, even when RPTR has reached WPTR. */
+@@ -1156,6 +1225,7 @@
+ 		(void)gpu_recover("client submission failed", vm);
+ 		return false;
+ 	}
++	gpu_recovery_streak = 0; /* Completed client workload, not a restart fence. */
+ 	smmu_detach(NULL, NULL, NULL);
+ 	return true;
+ }
+@@ -1244,6 +1314,7 @@
+ 		IOLockUnlock(gpu_lock);
+ 		return false;
+ 	}
++	gpu_recovery_streak = 0; /* The submitted frame reached its own fence. */
+ 	IOLockUnlock(gpu_lock);
+ 	t1 = mach_absolute_time();
+ 	absolutetime_to_nanoseconds(t1 - t0, &ns);
+diff --git a/iokit/Kernel/arm/SweetGPUPower.h b/iokit/Kernel/arm/SweetGPUPower.h
+--- a/iokit/Kernel/arm/SweetGPUPower.h
++++ b/iokit/Kernel/arm/SweetGPUPower.h
+@@ -3,7 +3,8 @@
+  * Protocol references: Linux qcom_glink_rpm.c, qcom_glink_native.c, smd-rpm.c,
+  * rpmpd.c; live sunstone DT: RPM RAM 0x45f0000/0x7000, IPCC client 0 signal 0,
+  * rwgx:0 (pm6125_s8_level). Topaz's shared rwcx rail is NOT sunstone's GX.
+- * No interrupt handler, sleep votes, re-handshake, or direct PMIC writes.
++ * One kernel takeover of the firmware link; no runtime re-handshake,
++ * interrupt handler, sleep votes, or direct PMIC writes.
+  */
+ struct gpu_rpm_fifo { uint32_t off, size; };
+ struct gpu_rpm_link {
+@@ -11,7 +12,7 @@
+ 	struct gpu_rpm_fifo tx, rx;
+ 	uint32_t msgid, ack;
+ 	uint16_t rcid;
+-	bool version, open, remote, error;
++	bool started, version, open, remote, error;
+ };
+ static struct gpu_rpm_link gpu_rpm;
+ static IOMemoryMap *gpu_rpm_map, *gpu_ipcc_map, *gpu_cc_map;
+@@ -136,13 +137,21 @@
+ 	switch (cmd) {
+ 	case 0: /* VERSION */
+ 	case 1: /* VERSION_ACK */
+-		if (ch != 1 || p[1] != 0) {
++		if (ch != 1) {
+ 			gpu_rpm.error = true;
+ 			break;
+ 		}
+-		gpu_rpm.version = true;
+-		if (cmd == 0 && !gpu_rpm_cmd(1, 1, 0)) {
+-			gpu_rpm.error = true;
++		/* Local features are 0: accept the peer's offer and negotiate its intersection. */
++		if (cmd == 0) {
++			gpu_rpm.version = gpu_rpm_cmd(1, 1, 0);
++			gpu_rpm.error = !gpu_rpm.version;
++		} else if (p[1] != 0) {
++			/* Counter-offer: repeat VERSION with the local intersection (0). */
++			if (!gpu_rpm_cmd(0, 1, 0)) {
++				gpu_rpm.error = true;
++			}
++		} else {
++			gpu_rpm.version = true;
+ 		}
+ 		break;
+ 	case 2:
+@@ -205,6 +214,10 @@
+ static bool
+ gpu_rpm_init(void)
+ {
++	if (gpu_rpm.started) {
++		return false;
++	}
++	gpu_rpm.started = true;
+ 	gpu_rpm_map = gpu_map(0x045f0000, 0x7000);
+ 	gpu_ipcc_map = gpu_map(0x00208000, 0x1000);
+ 	if (gpu_rpm_map == NULL || gpu_ipcc_map == NULL) {
+@@ -239,10 +252,14 @@
+ 	      gpu_rpm.rx.off + 8 + gpu_rpm.rx.size <= gpu_rpm.tx.off)) {
+ 		return false;
+ 	}
++	/* Linux glink_rpm_probe: take over only the AP-owned indices. The RPM owns
++	 * TX tail and RX head; nonzero firmware-era indices are not a rejection. */
++	smmu_wr(gpu_rpm.ram, gpu_rpm.tx.off + 4, 0);
++	smmu_wr(gpu_rpm.ram, gpu_rpm.rx.off, 0);
++	__builtin_arm_dsb(0xf);
+ 	uint32_t tail, head;
+-	if (!gpu_rpm_indices(gpu_rpm.tx, &tail, &head) || tail || head ||
+-	    !gpu_rpm_indices(gpu_rpm.rx, &tail, &head) || tail || head) {
+-		IOLog("SWEET GPU: RPM FIFOs used; refusing a second handshake\n");
++	if (!gpu_rpm_indices(gpu_rpm.tx, &tail, &head) ||
++	    !gpu_rpm_indices(gpu_rpm.rx, &tail, &head)) {
+ 		return false;
+ 	}
+ 	if (!gpu_rpm_cmd(0, 1, 0) || !gpu_rpm_wait(0)) {
+@@ -330,6 +347,7 @@
+ 			return false;
+ 		}
+ 	}
++	gpu_recovery_streak = 0; /* A verified 2D workload, not a restart probe. */
+ 	return true;
+ }
+ 

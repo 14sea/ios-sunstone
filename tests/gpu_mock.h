@@ -19,6 +19,7 @@ static unsigned boot_mhz=300;
 static uint64_t time_now;
 static std::vector<std::string> trace;
 static void tick();
+static void mock_smc(uint64_t[8]);
 static void reg_write(uint32_t, uint32_t);
 static uint32_t mmio_read(uintptr_t, uint32_t);
 static void mmio_write(uintptr_t, uint32_t, uint32_t);

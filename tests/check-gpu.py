@@ -73,6 +73,7 @@ def main():
         s = s.replace('static volatile uint32_t  *gpu_regs, *gpu_ring, *gpu_ctl;',
                       'static MockRegs gpu_regs; static volatile uint32_t *gpu_ring, *gpu_ctl;')
         s = replace_func(s, 'smmu_rd', 'static uint32_t smmu_rd(uintptr_t b,uint32_t o) { return mmio_read(b,o); }')
+        s = replace_func(s, 'gpu_smc', 'static void gpu_smc(uint64_t a[8]) { mock_smc(a); }')
         s = replace_func(s, 'smmu_wr', 'static void smmu_wr(uintptr_t b,uint32_t o,uint32_t v) { mmio_write(b,o,v); }')
         s = replace_func(s, 'sweet_gpu_clean_va', 'void sweet_gpu_clean_va(uintptr_t,uint64_t,bool) {}')
         s = replace_func(s, 'vm_seq_done', 'static bool vm_seq_done(sweet_gpu_vm *v,uint32_t s) { return (int32_t)(v->fence_va[GPU_USER_FENCE_OFFSET/4]-s)>=0; }')
