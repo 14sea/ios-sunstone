@@ -1,7 +1,9 @@
-# sunstone GPU recovery and fixed clocks (0125)
+# sunstone GPU recovery and fixed clocks (0125, 0130)
 
 2026-10-22. Implemented and checked locally; **not yet built as a full kernel or booted**.
-Local code commit: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
+Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
+Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):
+firmware FIFO takeover, feature negotiation, the recovery budget and zap retry.
 The last device evidence remains boot-36 (`../out/boot36-log19.txt`). The default
 clock stays at the shim's 300 MHz. No partitions were flashed for this change.
 
@@ -33,12 +35,25 @@ display fence timeout, recovery:
 3. Asserts RBBM reset for at least 100 us. Only after a successful drain does it
    detach the client and put CB0 in bypass.
 4. Restores the shim's immutable hardware setup, all 32 CP_PROTECT words, SQE
-   address, empty ring, `CP_ME_INIT`, nonsecure mode and the a619 2D context.
-5. Requires a new cache-flush fence before accepting another submission.
+   address, empty ring, `CP_ME_INIT` and the a619 2D context.
+5. Requires a new cache-flush fence before accepting another submission. If that
+   first restart fence fails, drains and resets again, then attempts one SCM
+   `BOOT_SET_REMOTE_STATE(ZAP_SHADER_RESUME=0, GPU_PAS=13)` and restarts once more.
+   The v1 shim handoff has no `zap_ok`: the first attempt omits `CP_SET_SECURE_MODE`;
+   only a successful SCM resume authorizes `CP_SET_SECURE_MODE 0` on the retry.
+   SCM transport and firmware result must both be zero. Interrupted sessions
+   preserve x6 and have a maximum of 32 SMC entries; no firmware reload is attempted.
 
 The failed submission/frame still reports failure; a successful reset allows the
 next one to run. The framebuffer finishes a failed frame on the CPU and clears
-its sticky GPU-failed flag if recovery succeeded, so later frames can use GPU copies. Kernel fence sequence numbers keep increasing. If restart fails,
+its sticky GPU-failed flag if recovery succeeded, so later frames can use GPU copies.
+A global streak counts workload failures requiring recovery; the **third consecutive
+failure** drains DMA and leaves reset asserted, then disables the GPU before another
+restart. A successful restart probe fence does **not** clear that streak. Only a
+completed client submission, completed display frame, or verified clock 2D selftest
+clears it. The counter spans both client and display paths under the ring lock.
+Thus a broken 2D path cannot incur a new timeout/reset on every later frame.
+Kernel fence sequence numbers keep increasing. If the bounded restart attempts fail,
 reset stays asserted and CPU presentation is the fallback. If the bus cannot drain,
 the attached VM, page tables, shadow IB and BO descriptors remain pinned until
 reboot. Each mapping takes its own `prepare()` reference, including wrapped task
@@ -71,9 +86,15 @@ subsystem. No sleep-state or DDR bandwidth votes were added.
 
 The transport uses RPM RAM `0x45f0000/0x7000`, validates both TOC FIFO ranges and
 indices, and rings **IPCC `0x208000`, client 0, signal 0** (not topaz's APCS).
-It refuses to re-handshake a used FIFO, rejects malformed or fragmented replies,
-and times out stale/missing ACKs and error replies. A rejected vote leaves the
-shim clock in place.
+On the kernel's first takeover it resets only **TX head and RX tail**, as Linux
+`glink_rpm_probe` does; TX tail and RX head stay owned by the RPM. Nonzero firmware-era
+indices are accepted (invalid remote indices still fail). The same kernel owner
+cannot call init twice. VERSION accepts arbitrary feature bits, intersects them
+with the local feature mask of zero, and ACKs zero; a nonzero VERSION_ACK counter-offer
+resends VERSION with zero. Unsupported protocol versions, malformed/fragmented
+replies, stale/missing ACKs and error replies still fail. A rejected vote leaves the
+shim clock in place. Sources: [GLINK RPM probe](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_rpm.c)
+and [native VERSION negotiation](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_native.c).
 
 After RCG readback, a 16x4 pixel copy with distinct source values checks the 2D
 engine and cache flush at the selected rate. Failure attempts 300 MHz, CP recovery,
@@ -93,9 +114,11 @@ identity), `../research/linux-msm/gpucc-sm6375.c`,
 `python3 tests/check-gpu.py` applies the GPU files from the complete patch series
 in a temporary directory and executes their actual C++ with IOKit/MMIO substitutes
 and UBSan. Tests cover handoff initialization, recovery order, stalled/faulted IBs,
-next-submission success, failed bus drain/restart, pinned BO lifetime, 400/600 MHz
-votes, malformed/stale/error/missing ACKs, FIFO wrap, used-link refusal and 2D
-fallback. `--source-root ../work/xnu` also requires byte-identical patched sources;
+next-submission success, failed bus drain/restart, pinned BO lifetime, the
+three-failure cutoff and real-work reset of that budget, conditional zap resume
+and bounded interrupted sessions, 400/600 MHz with firmware-era FIFO indices and
+nonzero feature offers, AP/RPM index ownership, counter-offer negotiation,
+malformed/stale/error/missing ACKs, FIFO wrap and 2D fallback. `--source-root ../work/xnu` also requires byte-identical patched sources;
 `--catalog ../research/linux-msm/a6xx_catalog.c` compares all 32 protection words.
 `--clang PATH --resource-dir PATH` adds a Mach-O compile with declaration stubs.
 
@@ -106,8 +129,10 @@ and that run's compile flags (Ubuntu clang 17, xnu-cc.py compatibility definitio
 This is a translation-unit check, not a complete kernel link or device test.
 
 The iOS `sweetgpu` tool now prints parameters 6 (`CORE_MHZ`) and 7 (`RESETS`),
-returns nonzero on failed assertions, and verifies a fresh submission after the
-unmapped-IOVA fault. Opt-in `--wedge` submits an impossible `CP_WAIT_REG_MEM` on a
+returns nonzero on failed assertions, and verifies a fresh successful submission
+after **each** deliberately faulted/wedged/protected IB. These real canaries reset
+the recovery budget between independent tests; three deliberate failures in a row
+would now correctly disable the GPU. Opt-in `--wedge` submits an impossible `CP_WAIT_REG_MEM` on a
 mapped BO; `--protect` exercises the protection fault described above.
 
 Next steps:

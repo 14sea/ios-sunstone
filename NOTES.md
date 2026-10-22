@@ -1,23 +1,28 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## sunstone GPU handoff (2026-10-22)
+## sunstone GPU handoff (2026-10-22, review follow-up)
 
-Local code commit: `a86ccf0` (fork); matching XNU source commit: `cfbc46f`.
-No push, new CI dispatch, device boot or flash in this session.
+Review-fix code commit: `d594f7f` (fork), matching XNU `f8dc8b9`.
+Initial implementation: `a86ccf0` (fork), matching XNU `cfbc46f`. Patch 0130 fixes the
+review findings: clear only AP-owned TX head/RX tail on firmware-link takeover,
+accept VERSION feature offers and negotiate zero, and stop on the third consecutive
+workload failure. Restart probe fences do not clear the streak; real client/display
+work and the verified clock selftest do. The iOS test now runs a valid IB after each
+deliberate fault, so independent tests do not exhaust the recovery budget.
 
-Patch 0125 implements CP recovery (halt/drain before SMMU bypass, full RBBM reset,
-ring/protection/2D restore, DMA quarantine on failed drain) and opt-in
-`sweetgpu_mhz=400|600` with exact RPM ACKs for sunstone's separate GX `rwgx:0`
-plus MX/CX, RCG readback and 2D selftest. Default remains 300 MHz. The CP_PROTECT
-“three ranges” TODO was stale: all 32 entries already match Linux a630.
+A failed first restart fence has one additional drain/reset attempt with SCM zap
+resume (state 0, GPU PAS 13). The v1 handoff has no zap_ok, so SET_SECURE_MODE 0 is
+now emitted only after a successful resume; SCM transport and result must both be
+zero, with at most 32 interrupted-session SMC entries. Resume/retry failure holds
+reset and disables the GPU. No shim ABI or firmware loading changes.
 
-Host UBSan checks and full GPU patch-series reconstruction passed. Changed
-SweetGPU.cpp and SweetFramebuffer.cpp compiled to arm64 Mach-O against the real headers/build files of
-CI 39733814183 (artifact 12405779477); no new full kernel build or device boot.
-The updated `tools/ios/sweetgpu` has `--wedge`/`--protect` and post-failure checks.
-See [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md) for implementation,
-validation limits and the exact next device tests. No flashing performed.
-Unrelated TopazModem.cpp work in work/xnu was left intact.
+Patch-series reconstruction, all UBSan host checks (including nonzero firmware
+indices/features, repeated bad frames and zap success/rejection/interruption) and
+the changed SweetGPU.cpp arm64 Mach-O compile with real headers/build files from
+CI 39733814183 / artifact 12405779477 passed. iOS test source syntax check passed.
+No new full kernel link, push, CI dispatch, boot or flash. Recovery, zap and high
+clocks still need device validation; default remains 300 MHz. See
+[docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md) for the exact next tests.
 
 ## Agent handoff / active work (2026-10-15, latest)
 

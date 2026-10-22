@@ -165,6 +165,9 @@ last-1025-blocks `dd` of `userdata` into `logN.bin`/`logN.txt` (`tools/sweet-log
   ring/protection/2D state, and pins a VM/BOs if the bus cannot drain. Optional `sweetgpu_mhz=400|600`
   requires MX/CX/GX RPM ACKs and a 2D selftest; default remains 300 MHz. Patch-series/host tests and
   a real-header arm64 translation-unit compile passed; full kernel link and device tests pending.
+  **0130 review fixes**: Linux-style AP FIFO-index takeover and feature negotiation; disable on the
+  third consecutive workload failure (restart probes do not reset the budget); one conditional SCM
+  zap-resume retry after a failed restart fence. Updated host tests and real-header arm64 compile pass.
   Details and test procedure: [docs/gpu-recovery-clock.md](docs/gpu-recovery-clock.md).
   0111 adds the topaz 0131-0139 IOSurface pieces (values, bulk attachments, client memory wrapping,
   detach/release protocol) and the empty `IOAcceleratorES`.
@@ -216,6 +219,7 @@ default); topaz's SM6225 hardware patches live in `xnu/patches-topaz/` (55 files
 | 0127 | GLINK channels per edge; DSP clients (`TopazDSP.h`): a driver gets its own channel on the ADSP edge, plus SMEM items and SMMU identity |
 | 0128 | FastRPC to the ADSP sensors PD (`SweetFastRPC`): attach, default listener, `adsp_listener_next2` loop, reverse calls (remotectl, apps_mem); payloads in 0xda000000 via SMMU stream 0xa3 |
 | 0129 | apps_std for the sensors PD (`SweetAppsStd`): persist registry read-only, vendor sensor config stat table, socinfo from SMEM 137 |
+| 0130 | GPU review fixes: AP-only FIFO-index reset, feature negotiation, three-failure cutoff, conditional zap-resume retry; local tests/compile pass, device pending |
 | 0098 | GPU user client, **unused** (`xnu/patches-unused/`) |
 
 ## Tooling and boot flow
